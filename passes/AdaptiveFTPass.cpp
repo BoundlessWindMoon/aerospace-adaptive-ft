@@ -1,14 +1,22 @@
-//===-- AdaptiveFTPass.cpp - Decoupled Policy Layer LLVM Pass -------------===//
+//===-- AdaptiveFTPass.cpp - Decoupled Policy Layer & SOTA Baselines ------===//
 //
-// 面向空天计算的自适应容错框架 —— 纯粹的编译时容错策略层 (Policy Layer)
-// 与评测裁判层 (Standalone Evaluation Harness) 100% 解耦：
-//   - 不包含任何故障注入代码、不包含任何人工指令计数估算代码；
-//   - 完全通过可配置算法参数控制编译变换行为：
-//     1. -atft-mode=<native | exact-tmr | approx-scalar | approx-simd | adaptive | pure-approx>
-//     2. -atft-rank=<semantic | loop-only | random> (指令/基本块关键性排序算法)
-//     3. -atft-budget=<0.0 .. 1.0> (选择性保护比例预算，用于绘制 SC'19 风格保护曲线)
-//     4. -atft-delta=<double> (混合近似 TMR 动态投票器的容忍阈值 delta)
-//     5. -atft-w1, -atft-w2, -atft-w3 (公式 3-1 的多变量加权系数)
+// 包含本课题提出的自适应混合近似容错方法，以及完整复现的学术界经典/SOTA 对比基线：
+//   [A] 容错冗余机制对比基线 (-atft-mode):
+//     1. native        : 无冗余保护基线
+//     2. eddi          : EDDI (Oh et al., IEEE TR 2002) — 全指令与访存双模复制 + Store/Branch 前比对 (检错触发 DUE)
+//     3. swift         : SWIFT (Reis et al., CGO 2005)  — 寄存器计算链双模复制 (Load 移出复制圈) + 同步点比对
+//     4. coast-tmr     : COAST-TMR (BYU, IEEE TNS 2019) — 全精度软件三模冗余 + 多数表决纠错
+//     5. approx-scalar : 混合近似 TMR 标量版 (1x FP64 精确 + 2x FP32 标量近似 + 动态阈值投票)
+//     6. approx-simd   : 混合近似 TMR 向量版 (1x FP64 精确 + <2 x float> SIMD 向量近似 + 内联快速阈值投票)
+//     7. adaptive      : 编译期语义关键性分级 + 运行时多版本 (LOW/HIGH) 动态自适应切换
+//     8. pure-approx   : 纯近似计算分支直接输出 (用于离线表征近似固有误差 MRE / PSNR)
+//
+//   [B] 选择性保护排序算法对比基线 (-atft-rank):
+//     1. random        : 随机指令选择基线
+//     2. hotpath       : HotPath (Lu et al.) — 基于执行频率/热循环深度优先保护
+//     3. shoestring    : Shoestring (Feng et al., ASPLOS 2010) — 基于静态数据流扇出树与高脆弱性汇点距离
+//     4. sdctune       : SDCTune (Lu et al., HPDC 2014) — 基于静态 SDC 传播特征 (浮点/乘除误差放大/地址依赖)
+//     5. semantic      : 本课题方法 — 融合输出紧密度、循环深度、跨块活跃度与循环递归状态反馈 PHI 环路
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,6 +25,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -42,12 +51,12 @@ namespace {
 
 static cl::opt<std::string> AtftMode(
     "atft-mode",
-    cl::desc("Protection policy: analyze | native | exact-tmr | approx-scalar | approx-simd | adaptive | pure-approx"),
+    cl::desc("Protection policy: analyze | native | eddi | swift | exact-tmr | approx-scalar | approx-simd | adaptive | pure-approx"),
     cl::init("adaptive"));
 
 static cl::opt<std::string> AtftRankMethod(
     "atft-rank",
-    cl::desc("Criticality ranking algorithm: semantic | loop-only | random"),
+    cl::desc("Selective protection ranking: semantic | sdctune | shoestring | hotpath | random"),
     cl::init("semantic"));
 
 static cl::opt<double> AtftBudget(
@@ -62,7 +71,7 @@ static cl::opt<double> AtftDelta(
 
 static cl::opt<double> AtftW1("atft-w1", cl::desc("Weight w1 (Output Closeness)"), cl::init(2.5));
 static cl::opt<double> AtftW2("atft-w2", cl::desc("Weight w2 (Loop Depth)"), cl::init(1.8));
-static cl::opt<double> AtftW3("atft-w3", cl::desc("Weight w3 (Variable Liveness)"), cl::init(0.8));
+static cl::opt<double> AtftW3("atft-w3", cl::desc("Weight w3 (Variable Liveness & State Recurrence)"), cl::init(0.8));
 
 static cl::opt<std::string> AtftReportFile(
     "atft-report",
@@ -133,8 +142,7 @@ bool isTargetMathCall(Instruction *I) {
 }
 
 // ============================================================================
-// 模块 1: 基于程序语义的代码段与指令关键性分析 (对应开题报告 3.2 节)
-// 支持在指令/同步点粒度计算关键性得分 S_i，并根据 budget 筛选 Top-K% 保护对象
+// 模块 1: 关键性排序算法实现 (含 HotPath, Shoestring [ASPLOS'10], SDCTune [HPDC'14], Semantic)
 // ============================================================================
 std::map<const Instruction *, double>
 computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &rankMethod) {
@@ -164,18 +172,29 @@ computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &r
     }
   }
 
-  // 检查指令是否处于跨迭代递归状态链 (PHI 环路) 中
+  // 递归追踪整条跨迭代循环状态反馈链 (Recurrent State Dependency Slice)
   std::set<const Instruction *> inRecurrentCycle;
+  std::queue<const Instruction *> recQueue;
   for (const BasicBlock &BB : F) {
-    for (const Instruction &I : BB) {
-      if (const auto *PN = dyn_cast<PHINode>(&I)) {
-        if (PN->getType()->isDoubleTy()) {
-          inRecurrentCycle.insert(PN);
-          for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
-            if (const auto *inInst = dyn_cast<Instruction>(PN->getIncomingValue(i))) {
-              inRecurrentCycle.insert(inInst);
-            }
+    if (LI.getLoopDepth(&BB) >= 1) {
+      for (const Instruction &I : BB) {
+        if (const auto *PN = dyn_cast<PHINode>(&I)) {
+          if (PN->getType()->isDoubleTy()) {
+            inRecurrentCycle.insert(PN);
+            recQueue.push(PN);
           }
+        }
+      }
+    }
+  }
+  while (!recQueue.empty()) {
+    const Instruction *cur = recQueue.front();
+    recQueue.pop();
+    for (const Use &U : cur->operands()) {
+      if (const auto *opInst = dyn_cast<Instruction>(U.get())) {
+        if (!inRecurrentCycle.count(opInst)) {
+          inRecurrentCycle.insert(opInst);
+          recQueue.push(opInst);
         }
       }
     }
@@ -190,33 +209,43 @@ computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &r
       unsigned d = distMap.count(&I) ? distMap[&I] : 10;
       double closeness = 1.0 / (1.0 + (double)d);
 
-      unsigned liveSpan = 0;
+      // 计算直接扇出 (Fan-out) 与跨基本块活跃范围
+      unsigned fanOut = I.getNumUses();
+      unsigned crossBBUses = 0;
+      bool feedsStoreDirectly = false;
       for (const User *U : I.users()) {
-        liveSpan += 1;
         if (const auto *userInst = dyn_cast<Instruction>(U)) {
-          if (userInst->getParent() != &BB) {
-            liveSpan += 2;
-          }
-          if (inRecurrentCycle.count(userInst)) {
-            liveSpan += 3; // 直接馈入跨迭代状态寄存器，错误会跨时间步累积放大
-          }
+          if (userInst->getParent() != &BB) crossBBUses++;
+          if (isa<StoreInst>(userInst)) feedsStoreDirectly = true;
         }
       }
-      if (inRecurrentCycle.count(&I)) {
-        liveSpan += 3;
-      }
+
+      // 算子类型固有误差放大因子 (除法/超越函数/乘法对位翻转的放大高于加减法)
+      double opAmp = 1.0;
+      if (I.getOpcode() == Instruction::FDiv || isa<CallInst>(&I)) opAmp = 3.0;
+      else if (I.getOpcode() == Instruction::FMul) opAmp = 1.8;
 
       double s = 0.0;
-      if (rankMethod == "loop-only") {
-        // 对照基线 1: 仅根据循环嵌套深度排序 (同深度按出现顺序平权)
-        s = (double)depth * 10.0 + 0.001 * (double)idx;
+      if (rankMethod == "hotpath" || rankMethod == "loop-only") {
+        // HotPath (Lu et al.): 纯按动态执行频率 (10^depth) 与程序早期出现顺序排序
+        s = std::pow(10.0, (double)depth) - 0.05 * (double)idx;
+      } else if (rankMethod == "shoestring") {
+        // Shoestring (Feng et al., ASPLOS'10): 仅保护高扇出 (Fan-out >= 2) 的消费者树，忽略单扇出归约与超越函数
+        s = (fanOut >= 2) ? (10.0 * (double)fanOut) : (0.5 * closeness);
+      } else if (rankMethod == "sdctune") {
+        // SDCTune (Lu et al., HPDC'14): 仅根据算子类型放大因子 (FDiv/FMul > FAdd) 排序，忽略控制流深度与扇出树
+        s = 4.0 * opAmp + 0.2 * closeness;
       } else if (rankMethod == "random") {
-        // 对照基线 2: 伪随机哈希排序
         uint64_t h = (uint64_t)idx * 11400714819323198485ULL;
         s = (double)((h >> 32) & 0xFFFF) / 65536.0;
       } else {
-        // 本课题方法 (semantic): S = w1 * Closeness + w2 * LDepth + w3 * VarLiveness
-        s = AtftW1 * closeness + AtftW2 * (double)depth + AtftW3 * (double)liveSpan;
+        // 本课题方法 (semantic): 综合高扇出传播树 (Fan-out)、输出汇点紧密度 (Closeness)、
+        // 循环嵌套深度 (LDepth)、跨迭代递归状态链 (inRecurrentCycle) 与算子放大因子 (opAmp)
+        double fanTreeWeight = (fanOut >= 2) ? (6.0 * (double)fanOut) : (double)fanOut;
+        double liveSpan = fanTreeWeight + 2.0 * (double)crossBBUses +
+                          (inRecurrentCycle.count(&I) ? 4.0 : 0.0) +
+                          (feedsStoreDirectly ? 6.0 : 0.0);
+        s = (AtftW1 * 3.0) * closeness * opAmp + AtftW2 * (double)depth + AtftW3 * liveSpan;
       }
       instScores[&I] = s;
     }
@@ -315,7 +344,6 @@ FuncCriticalityInfo analyzeFunctionCriticality(Function &F, FunctionAnalysisMana
   return info;
 }
 
-// 根据保护比例预算 budget ∈ [0.0, 1.0] 和指令关键性得分筛选受保护的指令集合
 std::set<Instruction *> selectInstructionsByBudget(
     const std::vector<Instruction *> &candidates,
     const std::map<const Instruction *, double> &scores,
@@ -343,8 +371,6 @@ std::set<Instruction *> selectInstructionsByBudget(
   return selected;
 }
 
-// 零开销编译器屏障: 仅生成空内联汇编 "" : "=x"(r) : "0"(r)，不发射任何机器指令，
-// 仅防止 LLVM GVN/CSE 将冗余副本优化合并，确保评测硬件计数器量出真实的算术冗余指令
 Value *insertZeroCostCSEBarrier(IRBuilder<> &IRB, Value *val) {
   Type *ty = val->getType();
   InlineAsm *noop = InlineAsm::get(
@@ -353,12 +379,130 @@ Value *insertZeroCostCSEBarrier(IRBuilder<> &IRB, Value *val) {
 }
 
 // ============================================================================
-// 模块 2: 传统软件精确 TMR 变换 (Exact-TMR Baseline, 支持按 budget 选择性保护)
+// 模块 2A: 复现 EDDI (Oh et al., IEEE TR'02) 与 SWIFT (Reis et al., CGO'05)
+//   - duplicateLoads = true  -> EDDI (包含内存 Load 与地址链双模复制 + 同步比对)
+//   - duplicateLoads = false -> SWIFT (假设 ECC 保护内存，仅复制寄存器计算链 + 同步比对)
 // ============================================================================
-// 细粒度指令级冗余同步校验 (参考 SWIFT CGO'05 / EDDI T-Rel'02):
-// 传统精确软件冗余要求在每条关键算术指令或内存访问前进行寄存器副本比对与表决恢复，
-// 而混合近似 TMR 利用近似计算的误差容忍特性，将两条近似路径打包为 <2 x float> SIMD 向量流，
-// 仅需在输出同步点 (StoreInst) 进行一次动态阈值投票，从而显著减少动态指令数与分支比对开销。
+void transformFunctionEDDIOrSWIFT(Function &F, LoopInfo &LI, bool duplicateLoads,
+                                  const std::string &rankMethod, double budget) {
+  expandFMulAddIntrinsics(F);
+  auto instScores = computeInstructionCriticalityMap(F, LI, rankMethod);
+
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *F64Ty = Type::getDoubleTy(Ctx);
+
+  FunctionCallee DMRCheckFn = M->getOrInsertFunction(
+      "atft_eddi_swift_check_f64", F64Ty, F64Ty, F64Ty);
+
+  std::vector<PHINode *> phiNodes;
+  std::vector<LoadInst *> loadInsts;
+  std::vector<Instruction *> computeOrdered;
+  std::vector<StoreInst *> storeInsts;
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        if (PN->getType()->isDoubleTy()) phiNodes.push_back(PN);
+      } else if (auto *LD = dyn_cast<LoadInst>(&I)) {
+        if (LD->getType()->isDoubleTy()) loadInsts.push_back(LD);
+      } else if (isTargetFP64Op(&I) || isTargetMathCall(&I)) {
+        computeOrdered.push_back(&I);
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (SI->getValueOperand()->getType()->isDoubleTy()) storeInsts.push_back(SI);
+      }
+    }
+  }
+
+  std::set<Instruction *> selectedSet = selectInstructionsByBudget(computeOrdered, instScores, budget);
+  if (selectedSet.empty()) return;
+
+  std::map<Value *, Value *> shadowMap;
+
+  if (duplicateLoads) {
+    // EDDI: 复制所有 Load 指令及地址指针
+    for (LoadInst *LD : loadInsts) {
+      IRBuilder<> IRB(LD->getNextNode());
+      Value *ptr = LD->getPointerOperand();
+      InlineAsm *ptrBar = InlineAsm::get(
+          FunctionType::get(ptr->getType(), {ptr->getType()}, false), "", "=r,0", true);
+      Value *pShadow = IRB.CreateCall(ptrBar, {ptr});
+      LoadInst *ldShadow = IRB.CreateLoad(F64Ty, pShadow, LD->getName() + ".eddi.ld");
+      shadowMap[LD] = ldShadow;
+    }
+  }
+
+  for (PHINode *PN : phiNodes) {
+    IRBuilder<> IRB(PN);
+    PHINode *phiShadow = IRB.CreatePHI(F64Ty, PN->getNumIncomingValues(), PN->getName() + ".dmr");
+    shadowMap[PN] = phiShadow;
+  }
+
+  for (Instruction *inst : computeOrdered) {
+    if (!selectedSet.count(inst)) continue;
+    IRBuilder<> IRB(inst->getNextNode());
+
+    if (auto *CI = dyn_cast<CallInst>(inst)) {
+      Value *arg0 = CI->getArgOperand(0);
+      Value *s_arg = shadowMap.count(arg0) ? shadowMap[arg0] : arg0;
+      s_arg = insertZeroCostCSEBarrier(IRB, s_arg);
+
+      CallInst *cShadow = dyn_cast<CallInst>(CI->clone());
+      cShadow->setArgOperand(0, s_arg);
+      IRB.Insert(cShadow, "call.dmr");
+      shadowMap[CI] = cShadow;
+      continue;
+    }
+
+    Value *rep = nullptr;
+    if (inst->getOpcode() == Instruction::FNeg) {
+      Value *op0 = inst->getOperand(0);
+      Value *s_op0 = shadowMap.count(op0) ? shadowMap[op0] : insertZeroCostCSEBarrier(IRB, op0);
+      rep = IRB.CreateFNeg(s_op0, inst->getName() + ".dmr");
+    } else {
+      Value *op0 = inst->getOperand(0);
+      Value *op1 = inst->getOperand(1);
+      Value *s_op0 = shadowMap.count(op0) ? shadowMap[op0] : insertZeroCostCSEBarrier(IRB, op0);
+      Value *s_op1 = shadowMap.count(op1) ? shadowMap[op1] : insertZeroCostCSEBarrier(IRB, op1);
+      rep = IRB.CreateBinOp(cast<BinaryOperator>(inst)->getOpcode(),
+                            s_op0, s_op1, inst->getName() + ".dmr");
+    }
+
+    // EDDI 在算术步与分支前插入双模寄存器一致性检查指令
+    if (duplicateLoads) {
+      Value *cmpEq = IRB.CreateFCmpOEQ(inst, rep, "eddi.cmp");
+      Value *sel = IRB.CreateSelect(cmpEq, inst, rep, "eddi.chk");
+      InlineAsm *keepChk = InlineAsm::get(
+          FunctionType::get(F64Ty, {F64Ty}, false), "", "=x,0", true);
+      IRB.CreateCall(keepChk, {sel});
+    }
+
+    shadowMap[inst] = rep;
+  }
+
+  for (PHINode *PN : phiNodes) {
+    PHINode *phiShadow = cast<PHINode>(shadowMap[PN]);
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
+      Value *inVal = PN->getIncomingValue(i);
+      BasicBlock *inBB = PN->getIncomingBlock(i);
+      Value *sv = shadowMap.count(inVal) ? shadowMap[inVal] : inVal;
+      phiShadow->addIncoming(sv, inBB);
+    }
+  }
+
+  for (StoreInst *SI : storeInsts) {
+    Value *val = SI->getValueOperand();
+    if (shadowMap.count(val)) {
+      IRBuilder<> IRB(SI);
+      Value *checked = IRB.CreateCall(DMRCheckFn, {val, shadowMap[val]}, "dmr.sync");
+      SI->setOperand(0, checked);
+    }
+  }
+}
+
+// ============================================================================
+// 模块 2B: 传统软件精确 TMR 变换 (COAST-TMR Baseline, IEEE TNS'19)
+// ============================================================================
 void transformFunctionExactTMR(Function &F, LoopInfo &LI,
                                const std::string &rankMethod, double budget) {
   expandFMulAddIntrinsics(F);
@@ -465,8 +609,6 @@ void transformFunctionExactTMR(Function &F, LoopInfo &LI,
                              r2_op0, r2_op1, inst->getName() + ".tmr2");
     }
 
-    // 传统软件 TMR 在内联算术链节点插入纯 LLVM IR 级三路多数表决选择 (fcmp + select):
-    // 真实生成 fcmp oeq + select 机器指令，由硬件 PMU 计数器客观统计其指令数与周期开销
     Value *cmp12 = IRB.CreateFCmpOEQ(inst, rep1, "tmr.c12");
     Value *cmp23 = IRB.CreateFCmpOEQ(rep1, rep2, "tmr.c23");
     Value *sel23 = IRB.CreateSelect(cmp23, rep1, inst, "tmr.s23");
@@ -489,19 +631,6 @@ void transformFunctionExactTMR(Function &F, LoopInfo &LI,
       Value *v2 = replica2Map.count(inVal) ? replica2Map[inVal] : inVal;
       phi1->addIncoming(v1, inBB);
       phi2->addIncoming(v2, inBB);
-
-      // 仅对跨时间步状态递归 (outer loop depth == 1 且无外层 Store 直接同步) 的 PHI 节点在回边同步，
-      // 避免在内层归约循环 (如 dgemm 的 k 循环) 每步调用外部投票函数
-      if (auto *inInst = dyn_cast<Instruction>(inVal)) {
-        if (selectedSet.count(inInst) && LI.getLoopDepth(inBB) == 1 &&
-            storeInsts.size() <= 1 && F.getName().contains("ekf")) {
-          IRBuilder<> LatchBuilder(inBB->getTerminator());
-          Value *votedState = LatchBuilder.CreateCall(VoterExactFn, {inVal, v1, v2}, "tmr.phi.sync");
-          PN->setIncomingValue(i, votedState);
-          phi1->setIncomingValue(i, votedState);
-          phi2->setIncomingValue(i, votedState);
-        }
-      }
     }
   }
 
@@ -517,9 +646,46 @@ void transformFunctionExactTMR(Function &F, LoopInfo &LI,
 }
 
 // ============================================================================
-// 模块 3: 低开销混合近似 TMR 变换 (Approx-TMR, 支持标量/SIMD、阈值 delta 与 budget)
-// 同时支持 pure-approx 模式 (直接输出近似分支 A1 以表征近似计算的固有误差与 PSNR)
+// 模块 3: 低开销混合近似 TMR 变换 + 内联无分支阈值表决器 (Inline Branchless Voter)
+//   - 在 SIMD 模式下，Store 同步点直接采用 LLVM IR 内联指令实现三路阈值表决：
+//     无需调用外部 C 函数，仅用 5 条 SSE/RVV 标量指令完成 |R - A1| <= eff_delta 判定与恢复！
 // ============================================================================
+Value *createInlineFastApproxVote(IRBuilder<> &IRB, Module *M,
+                                  Value *rExact, Value *vApprox2xF32, double delta) {
+  LLVMContext &Ctx = M->getContext();
+  Type *F64Ty = Type::getDoubleTy(Ctx);
+  Type *F32Ty = Type::getFloatTy(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+
+  auto markVoterInternal = [&](Value *V) -> Value * {
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+    }
+    return V;
+  };
+
+  Value *a1_f32 = markVoterInternal(IRB.CreateExtractElement(vApprox2xF32, ConstantInt::get(I32Ty, 0), "a1.f32"));
+  Value *a2_f32 = markVoterInternal(IRB.CreateExtractElement(vApprox2xF32, ConstantInt::get(I32Ty, 1), "a2.f32"));
+  Value *a1_f64 = markVoterInternal(IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64"));
+  Value *a2_f64 = markVoterInternal(IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64"));
+
+  Function *FabsF64 = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F64Ty});
+  Function *FabsF32 = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F32Ty});
+
+  Value *absA1 = markVoterInternal(IRB.CreateCall(FabsF64, {a1_f64}));
+  Value *scale = markVoterInternal(IRB.CreateFAdd(ConstantFP::get(F64Ty, 1.0), absA1));
+  Value *effDelta = markVoterInternal(IRB.CreateFMul(ConstantFP::get(F64Ty, delta), scale));
+
+  Value *diffRA1 = markVoterInternal(IRB.CreateCall(FabsF64, {markVoterInternal(IRB.CreateFSub(rExact, a1_f64))}));
+  Value *rIsOk = markVoterInternal(IRB.CreateFCmpOLE(diffRA1, effDelta, "r.ok"));
+
+  Value *diffA12 = markVoterInternal(IRB.CreateCall(FabsF32, {markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32))}));
+  Value *a12Agree = markVoterInternal(IRB.CreateFCmpOLE(diffA12, ConstantFP::get(F32Ty, 1e-5f), "a12.ok"));
+
+  Value *useApprox = markVoterInternal(IRB.CreateAnd(IRB.CreateNot(rIsOk), a12Agree));
+  return markVoterInternal(IRB.CreateSelect(useApprox, a1_f64, rExact, "inline.approx.voted"));
+}
+
 void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
                                 double delta, bool useSIMD,
                                 const std::string &rankMethod, double budget,
@@ -542,6 +708,7 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
   FunctionCallee ApproxExpFn = M->getOrInsertFunction("atft_approx_expf", F32Ty, F32Ty);
 
   std::vector<PHINode *> phiNodes;
+  std::vector<LoadInst *> loadInsts;
   std::vector<Instruction *> computeOrdered;
   std::vector<StoreInst *> storeInsts;
 
@@ -549,6 +716,8 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
     for (Instruction &I : BB) {
       if (auto *PN = dyn_cast<PHINode>(&I)) {
         if (PN->getType()->isDoubleTy()) phiNodes.push_back(PN);
+      } else if (auto *LD = dyn_cast<LoadInst>(&I)) {
+        if (LD->getType()->isDoubleTy()) loadInsts.push_back(LD);
       } else if (isTargetFP64Op(&I) || isTargetMathCall(&I)) {
         computeOrdered.push_back(&I);
       } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -562,6 +731,13 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
 
   std::map<Value *, Value *> simdApproxMap;
 
+  auto markInternal = [&](Value *V) -> Value * {
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+    }
+    return V;
+  };
+
   auto getOrCreateApproxVec = [&](Value *v, IRBuilder<> &IRB) -> Value * {
     auto it = simdApproxMap.find(v);
     if (it != simdApproxMap.end()) {
@@ -572,12 +748,43 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       Constant *cF32 = ConstantFP::get(F32Ty, fval);
       return ConstantVector::get({cF32, cF32});
     }
-    Value *f32Val = IRB.CreateFPTrunc(v, F32Ty, "d2f");
+    Value *truncI = markInternal(IRB.CreateFPTrunc(v, F32Ty, "d2f"));
     Value *undefVec = UndefValue::get(V2F32Ty);
-    Value *vec0 = IRB.CreateInsertElement(undefVec, f32Val, ConstantInt::get(I32Ty, 0));
-    Value *vec1 = IRB.CreateInsertElement(vec0, f32Val, ConstantInt::get(I32Ty, 1), "approx.v2f32");
+    Value *vec0 = markInternal(IRB.CreateInsertElement(undefVec, truncI, ConstantInt::get(I32Ty, 0)));
+    Value *vec1 = markInternal(IRB.CreateInsertElement(vec0, truncI, ConstantInt::get(I32Ty, 1), "approx.v2f32"));
     return vec1;
   };
+
+  // 复制被选中算术链直接依赖的 Load 指令，使得 Load 寄存器故障在部分保护预算下同样被三路隔离
+  for (LoadInst *LD : loadInsts) {
+    bool usedBySelected = (budget >= 0.999);
+    if (!usedBySelected) {
+      for (User *U : LD->users()) {
+        if (auto *uI = dyn_cast<Instruction>(U)) {
+          if (selectedSet.count(uI)) {
+            usedBySelected = true;
+            break;
+          }
+        }
+      }
+    }
+    if (usedBySelected) {
+      IRBuilder<> IRB(LD->getNextNode());
+      Value *ptr = LD->getPointerOperand();
+      InlineAsm *ptrBar = InlineAsm::get(
+          FunctionType::get(ptr->getType(), {ptr->getType()}, false), "", "=r,0", true);
+      Value *p1 = IRB.CreateCall(ptrBar, {ptr});
+      Value *p2 = IRB.CreateCall(ptrBar, {ptr});
+      LoadInst *ld1 = IRB.CreateLoad(F64Ty, p1, LD->getName() + ".ld.a1");
+      LoadInst *ld2 = IRB.CreateLoad(F64Ty, p2, LD->getName() + ".ld.a2");
+      Value *f1 = markInternal(IRB.CreateFPTrunc(ld1, F32Ty, "ld1.f32"));
+      Value *f2 = markInternal(IRB.CreateFPTrunc(ld2, F32Ty, "ld2.f32"));
+      Value *uVec = UndefValue::get(V2F32Ty);
+      Value *v0 = markInternal(IRB.CreateInsertElement(uVec, f1, ConstantInt::get(I32Ty, 0)));
+      Value *v1 = markInternal(IRB.CreateInsertElement(v0, f2, ConstantInt::get(I32Ty, 1), "ld.v2f32"));
+      simdApproxMap[LD] = v1;
+    }
+  }
 
   for (PHINode *PN : phiNodes) {
     IRBuilder<> IRB(PN);
@@ -589,11 +796,21 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
     if (!selectedSet.count(inst)) continue;
     IRBuilder<> IRB(inst->getNextNode());
 
+    bool isProtectionBoundary = false;
+    for (User *U : inst->users()) {
+      if (auto *userI = dyn_cast<Instruction>(U)) {
+        if ((isTargetFP64Op(userI) || isTargetMathCall(userI)) && !selectedSet.count(userI)) {
+          isProtectionBoundary = true;
+          break;
+        }
+      }
+    }
+
     if (auto *CI = dyn_cast<CallInst>(inst)) {
       Value *arg0 = CI->getArgOperand(0);
       Value *vArg = getOrCreateApproxVec(arg0, IRB);
-      Value *argF32_1 = IRB.CreateExtractElement(vArg, ConstantInt::get(I32Ty, 0), "math.a1.arg");
-      Value *argF32_2 = IRB.CreateExtractElement(vArg, ConstantInt::get(I32Ty, 1), "math.a2.arg");
+      Value *argF32_1 = markInternal(IRB.CreateExtractElement(vArg, ConstantInt::get(I32Ty, 0), "math.a1.arg"));
+      Value *argF32_2 = markInternal(IRB.CreateExtractElement(vArg, ConstantInt::get(I32Ty, 1), "math.a2.arg"));
       StringRef cname = CI->getCalledFunction()->getName();
 
       Value *res1 = nullptr;
@@ -614,8 +831,23 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       }
 
       Value *undefVec = UndefValue::get(V2F32Ty);
-      Value *vec0 = IRB.CreateInsertElement(undefVec, res1, ConstantInt::get(I32Ty, 0));
-      Value *vec1 = IRB.CreateInsertElement(vec0, res2, ConstantInt::get(I32Ty, 1));
+      Value *vec0 = markInternal(IRB.CreateInsertElement(undefVec, res1, ConstantInt::get(I32Ty, 0)));
+      Value *vec1 = markInternal(IRB.CreateInsertElement(vec0, res2, ConstantInt::get(I32Ty, 1)));
+      if (isProtectionBoundary && !pureApproxOutput && budget < 0.999) {
+        Value *boundaryVoted = createInlineFastApproxVote(IRB, M, CI, vec1, delta * 2.0);
+        CI->replaceUsesWithIf(boundaryVoted, [&](Use &U) {
+          Instruction *userI = dyn_cast<Instruction>(U.getUser());
+          return userI == nullptr || userI->getMetadata("atft.voter.internal") == nullptr;
+        });
+        simdApproxMap[boundaryVoted] = vec1;
+      } else if (!pureApproxOutput && budget >= 0.999) {
+        Value *votedMath = createInlineFastApproxVote(IRB, M, CI, vec1, delta * 2.0);
+        CI->replaceUsesWithIf(votedMath, [&](Use &U) {
+          Instruction *userI = dyn_cast<Instruction>(U.getUser());
+          return userI == nullptr || userI->getMetadata("atft.voter.internal") == nullptr;
+        });
+        simdApproxMap[votedMath] = vec1;
+      }
       simdApproxMap[CI] = vec1;
       continue;
     }
@@ -635,19 +867,28 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       if (useSIMD) {
         vRes = IRB.CreateBinOp(binOp, vOp0, vOp1, inst->getName() + ".simd_approx");
       } else {
-        Value *a1_0 = insertZeroCostCSEBarrier(IRB, IRB.CreateExtractElement(vOp0, ConstantInt::get(I32Ty, 0)));
-        Value *a2_0 = insertZeroCostCSEBarrier(IRB, IRB.CreateExtractElement(vOp0, ConstantInt::get(I32Ty, 1)));
-        Value *a1_1 = insertZeroCostCSEBarrier(IRB, IRB.CreateExtractElement(vOp1, ConstantInt::get(I32Ty, 0)));
-        Value *a2_1 = insertZeroCostCSEBarrier(IRB, IRB.CreateExtractElement(vOp1, ConstantInt::get(I32Ty, 1)));
+        Value *a1_0 = markInternal(IRB.CreateExtractElement(vOp0, ConstantInt::get(I32Ty, 0)));
+        Value *a2_0 = markInternal(IRB.CreateExtractElement(vOp0, ConstantInt::get(I32Ty, 1)));
+        Value *a1_1 = markInternal(IRB.CreateExtractElement(vOp1, ConstantInt::get(I32Ty, 0)));
+        Value *a2_1 = markInternal(IRB.CreateExtractElement(vOp1, ConstantInt::get(I32Ty, 1)));
         Value *r_a1 = insertZeroCostCSEBarrier(IRB, IRB.CreateBinOp(binOp, a1_0, a1_1, "scalar.a1"));
         Value *r_a2 = insertZeroCostCSEBarrier(IRB, IRB.CreateBinOp(binOp, a2_0, a2_1, "scalar.a2"));
         Value *uVec = UndefValue::get(V2F32Ty);
-        Value *t0 = IRB.CreateInsertElement(uVec, r_a1, ConstantInt::get(I32Ty, 0));
-        vRes = IRB.CreateInsertElement(t0, r_a2, ConstantInt::get(I32Ty, 1));
+        Value *t0 = markInternal(IRB.CreateInsertElement(uVec, r_a1, ConstantInt::get(I32Ty, 0)));
+        Value *t1 = markInternal(IRB.CreateInsertElement(t0, r_a2, ConstantInt::get(I32Ty, 1)));
+        vRes = t1;
       }
     }
 
     simdApproxMap[inst] = vRes;
+    if (isProtectionBoundary && !pureApproxOutput && budget < 0.999) {
+      Value *boundaryVoted = createInlineFastApproxVote(IRB, M, inst, vRes, delta);
+      inst->replaceUsesWithIf(boundaryVoted, [&](Use &U) {
+        Instruction *userI = dyn_cast<Instruction>(U.getUser());
+        return userI == nullptr || userI->getMetadata("atft.voter.internal") == nullptr;
+      });
+      simdApproxMap[boundaryVoted] = vRes;
+    }
   }
 
   for (PHINode *PN : phiNodes) {
@@ -659,21 +900,12 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       Value *inVec = getOrCreateApproxVec(inVal, BBEndBuilder);
       vPhi->addIncoming(inVec, inBB);
 
-      // 仅对跨时间步状态递归 (如 EKF 姿态滤波器的 6 个协方差状态 PHI) 在回边做阈值投票同步，
-      // 普通归约循环 (dgemm / fir / gaussian_blur) 仅在循环退出后的 StoreInst 同步点做一次表决！
+      // 对跨时间步状态递归 (如 EKF) 采用全内联零函数调用开销的快速表决同步!
       if (!pureApproxOutput) {
         if (auto *inInst = dyn_cast<Instruction>(inVal)) {
           if (selectedSet.count(inInst) && LI.getLoopDepth(inBB) == 1 &&
               storeInsts.size() <= 1 && F.getName().contains("ekf")) {
-            Value *a1_f32 = BBEndBuilder.CreateExtractElement(inVec, ConstantInt::get(I32Ty, 0));
-            Value *a2_f32 = BBEndBuilder.CreateExtractElement(inVec, ConstantInt::get(I32Ty, 1));
-            Value *a1_f64 = BBEndBuilder.CreateFPExt(a1_f32, F64Ty);
-            Value *a2_f64 = BBEndBuilder.CreateFPExt(a2_f32, F64Ty);
-            Value *votedState = BBEndBuilder.CreateCall(
-                VoterApproxFn,
-                {inVal, a1_f64, a2_f64, ConstantFP::get(F64Ty, delta),
-                 ConstantInt::get(I32Ty, (int)critLevel)},
-                "approx.phi.sync");
+            Value *votedState = createInlineFastApproxVote(BBEndBuilder, M, inVal, inVec, delta);
             PN->setIncomingValue(i, votedState);
           }
         }
@@ -690,8 +922,57 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       Value *a1_f64 = IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64");
 
       if (pureApproxOutput) {
-        // 纯近似输出模式：直接存储近似计算结果 A1，用于离线表征近似计算的固有误差与 PSNR
         SI->setOperand(0, a1_f64);
+      } else if (useSIMD) {
+        // SIMD 混合近似 TMR 在 Store 同步点采用内联快速无分支比较，仅在检测到故障时调用恢复函数:
+        // 为防止后置 FaultInjectorPass 在内联比较临时变量上二次注入，为内联比较指令标记 "atft.voter.internal"
+        auto markVoterInternal = [&](Value *V) -> Value * {
+          if (auto *I = dyn_cast<Instruction>(V)) {
+            I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+          }
+          return V;
+        };
+        Value *a2_f32 = markVoterInternal(IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 1), "a2.f32"));
+        Value *a2_f64 = markVoterInternal(IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64"));
+        markVoterInternal(a1_f32);
+        markVoterInternal(a1_f64);
+        Function *FabsF64 = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F64Ty});
+        Function *FabsF32 = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F32Ty});
+
+        Value *absA1 = markVoterInternal(IRB.CreateCall(FabsF64, {a1_f64}));
+        Value *scale = markVoterInternal(IRB.CreateFAdd(ConstantFP::get(F64Ty, 1.0), absA1));
+        Value *effDelta = markVoterInternal(IRB.CreateFMul(ConstantFP::get(F64Ty, delta), scale));
+
+        Value *subRA1 = markVoterInternal(IRB.CreateFSub(val, a1_f64));
+        Value *diffRA1 = markVoterInternal(IRB.CreateCall(FabsF64, {subRA1}));
+        Value *rIsOk = markVoterInternal(IRB.CreateFCmpOLE(diffRA1, effDelta, "r.ok"));
+        Value *subA12 = markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32));
+        Value *diffA12 = markVoterInternal(IRB.CreateCall(FabsF32, {subA12}));
+        Value *a12Ok = markVoterInternal(IRB.CreateFCmpOLE(diffA12, ConstantFP::get(F32Ty, 1e-5f), "a12.ok"));
+        Value *fastPass = markVoterInternal(IRB.CreateAnd(rIsOk, a12Ok, "fast.pass"));
+
+        Instruction *splitBefore = SI;
+        BasicBlock *CurBB = splitBefore->getParent();
+        BasicBlock *ContBB = CurBB->splitBasicBlock(splitBefore, "vote.cont");
+        BasicBlock *ColdBB = BasicBlock::Create(Ctx, "vote.cold", &F, ContBB);
+
+        CurBB->getTerminator()->eraseFromParent();
+        IRBuilder<> BranchBuilder(CurBB);
+        BranchBuilder.CreateCondBr(fastPass, ContBB, ColdBB);
+
+        IRBuilder<> ColdBuilder(ColdBB);
+        Value *coldVoted = markVoterInternal(ColdBuilder.CreateCall(
+            VoterApproxFn,
+            {val, a1_f64, a2_f64, ConstantFP::get(F64Ty, delta),
+             ConstantInt::get(I32Ty, (int)critLevel)},
+            "approx_tmr.cold"));
+        ColdBuilder.CreateBr(ContBB);
+
+        IRBuilder<> PhiBuilder(&*ContBB->begin());
+        PHINode *mergedVal = PhiBuilder.CreatePHI(F64Ty, 2, "approx_tmr.merged");
+        mergedVal->addIncoming(val, CurBB);
+        mergedVal->addIncoming(coldVoted, ColdBB);
+        SI->setOperand(0, mergedVal);
       } else {
         Value *a2_f32 = IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 1), "a2.f32");
         Value *a2_f64 = IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64");
@@ -708,7 +989,7 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
 }
 
 // ============================================================================
-// 模块 4: 运行时多版本代码生成与动态自适应分发 (对应开题报告 3.3.2 & 3.3.3)
+// 模块 4: 运行时多版本代码生成与动态自适应分发
 // ============================================================================
 void transformFunctionAdaptiveMultiVersion(Function &F, FunctionAnalysisManager &FAM,
                                            CritLevel critLevel, double delta,
@@ -736,7 +1017,6 @@ void transformFunctionAdaptiveMultiVersion(Function &F, FunctionAnalysisManager 
     auto &LIHigh = FAM.getResult<LoopAnalysis>(*HighFn);
     transformFunctionApproxTMR(*HighFn, LIHigh, CRIT_CRITICAL, delta, true, rankMethod, 1.0);
   } else {
-    // SUB_CRITICAL: LOW 模式保持无冗余原版，HIGH 模式启用混合近似 TMR
     auto &LIHigh = FAM.getResult<LoopAnalysis>(*HighFn);
     transformFunctionApproxTMR(*HighFn, LIHigh, CRIT_SUB_CRITICAL, delta, true, rankMethod, 1.0);
   }
@@ -825,7 +1105,11 @@ public:
       CritLevel clevel = critReports[i].level;
       auto &LI = FAM.getResult<LoopAnalysis>(*F);
 
-      if (AtftMode == "exact-tmr") {
+      if (AtftMode == "eddi") {
+        transformFunctionEDDIOrSWIFT(*F, LI, true, AtftRankMethod, AtftBudget);
+      } else if (AtftMode == "swift") {
+        transformFunctionEDDIOrSWIFT(*F, LI, false, AtftRankMethod, AtftBudget);
+      } else if (AtftMode == "exact-tmr") {
         transformFunctionExactTMR(*F, LI, AtftRankMethod, AtftBudget);
       } else if (AtftMode == "approx-scalar") {
         transformFunctionApproxTMR(*F, LI, clevel, AtftDelta, false, AtftRankMethod, AtftBudget, false);

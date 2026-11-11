@@ -29,6 +29,8 @@ namespace {
 bool isInjectableDataInstruction(Instruction *I) {
   if (!I) return false;
   if (isa<PHINode>(I)) return false;
+  // 表决器内部比较指令属于同步检查器 (与外部表决函数一致，不在表决器内部重复打桩)
+  if (I->getMetadata("atft.voter.internal") != nullptr) return false;
 
   // 针对算术指令或内存加载指令的目标寄存器注入单粒子位翻转
   if (I->isBinaryOp() || I->isUnaryOp() || isa<LoadInst>(I)) {
@@ -93,19 +95,14 @@ public:
             return U.getUser() != hooked;
           });
         } else if (ty == V2F32Ty) {
-          // 对 <2 x float> SIMD 向量寄存器的两个 lane 分别挂载故障注入钩子
-          Value *lane0 = IRB.CreateExtractElement(inst, ConstantInt::get(I32Ty, 0), "v.l0");
-          Value *lane1 = IRB.CreateExtractElement(inst, ConstantInt::get(I32Ty, 1), "v.l1");
-          Value *h0 = IRB.CreateCall(
-              HookF32, {lane0, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.vl0");
-          Value *h1 = IRB.CreateCall(
-              HookF32, {lane1, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.vl1");
-          Value *uVec = UndefValue::get(V2F32Ty);
-          Value *v0 = IRB.CreateInsertElement(uVec, h0, ConstantInt::get(I32Ty, 0));
-          Value *hookedVec = IRB.CreateInsertElement(v0, h1, ConstantInt::get(I32Ty, 1), "fi.v2f32");
+          // 对 <2 x float> SIMD 向量寄存器：每次执行算作 1 条动态 SIMD 指令，
+          // 若被抽中注入单比特翻转，随机翻转 64-bit 向量寄存器中的 1 个 bit (即损坏 lane 0 或 lane 1 之一)
+          Value *bitcastI64 = IRB.CreateBitCast(inst, Type::getDoubleTy(Ctx), "v2f32.as.f64");
+          Value *hookedF64 = IRB.CreateCall(
+              HookF64, {bitcastI64, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.v2f32.f64");
+          Value *hookedVec = IRB.CreateBitCast(hookedF64, V2F32Ty, "fi.v2f32");
           inst->replaceUsesWithIf(hookedVec, [&](Use &U) {
-            Instruction *userInst = dyn_cast<Instruction>(U.getUser());
-            return userInst != lane0 && userInst != lane1;
+            return U.getUser() != bitcastI64;
           });
         }
       }

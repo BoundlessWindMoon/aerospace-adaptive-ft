@@ -126,7 +126,24 @@ void atft_step_window(void) {
 }
 
 // ============================================================================
-// 传统精确 TMR 表决器 (Baseline)
+// EDDI (IEEE TR'02) / SWIFT (CGO'05) 双模冗余一致性检查器 (DMR Checker)
+// 双模指令复制仅能检测主路与影子路不一致 (将静默数据损坏 SDC 转化为检出不可恢复错误 DUE)，
+// 无法像三模冗余那样判定哪一路正确并在线恢复
+// ============================================================================
+double atft_eddi_swift_check_f64(double r_master, double r_shadow) {
+    g_atft_state.total_votes++;
+    const double eps = 1e-11 * (1.0 + fabs(r_master));
+    if (isfinite(r_master) && isfinite(r_shadow) && fabs(r_master - r_shadow) <= eps) {
+        g_atft_state.fault_free_votes++;
+        return r_master;
+    }
+    g_atft_state.detected_faults++;
+    g_atft_state.unrecoverable_faults++;
+    return r_master;
+}
+
+// ============================================================================
+// 传统精确 TMR 表决器 (COAST Baseline, IEEE TNS'19)
 // ============================================================================
 double atft_voter_exact_f64(double r1, double r2, double r3) {
     g_atft_state.total_votes++;
@@ -177,6 +194,9 @@ int32_t atft_voter_exact_i32(int32_t r1, int32_t r2, int32_t r3) {
 // 混合误差容忍与判定机制 (对应开题报告 3.4.4.2 & 3.4.4.3)
 // ============================================================================
 double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
+                             double delta, int32_t crit_level) __attribute__((always_inline));
+
+double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
                              double delta, int32_t crit_level) {
     g_atft_state.total_votes++;
 
@@ -186,24 +206,23 @@ double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
     if (eff_delta < 2e-6) eff_delta = 2e-6;
 
     double diff_r_a1 = fabs(r_exact - a1_approx);
-    double diff_r_a2 = fabs(r_exact - a2_approx);
     double diff_a1_a2 = fabs(a1_approx - a2_approx);
 
-    int r_a1_ok = (diff_r_a1 <= eff_delta) && isfinite(r_exact) && isfinite(a1_approx);
-    int r_a2_ok = (diff_r_a2 <= eff_delta) && isfinite(r_exact) && isfinite(a2_approx);
-    // 两条近似路径采用同种近似变换，无软错误时输出严格相等 (diff_a1_a2 == 0)
-    int a1_a2_ok = (diff_a1_a2 <= 1e-7 * (1.0 + ref_scale)) && isfinite(a1_approx) && isfinite(a2_approx);
-
-    // 情况 1: 三路均在容忍阈值内且两近似副本一致 -> 无软错误，输出精确结果 R (零精度损失!)
-    if (r_a1_ok && r_a2_ok && a1_a2_ok) {
+    // Fast-path: 绝大多数无软错误情况仅需两次 IEEE-754 比较 (FCMP_OLE 天然排除 NaN)
+    if (__builtin_expect((diff_r_a1 <= eff_delta) && (diff_a1_a2 <= 1e-6 * (1.0 + ref_scale)), 1)) {
         g_atft_state.fault_free_votes++;
         return r_exact;
     }
 
-    // 检测到软错误 (不会在投票器内重复上报环境脉冲，由硬件传感器通道独立上报或统计)
+    // Cold-path: 检测到软错误异常时的三路分支恢复逻辑
+    double diff_r_a2 = fabs(r_exact - a2_approx);
+    int r_a1_ok = (diff_r_a1 <= eff_delta) && isfinite(r_exact) && isfinite(a1_approx);
+    int r_a2_ok = (diff_r_a2 <= eff_delta) && isfinite(r_exact) && isfinite(a2_approx);
+    int a1_a2_ok = (diff_a1_a2 <= 1e-5 * (1.0 + ref_scale)) && isfinite(a1_approx) && isfinite(a2_approx);
+
     g_atft_state.detected_faults++;
 
-    // 情况 2: |A1 - A2| <= eps 但 |R - A1| > delta -> 精确计算链路 R 发生故障!
+    // 情况 1: 两条近似副本一致 (a1_a2_ok)，说明主路 R 发生位翻转 (含 R 变为 NaN/Inf 或偏离超过 delta) -> 采纳近似副本恢复
     if (a1_a2_ok && (!r_a1_ok || !r_a2_ok)) {
         g_atft_state.exact_branch_faults++;
         if (crit_level >= ATFT_CRIT_CRITICAL) {
@@ -215,25 +234,29 @@ double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
         }
     }
 
-    // 情况 3: 两条近似副本不一致 (!a1_a2_ok)，说明 A1 或 A2 发生软错误，而 R 与其中一条吻合 -> 直接输出精确值 R!
-    if (r_a1_ok && !r_a2_ok) {
-        g_atft_state.approx_branch_faults++;
-        g_atft_state.recovered_by_reexec++;
-        return r_exact;
-    }
-    if (r_a2_ok && !r_a1_ok) {
-        g_atft_state.approx_branch_faults++;
-        g_atft_state.recovered_by_reexec++;
-        return r_exact;
-    }
-    if (!a1_a2_ok && r_a1_ok && r_a2_ok) {
-        // A1 或 A2 发生了微小位翻转但仍落在 delta 内，由 A1!=A2 检出并直接返回精确值 R
-        g_atft_state.approx_branch_faults++;
-        g_atft_state.recovered_by_reexec++;
-        return r_exact;
+    // 情况 2: 某一条近似链路发生软错误 (含变为 NaN/Inf 或大幅偏离，导致 ref_scale 被虚高放大)，
+    // 直接利用健康的另一条近似副本单独重新计算精确阈值:
+    if (isfinite(r_exact)) {
+        if (isfinite(a1_approx)) {
+            double d1_lim = delta * (1.0 + fabs(a1_approx));
+            if (d1_lim < 2e-6) d1_lim = 2e-6;
+            if (fabs(r_exact - a1_approx) <= d1_lim) {
+                g_atft_state.approx_branch_faults++;
+                g_atft_state.recovered_by_reexec++;
+                return r_exact;
+            }
+        }
+        if (isfinite(a2_approx)) {
+            double d2_lim = delta * (1.0 + fabs(a2_approx));
+            if (d2_lim < 2e-6) d2_lim = 2e-6;
+            if (fabs(r_exact - a2_approx) <= d2_lim) {
+                g_atft_state.approx_branch_faults++;
+                g_atft_state.recovered_by_reexec++;
+                return r_exact;
+            }
+        }
     }
 
-    // 情况 4: 极端多路同时故障，选择有限值安全回退
     g_atft_state.unrecoverable_faults++;
     if (isfinite(r_exact)) return r_exact;
     if (isfinite(a1_approx)) return a1_approx;
@@ -293,11 +316,16 @@ float atft_approx_cosf(float x) {
 }
 
 float atft_approx_expf(float x) {
-    if (x < -10.0f) return 0.0f;
-    if (x > 10.0f) x = 10.0f;
-    float t = 1.0f + x * 0.0625f;
-    t *= t; t *= t; t *= t; t *= t;
-    return t;
+    if (x < -20.0f) return 0.0f;
+    if (x > 20.0f) x = 20.0f;
+    // Range reduction: e^x = 2^k * e^r, where k = round(x / ln2), r in [-ln2/2, ln2/2]
+    const float inv_ln2 = 1.44269504089f;
+    const float ln2     = 0.69314718056f;
+    int k = (int)roundf(x * inv_ln2);
+    float r = x - (float)k * ln2;
+    // 4th-order Taylor polynomial on [-0.346, 0.346] (max error < 3e-5)
+    float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * 0.04166667f)));
+    return ldexpf(p, k);
 }
 
 typedef float v2f32 __attribute__((ext_vector_type(2)));

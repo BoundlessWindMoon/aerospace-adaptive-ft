@@ -8,6 +8,14 @@
 #include <string.h>
 #include <time.h>
 
+#define NUM_BENCHES 12
+
+static const char *BENCH_NAMES[NUM_BENCHES] = {
+    "pb_gemm", "pb_2mm", "pb_atax", "pb_bicg", "pb_jacobi2d",
+    "parsec_blackscholes", "axc_sobel", "axc_gaussian",
+    "dsp_kissfft", "dsp_fir", "gnc_pid", "gnc_ekf"
+};
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -21,139 +29,212 @@ static uint64_t splitmix64(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
-static void init_test_inputs(int n_mat, double *A, double *B, double *x,
-                             int n_fft, double *fft_re, double *fft_im,
-                             int n_fir, int n_taps, double *fir_sig, double *fir_coeffs,
-                             int img_h, int img_w, double *img_in,
-                             int ctrl_steps, double *setpoints, double *meas,
-                             double *gyro, double *accel) {
-    for (int i = 0; i < n_mat * n_mat; i++) {
-        A[i] = 0.5 * sin(0.13 * (double)(i + 1)) + 0.8;
-        B[i] = 0.5 * cos(0.07 * (double)(i + 1)) + 0.6;
+typedef struct {
+    int n_mat;
+    int n_fft;
+    int n_fir, n_taps;
+    int img_h, img_w;
+    int ctrl_steps;
+    int n_opts;
+
+    double *A, *B, *C, *D, *tmp_2mm;
+    double *x, *y, *tmp_atax, *s_bicg, *q_bicg, *p_bicg, *r_bicg;
+    double *jac_A, *jac_B;
+    double *bs_spt, *bs_strike, *bs_rate, *bs_vol, *bs_time, *bs_prices;
+    double *fft_re, *fft_im, *fft_out_re, *fft_out_im;
+    double *fir_sig, *fir_coeffs, *fir_out;
+    double *img_in, *sobel_out, *blur_out;
+    double *setpoints, *meas, *pid_out;
+    double *gyro, *accel, *ekf_out;
+
+    double *out_ptrs[NUM_BENCHES];
+    int     out_sizes[NUM_BENCHES];
+    double  peak_vals[NUM_BENCHES];
+    int     perf_iters[NUM_BENCHES];
+} suite_workspace_t;
+
+static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
+    memset(ws, 0, sizeof(*ws));
+    ws->n_mat      = scale_small ? 24  : 48;
+    ws->n_fft      = scale_small ? 32  : 64;
+    ws->n_fir      = scale_small ? 256 : 512;
+    ws->n_taps     = scale_small ? 16  : 32;
+    ws->img_h      = scale_small ? 24  : 48;
+    ws->img_w      = scale_small ? 24  : 48;
+    ws->ctrl_steps = scale_small ? 256 : 512;
+    ws->n_opts     = scale_small ? 256 : 512;
+
+    int nm2 = ws->n_mat * ws->n_mat;
+    ws->A        = calloc(nm2, sizeof(double));
+    ws->B        = calloc(nm2, sizeof(double));
+    ws->C        = calloc(nm2, sizeof(double));
+    ws->D        = calloc(nm2, sizeof(double));
+    ws->tmp_2mm  = calloc(nm2, sizeof(double));
+    ws->x        = calloc(ws->n_mat, sizeof(double));
+    ws->y        = calloc(ws->n_mat, sizeof(double));
+    ws->tmp_atax = calloc(ws->n_mat, sizeof(double));
+    ws->s_bicg   = calloc(ws->n_mat, sizeof(double));
+    ws->q_bicg   = calloc(ws->n_mat, sizeof(double));
+    ws->p_bicg   = calloc(ws->n_mat, sizeof(double));
+    ws->r_bicg   = calloc(ws->n_mat, sizeof(double));
+    ws->jac_A    = calloc(nm2, sizeof(double));
+    ws->jac_B    = calloc(nm2, sizeof(double));
+
+    ws->bs_spt    = calloc(ws->n_opts, sizeof(double));
+    ws->bs_strike = calloc(ws->n_opts, sizeof(double));
+    ws->bs_rate   = calloc(ws->n_opts, sizeof(double));
+    ws->bs_vol    = calloc(ws->n_opts, sizeof(double));
+    ws->bs_time   = calloc(ws->n_opts, sizeof(double));
+    ws->bs_prices = calloc(ws->n_opts, sizeof(double));
+
+    ws->fft_re     = calloc(ws->n_fft, sizeof(double));
+    ws->fft_im     = calloc(ws->n_fft, sizeof(double));
+    ws->fft_out_re = calloc(ws->n_fft, sizeof(double));
+    ws->fft_out_im = calloc(ws->n_fft, sizeof(double));
+
+    ws->fir_sig    = calloc(ws->n_fir, sizeof(double));
+    ws->fir_coeffs = calloc(ws->n_taps, sizeof(double));
+    ws->fir_out    = calloc(ws->n_fir, sizeof(double));
+
+    int im2 = ws->img_h * ws->img_w;
+    ws->img_in    = calloc(im2, sizeof(double));
+    ws->sobel_out = calloc(im2, sizeof(double));
+    ws->blur_out  = calloc(im2, sizeof(double));
+
+    ws->setpoints = calloc(ws->ctrl_steps, sizeof(double));
+    ws->meas      = calloc(ws->ctrl_steps, sizeof(double));
+    ws->pid_out   = calloc(ws->ctrl_steps, sizeof(double));
+    ws->gyro      = calloc(ws->ctrl_steps, sizeof(double));
+    ws->accel     = calloc(ws->ctrl_steps, sizeof(double));
+    ws->ekf_out   = calloc(ws->ctrl_steps, sizeof(double));
+
+    for (int i = 0; i < nm2; i++) {
+        ws->A[i] = 0.5 * sin(0.13 * (double)(i + 1)) + 0.8;
+        ws->B[i] = 0.5 * cos(0.07 * (double)(i + 1)) + 0.6;
     }
-    for (int i = 0; i < n_mat; i++) {
-        x[i] = 0.3 * sin(0.2 * (double)i) + 1.0;
+    for (int i = 0; i < ws->n_mat; i++) {
+        ws->x[i]      = 0.3 * sin(0.2 * (double)i) + 1.0;
+        ws->p_bicg[i] = 0.4 * cos(0.17 * (double)i) + 0.9;
+        ws->r_bicg[i] = 0.35 * sin(0.11 * (double)i) + 0.7;
     }
-    for (int i = 0; i < n_fft; i++) {
-        fft_re[i] = cos(2.0 * 3.141592653589793 * 3.0 * i / n_fft) +
-                    0.25 * sin(2.0 * 3.141592653589793 * 7.0 * i / n_fft);
-        fft_im[i] = 0.1 * sin(2.0 * 3.141592653589793 * 3.0 * i / n_fft);
+    for (int i = 0; i < ws->n_opts; i++) {
+        ws->bs_spt[i]    = 50.0 + 15.0 * sin(0.1 * (double)i);
+        ws->bs_strike[i] = 52.0 + 10.0 * cos(0.1 * (double)i);
+        ws->bs_rate[i]   = 0.05;
+        ws->bs_vol[i]    = 0.25 + 0.05 * sin(0.05 * (double)i);
+        ws->bs_time[i]   = 1.0 + 0.5 * cos(0.03 * (double)i);
     }
-    for (int i = 0; i < n_fir; i++) {
-        fir_sig[i] = sin(0.05 * (double)i) + 0.2 * cos(0.31 * (double)i);
+    for (int i = 0; i < ws->n_fft; i++) {
+        ws->fft_re[i] = cos(2.0 * 3.141592653589793 * 3.0 * i / ws->n_fft) +
+                        0.25 * sin(2.0 * 3.141592653589793 * 7.0 * i / ws->n_fft);
+        ws->fft_im[i] = 0.1 * sin(2.0 * 3.141592653589793 * 3.0 * i / ws->n_fft);
     }
-    for (int k = 0; k < n_taps; k++) {
-        double w = 0.54 - 0.46 * cos(2.0 * 3.141592653589793 * k / (n_taps - 1));
-        fir_coeffs[k] = w / (double)n_taps;
+    for (int i = 0; i < ws->n_fir; i++) {
+        ws->fir_sig[i] = sin(0.05 * (double)i) + 0.2 * cos(0.31 * (double)i);
     }
-    for (int r = 0; r < img_h; r++) {
-        for (int c = 0; c < img_w; c++) {
-            img_in[r * img_w + c] = 128.0 + 60.0 * sin(0.15 * r) * cos(0.15 * c);
+    for (int k = 0; k < ws->n_taps; k++) {
+        double w = 0.54 - 0.46 * cos(2.0 * 3.141592653589793 * k / (ws->n_taps - 1));
+        ws->fir_coeffs[k] = w / (double)ws->n_taps;
+    }
+    for (int r = 0; r < ws->img_h; r++) {
+        for (int c = 0; c < ws->img_w; c++) {
+            ws->img_in[r * ws->img_w + c] = 128.0 + 60.0 * sin(0.15 * r) * cos(0.15 * c);
         }
     }
-    for (int t = 0; t < ctrl_steps; t++) {
-        setpoints[t] = 1.0;
-        meas[t] = 1.0 - 0.8 * exp(-0.02 * (double)t) * cos(0.08 * (double)t);
-        gyro[t] = 0.05 * cos(0.04 * (double)t) + 0.002;
-        accel[t] = 1.25 * sin(0.04 * (double)t);
+    for (int t = 0; t < ws->ctrl_steps; t++) {
+        ws->setpoints[t] = 1.0;
+        ws->meas[t]      = 1.0 - 0.8 * exp(-0.02 * (double)t) * cos(0.08 * (double)t);
+        ws->gyro[t]      = 0.05 * cos(0.04 * (double)t) + 0.002;
+        ws->accel[t]     = 1.25 * sin(0.04 * (double)t);
+    }
+
+    ws->out_ptrs[0]  = ws->C;          ws->out_sizes[0]  = nm2;            ws->peak_vals[0]  = 40.0;  ws->perf_iters[0]  = 200;
+    ws->out_ptrs[1]  = ws->D;          ws->out_sizes[1]  = nm2;            ws->peak_vals[1]  = 800.0; ws->perf_iters[1]  = 150;
+    ws->out_ptrs[2]  = ws->y;          ws->out_sizes[2]  = ws->n_mat;      ws->peak_vals[2]  = 600.0; ws->perf_iters[2]  = 1500;
+    ws->out_ptrs[3]  = ws->q_bicg;     ws->out_sizes[3]  = ws->n_mat;      ws->peak_vals[3]  = 40.0;  ws->perf_iters[3]  = 1500;
+    ws->out_ptrs[4]  = ws->jac_A;      ws->out_sizes[4]  = nm2;            ws->peak_vals[4]  = 2.0;   ws->perf_iters[4]  = 200;
+    ws->out_ptrs[5]  = ws->bs_prices;  ws->out_sizes[5]  = ws->n_opts;     ws->peak_vals[5]  = 25.0;  ws->perf_iters[5]  = 600;
+    ws->out_ptrs[6]  = ws->sobel_out;  ws->out_sizes[6]  = im2;            ws->peak_vals[6]  = 255.0; ws->perf_iters[6]  = 800;
+    ws->out_ptrs[7]  = ws->blur_out;   ws->out_sizes[7]  = im2;            ws->peak_vals[7]  = 255.0; ws->perf_iters[7]  = 400;
+    ws->out_ptrs[8]  = ws->fft_out_re; ws->out_sizes[8]  = ws->n_fft;      ws->peak_vals[8]  = 32.0;  ws->perf_iters[8]  = 300;
+    ws->out_ptrs[9]  = ws->fir_out;    ws->out_sizes[9]  = ws->n_fir;      ws->peak_vals[9]  = 1.5;   ws->perf_iters[9]  = 800;
+    ws->out_ptrs[10] = ws->pid_out;    ws->out_sizes[10] = ws->ctrl_steps; ws->peak_vals[10] = 2.0;   ws->perf_iters[10] = 2000;
+    ws->out_ptrs[11] = ws->ekf_out;    ws->out_sizes[11] = ws->ctrl_steps; ws->peak_vals[11] = 1.5;   ws->perf_iters[11] = 2000;
+}
+
+static void reset_mutable_buffers(suite_workspace_t *ws, int b) {
+    int nm2 = ws->n_mat * ws->n_mat;
+    if (b == 0) {
+        for (int i = 0; i < nm2; i++) ws->C[i] = 0.1 * (double)(i % 17);
+    } else if (b == 1) {
+        for (int i = 0; i < nm2; i++) ws->D[i] = 0.05 * (double)(i % 13);
+    } else if (b == 4) {
+        for (int i = 0; i < nm2; i++) {
+            ws->jac_A[i] = 0.5 + 0.3 * sin(0.1 * (double)i);
+            ws->jac_B[i] = 0.5 + 0.3 * cos(0.1 * (double)i);
+        }
     }
 }
 
-// ============================================================================
-// 模式 1: 硬件 PMU 计数器性能与输出质量 (QoR) 测量
-// 直接通过 Linux perf_event_open 读取 CPU 硬件退休指令数与 CPU 周期数
-// ============================================================================
+static void invoke_benchmark(suite_workspace_t *ws, int b) {
+    reset_mutable_buffers(ws, b);
+    switch (b) {
+        case 0: bench_pb_gemm(ws->n_mat, ws->n_mat, ws->n_mat, 1.5, 1.2, ws->A, ws->B, ws->C); break;
+        case 1: bench_pb_2mm(ws->n_mat, ws->n_mat, ws->n_mat, ws->n_mat, 1.5, 1.2, ws->tmp_2mm, ws->A, ws->B, ws->A, ws->D); break;
+        case 2: bench_pb_atax(ws->n_mat, ws->n_mat, ws->A, ws->x, ws->y, ws->tmp_atax); break;
+        case 3: bench_pb_bicg(ws->n_mat, ws->n_mat, ws->A, ws->s_bicg, ws->q_bicg, ws->p_bicg, ws->r_bicg); break;
+        case 4: bench_pb_jacobi2d(4, ws->n_mat, ws->jac_A, ws->jac_B); break;
+        case 5: bench_parsec_blackscholes(ws->n_opts, ws->bs_spt, ws->bs_strike, ws->bs_rate, ws->bs_vol, ws->bs_time, ws->bs_prices); break;
+        case 6: bench_axc_sobel(ws->img_h, ws->img_w, ws->img_in, ws->sobel_out); break;
+        case 7: bench_axc_gaussian(ws->img_h, ws->img_w, ws->img_in, ws->blur_out); break;
+        case 8: bench_dsp_kissfft(ws->n_fft, ws->fft_re, ws->fft_im, ws->fft_out_re, ws->fft_out_im); break;
+        case 9: bench_dsp_fir(ws->n_fir, ws->n_taps, ws->fir_sig, ws->fir_coeffs, ws->fir_out); break;
+        case 10: bench_gnc_pid(ws->ctrl_steps, ws->setpoints, ws->meas, 1.2, 0.4, 0.05, 0.01, ws->pid_out); break;
+        case 11: bench_gnc_ekf(ws->ctrl_steps, ws->gyro, ws->accel, 0.01, ws->ekf_out); break;
+    }
+}
+
+static void free_workspace(suite_workspace_t *ws) {
+    free(ws->A); free(ws->B); free(ws->C); free(ws->D); free(ws->tmp_2mm);
+    free(ws->x); free(ws->y); free(ws->tmp_atax); free(ws->s_bicg);
+    free(ws->q_bicg); free(ws->p_bicg); free(ws->r_bicg);
+    free(ws->jac_A); free(ws->jac_B);
+    free(ws->bs_spt); free(ws->bs_strike); free(ws->bs_rate);
+    free(ws->bs_vol); free(ws->bs_time); free(ws->bs_prices);
+    free(ws->fft_re); free(ws->fft_im); free(ws->fft_out_re); free(ws->fft_out_im);
+    free(ws->fir_sig); free(ws->fir_coeffs); free(ws->fir_out);
+    free(ws->img_in); free(ws->sobel_out); free(ws->blur_out);
+    free(ws->setpoints); free(ws->meas); free(ws->pid_out);
+    free(ws->gyro); free(ws->accel); free(ws->ekf_out);
+}
+
 static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir, int dump_golden) {
-    const int n_mat = 48;
-    const int n_fft = 64;
-    const int n_fir = 512, n_taps = 32;
-    const int img_h = 48, img_w = 48;
-    const int ctrl_steps = 512;
-
-    double *A = calloc(n_mat * n_mat, sizeof(double));
-    double *B = calloc(n_mat * n_mat, sizeof(double));
-    double *C = calloc(n_mat * n_mat, sizeof(double));
-    double *x = calloc(n_mat, sizeof(double));
-    double *y = calloc(n_mat, sizeof(double));
-    double *fft_re = calloc(n_fft, sizeof(double));
-    double *fft_im = calloc(n_fft, sizeof(double));
-    double *fft_out_re = calloc(n_fft, sizeof(double));
-    double *fft_out_im = calloc(n_fft, sizeof(double));
-    double *fir_sig = calloc(n_fir, sizeof(double));
-    double *fir_coeffs = calloc(n_taps, sizeof(double));
-    double *fir_out = calloc(n_fir, sizeof(double));
-    double *img_in = calloc(img_h * img_w, sizeof(double));
-    double *sobel_out = calloc(img_h * img_w, sizeof(double));
-    double *blur_out = calloc(img_h * img_w, sizeof(double));
-    double *setpoints = calloc(ctrl_steps, sizeof(double));
-    double *meas = calloc(ctrl_steps, sizeof(double));
-    double *pid_out = calloc(ctrl_steps, sizeof(double));
-    double *gyro = calloc(ctrl_steps, sizeof(double));
-    double *accel = calloc(ctrl_steps, sizeof(double));
-    double *ekf_out = calloc(ctrl_steps, sizeof(double));
-
-    init_test_inputs(n_mat, A, B, x, n_fft, fft_re, fft_im,
-                     n_fir, n_taps, fir_sig, fir_coeffs,
-                     img_h, img_w, img_in,
-                     ctrl_steps, setpoints, meas, gyro, accel);
-
-    const char *bench_names[8] = {
-        "dgemm", "dgemv", "fft", "fir", "sobel", "gaussian_blur", "pid", "ekf"
-    };
-    int out_sizes[8] = {
-        n_mat * n_mat, n_mat, n_fft, n_fir, img_h * img_w, img_h * img_w, ctrl_steps, ctrl_steps
-    };
-    double *out_ptrs[8] = {
-        C, y, fft_out_re, fir_out, sobel_out, blur_out, pid_out, ekf_out
-    };
-    double peak_vals[8] = {
-        35.0, 40.0, 32.0, 1.5, 255.0, 255.0, 2.0, 1.5
-    };
-    int iters_list[8] = {
-        200, 2000, 300, 1000, 1000, 400, 2000, 2000
-    };
+    suite_workspace_t ws;
+    alloc_and_init_workspace(&ws, 0);
 
     harness_pmu_t pmu;
     harness_pmu_init(&pmu);
 
-    for (int b = 0; b < 8; b++) {
+    for (int b = 0; b < NUM_BENCHES; b++) {
         atft_init(10000.0, 4.0, 3, 4, 3);
         if (strcmp(policy_name, "adaptive_high") == 0) {
             g_atft_state.current_mode = ATFT_MODE_HIGH;
         }
 
-        // 预热一次
-        switch (b) {
-            case 0: bench_dgemm_kernel(n_mat, A, B, C); break;
-            case 1: bench_dgemv_kernel(n_mat, A, x, y); break;
-            case 2: bench_fft_radix2_kernel(n_fft, fft_re, fft_im, fft_out_re, fft_out_im); break;
-            case 3: bench_fir_filter_kernel(n_fir, n_taps, fir_sig, fir_coeffs, fir_out); break;
-            case 4: bench_sobel_kernel(img_h, img_w, img_in, sobel_out); break;
-            case 5: bench_gaussian_blur_kernel(img_h, img_w, img_in, blur_out); break;
-            case 6: bench_pid_controller_kernel(ctrl_steps, setpoints, meas, 1.2, 0.4, 0.05, 0.01, pid_out); break;
-            case 7: bench_ekf_attitude_kernel(ctrl_steps, gyro, accel, 0.01, ekf_out); break;
-        }
+        // Warmup
+        invoke_benchmark(&ws, b);
 
         atft_reset_stats();
         if (strcmp(policy_name, "adaptive_high") == 0) {
             g_atft_state.current_mode = ATFT_MODE_HIGH;
         }
 
-        int iters = iters_list[b];
+        int iters = ws.perf_iters[b];
         uint64_t total_hw_insts = 0, total_hw_cycles = 0;
         double t0 = now_sec();
         harness_pmu_start(&pmu);
         for (int it = 0; it < iters; it++) {
-            switch (b) {
-                case 0: bench_dgemm_kernel(n_mat, A, B, C); break;
-                case 1: bench_dgemv_kernel(n_mat, A, x, y); break;
-                case 2: bench_fft_radix2_kernel(n_fft, fft_re, fft_im, fft_out_re, fft_out_im); break;
-                case 3: bench_fir_filter_kernel(n_fir, n_taps, fir_sig, fir_coeffs, fir_out); break;
-                case 4: bench_sobel_kernel(img_h, img_w, img_in, sobel_out); break;
-                case 5: bench_gaussian_blur_kernel(img_h, img_w, img_in, blur_out); break;
-                case 6: bench_pid_controller_kernel(ctrl_steps, setpoints, meas, 1.2, 0.4, 0.05, 0.01, pid_out); break;
-                case 7: bench_ekf_attitude_kernel(ctrl_steps, gyro, accel, 0.01, ekf_out); break;
-            }
+            invoke_benchmark(&ws, b);
         }
         harness_pmu_stop(&pmu, &total_hw_insts, &total_hw_cycles);
         double t1 = now_sec();
@@ -163,7 +244,7 @@ static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir,
         uint64_t hw_cycles = total_hw_cycles / (uint64_t)iters;
 
         char gpath[512];
-        snprintf(gpath, sizeof(gpath), "%s/golden_%s.bin", golden_dir, bench_names[b]);
+        snprintf(gpath, sizeof(gpath), "%s/golden_%s.bin", golden_dir, BENCH_NAMES[b]);
         harness_qor_metrics_t qor;
         memset(&qor, 0, sizeof(qor));
         qor.psnr_db = 120.0;
@@ -171,17 +252,17 @@ static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir,
         if (dump_golden) {
             FILE *fp = fopen(gpath, "wb");
             if (fp) {
-                fwrite(out_ptrs[b], sizeof(double), out_sizes[b], fp);
+                fwrite(ws.out_ptrs[b], sizeof(double), ws.out_sizes[b], fp);
                 fclose(fp);
             }
         } else {
-            double *golden_buf = calloc(out_sizes[b], sizeof(double));
+            double *golden_buf = calloc(ws.out_sizes[b], sizeof(double));
             FILE *fp = fopen(gpath, "rb");
             if (fp) {
-                size_t nr = fread(golden_buf, sizeof(double), out_sizes[b], fp);
+                size_t nr = fread(golden_buf, sizeof(double), ws.out_sizes[b], fp);
                 (void)nr;
                 fclose(fp);
-                harness_compute_qor(out_sizes[b], golden_buf, out_ptrs[b], peak_vals[b], &qor);
+                harness_compute_qor(ws.out_sizes[b], golden_buf, ws.out_ptrs[b], ws.peak_vals[b], &qor);
             }
             free(golden_buf);
         }
@@ -190,104 +271,36 @@ static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir,
         uint64_t false_alarms_per_iter = g_atft_state.detected_faults / (uint64_t)iters;
 
         printf("PMU_CSV,%s,%s,%.3f,%lu,%lu,%.6e,%.6e,%.6e,%.2f,%lu,%lu\n",
-               policy_name, bench_names[b], avg_us,
+               policy_name, BENCH_NAMES[b], avg_us,
                (unsigned long)hw_insts, (unsigned long)hw_cycles,
                qor.rel_l2_err, qor.mean_rel_err, qor.max_abs_err, qor.psnr_db,
                (unsigned long)votes_per_iter, (unsigned long)false_alarms_per_iter);
     }
 
     harness_pmu_close(&pmu);
-    free(A); free(B); free(C); free(x); free(y);
-    free(fft_re); free(fft_im); free(fft_out_re); free(fft_out_im);
-    free(fir_sig); free(fir_coeffs); free(fir_out);
-    free(img_in); free(sobel_out); free(blur_out);
-    free(setpoints); free(meas); free(pid_out);
-    free(gyro); free(accel); free(ekf_out);
+    free_workspace(&ws);
     return 0;
 }
 
-// ============================================================================
-// 模式 2: 标准两阶段 One-Fault-Per-Run 故障注入实验 (LLFI / SASSIFI / SC'19 标准)
-// Phase 1: 跑一次无故障执行，获取真实总动态目标指令数 N_dyn
-// Phase 2: 跑 M 次独立实验，每次均匀随机抽 k ∈ [1, N_dyn] 与 bit ∈ [0, 63]，
-//          按五分类统计结果：
-//          - Masked (完全掩盖: rel_l2 <= 1e-12 且 detected == 0)
-//          - Detected_Recovered (投票器检出并恢复: detected > 0 且 rel_l2 <= 0.01)
-//          - Benign_Approx (未超阈值但误差落在 (1e-12, 0.01] 可接受界内)
-//          - SDC (静默数据损坏: rel_l2 > 0.01 或 NaN/Inf，且 unrecoverable == 0)
-//          - DUE (检出但三路不一致无法恢复: unrecoverable > 0)
-// ============================================================================
 static int run_standard_one_fault_fi(const char *policy_name, const char *golden_dir, int trials) {
-    const int n_mat = 24;
-    const int n_fft = 32;
-    const int n_fir = 256, n_taps = 16;
-    const int img_h = 24, img_w = 24;
-    const int ctrl_steps = 256;
+    (void)golden_dir;
+    suite_workspace_t ws;
+    alloc_and_init_workspace(&ws, 1);
 
-    double *A = calloc(n_mat * n_mat, sizeof(double));
-    double *B = calloc(n_mat * n_mat, sizeof(double));
-    double *C = calloc(n_mat * n_mat, sizeof(double));
-    double *x = calloc(n_mat, sizeof(double));
-    double *y = calloc(n_mat, sizeof(double));
-    double *fft_re = calloc(n_fft, sizeof(double));
-    double *fft_im = calloc(n_fft, sizeof(double));
-    double *fft_out_re = calloc(n_fft, sizeof(double));
-    double *fft_out_im = calloc(n_fft, sizeof(double));
-    double *fir_sig = calloc(n_fir, sizeof(double));
-    double *fir_coeffs = calloc(n_taps, sizeof(double));
-    double *fir_out = calloc(n_fir, sizeof(double));
-    double *img_in = calloc(img_h * img_w, sizeof(double));
-    double *sobel_out = calloc(img_h * img_w, sizeof(double));
-    double *blur_out = calloc(img_h * img_w, sizeof(double));
-    double *setpoints = calloc(ctrl_steps, sizeof(double));
-    double *meas = calloc(ctrl_steps, sizeof(double));
-    double *pid_out = calloc(ctrl_steps, sizeof(double));
-    double *gyro = calloc(ctrl_steps, sizeof(double));
-    double *accel = calloc(ctrl_steps, sizeof(double));
-    double *ekf_out = calloc(ctrl_steps, sizeof(double));
-
-    init_test_inputs(n_mat, A, B, x, n_fft, fft_re, fft_im,
-                     n_fir, n_taps, fir_sig, fir_coeffs,
-                     img_h, img_w, img_in,
-                     ctrl_steps, setpoints, meas, gyro, accel);
-
-    const char *bench_names[8] = {
-        "dgemm", "dgemv", "fft", "fir", "sobel", "gaussian_blur", "pid", "ekf"
-    };
-    int out_sizes[8] = {
-        n_mat * n_mat, n_mat, n_fft, n_fir, img_h * img_w, img_h * img_w, ctrl_steps, ctrl_steps
-    };
-    double *out_ptrs[8] = {
-        C, y, fft_out_re, fir_out, sobel_out, blur_out, pid_out, ekf_out
-    };
-    double peak_vals[8] = {
-        20.0, 20.0, 16.0, 1.5, 255.0, 255.0, 2.0, 1.5
-    };
-
-    for (int b = 0; b < 8; b++) {
-        // Phase 1: Profiling 阶段 (无故障运行一次，统计总动态目标指令数 N_dyn 并获取基准输出)
-        double *golden_buf = calloc(out_sizes[b], sizeof(double));
+    for (int b = 0; b < NUM_BENCHES; b++) {
+        double *golden_buf = calloc(ws.out_sizes[b], sizeof(double));
         atft_init(10000.0, 4.0, 3, 4, 3);
         if (strstr(policy_name, "adaptive") != NULL) {
             g_atft_state.current_mode = ATFT_MODE_HIGH;
         }
         harness_fi_reset_profile();
 
-        switch (b) {
-            case 0: bench_dgemm_kernel(n_mat, A, B, golden_buf); break;
-            case 1: bench_dgemv_kernel(n_mat, A, x, golden_buf); break;
-            case 2: bench_fft_radix2_kernel(n_fft, fft_re, fft_im, golden_buf, fft_out_im); break;
-            case 3: bench_fir_filter_kernel(n_fir, n_taps, fir_sig, fir_coeffs, golden_buf); break;
-            case 4: bench_sobel_kernel(img_h, img_w, img_in, golden_buf); break;
-            case 5: bench_gaussian_blur_kernel(img_h, img_w, img_in, golden_buf); break;
-            case 6: bench_pid_controller_kernel(ctrl_steps, setpoints, meas, 1.2, 0.4, 0.05, 0.01, golden_buf); break;
-            case 7: bench_ekf_attitude_kernel(ctrl_steps, gyro, accel, 0.01, golden_buf); break;
-        }
+        invoke_benchmark(&ws, b);
+        memcpy(golden_buf, ws.out_ptrs[b], ws.out_sizes[b] * sizeof(double));
 
         uint64_t total_dyn_insts = harness_fi_get_total_dyn_insts();
         uint64_t baseline_false_alarms = g_atft_state.detected_faults;
 
-        // Phase 2: One-Fault-Per-Run 均匀采样注入阶段
         int cnt_masked = 0;
         int cnt_det_rec = 0;
         int cnt_benign = 0;
@@ -308,20 +321,11 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
             }
             harness_fi_arm_one_fault(target_step, target_bit);
 
-            memset(out_ptrs[b], 0, out_sizes[b] * sizeof(double));
-            switch (b) {
-                case 0: bench_dgemm_kernel(n_mat, A, B, C); break;
-                case 1: bench_dgemv_kernel(n_mat, A, x, y); break;
-                case 2: bench_fft_radix2_kernel(n_fft, fft_re, fft_im, fft_out_re, fft_out_im); break;
-                case 3: bench_fir_filter_kernel(n_fir, n_taps, fir_sig, fir_coeffs, fir_out); break;
-                case 4: bench_sobel_kernel(img_h, img_w, img_in, sobel_out); break;
-                case 5: bench_gaussian_blur_kernel(img_h, img_w, img_in, blur_out); break;
-                case 6: bench_pid_controller_kernel(ctrl_steps, setpoints, meas, 1.2, 0.4, 0.05, 0.01, pid_out); break;
-                case 7: bench_ekf_attitude_kernel(ctrl_steps, gyro, accel, 0.01, ekf_out); break;
-            }
+            memset(ws.out_ptrs[b], 0, ws.out_sizes[b] * sizeof(double));
+            invoke_benchmark(&ws, b);
 
             harness_qor_metrics_t qor;
-            harness_compute_qor(out_sizes[b], golden_buf, out_ptrs[b], peak_vals[b], &qor);
+            harness_compute_qor(ws.out_sizes[b], golden_buf, ws.out_ptrs[b], ws.peak_vals[b], &qor);
 
             int fault_detected = (g_atft_state.detected_faults > baseline_false_alarms);
             int unrec = (g_atft_state.unrecoverable_faults > 0);
@@ -351,53 +355,19 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
         double avg_err   = valid_runs > 0 ? (sum_valid_rel_err / valid_runs) : 0.0;
 
         printf("FI5_CSV,%s,%s,%lu,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.6e\n",
-               policy_name, bench_names[b], (unsigned long)total_dyn_insts, trials,
+               policy_name, BENCH_NAMES[b], (unsigned long)total_dyn_insts, trials,
                p_masked, p_det_rec, p_benign, p_sdc, p_due, avg_err);
 
         free(golden_buf);
     }
 
-    free(A); free(B); free(C); free(x); free(y);
-    free(fft_re); free(fft_im); free(fft_out_re); free(fft_out_im);
-    free(fir_sig); free(fir_coeffs); free(fir_out);
-    free(img_in); free(sobel_out); free(blur_out);
-    free(setpoints); free(meas); free(pid_out);
-    free(gyro); free(accel); free(ekf_out);
+    free_workspace(&ws);
     return 0;
 }
 
-// ============================================================================
-// 模式 3: 在轨太阳耀斑辐射风暴动态自适应切换轨迹 (使用硬件 PMU 测量每窗口真实指令数)
-// ============================================================================
 static int run_adaptive_trace_pmu(void) {
-    const int n_mat = 32;
-    const int n_fft = 48;
-    const int ctrl_steps = 256;
-
-    double *A = calloc(n_mat * n_mat, sizeof(double));
-    double *B = calloc(n_mat * n_mat, sizeof(double));
-    double *C = calloc(n_mat * n_mat, sizeof(double));
-    double *x = calloc(n_mat, sizeof(double));
-    double *y = calloc(n_mat, sizeof(double));
-    double *fft_re = calloc(n_fft, sizeof(double));
-    double *fft_im = calloc(n_fft, sizeof(double));
-    double *fft_out_re = calloc(n_fft, sizeof(double));
-    double *fft_out_im = calloc(n_fft, sizeof(double));
-    double *fir_sig = calloc(256, sizeof(double));
-    double *fir_coeffs = calloc(16, sizeof(double));
-    double *img_in = calloc(32 * 32, sizeof(double));
-    double *sobel_out = calloc(32 * 32, sizeof(double));
-    double *setpoints = calloc(ctrl_steps, sizeof(double));
-    double *meas = calloc(ctrl_steps, sizeof(double));
-    double *pid_out = calloc(ctrl_steps, sizeof(double));
-    double *gyro = calloc(ctrl_steps, sizeof(double));
-    double *accel = calloc(ctrl_steps, sizeof(double));
-    double *ekf_out = calloc(ctrl_steps, sizeof(double));
-
-    init_test_inputs(n_mat, A, B, x, n_fft, fft_re, fft_im,
-                     256, 16, fir_sig, fir_coeffs,
-                     32, 32, img_in,
-                     ctrl_steps, setpoints, meas, gyro, accel);
+    suite_workspace_t ws;
+    alloc_and_init_workspace(&ws, 1);
 
     harness_pmu_t pmu;
     harness_pmu_init(&pmu);
@@ -424,25 +394,25 @@ static int run_adaptive_trace_pmu(void) {
         harness_pmu_start(&pmu);
 
         for (int sub = 0; sub < 5; sub++) {
-            bench_dgemm_kernel(n_mat, A, B, C);
+            invoke_benchmark(&ws, 0); // pb_gemm
             atft_advance_insts(600000);
             if (ecc_events_in_win >= 5) atft_report_ecc_event();
 
-            bench_dgemv_kernel(n_mat, A, x, y);
+            invoke_benchmark(&ws, 2); // pb_atax
             atft_advance_insts(100000);
             if (ecc_events_in_win >= 5) atft_report_ecc_event();
 
-            bench_fft_radix2_kernel(n_fft, fft_re, fft_im, fft_out_re, fft_out_im);
+            invoke_benchmark(&ws, 8); // dsp_kissfft
             atft_advance_insts(300000);
             if (ecc_events_in_win >= 5) atft_report_ecc_event();
 
-            bench_sobel_kernel(32, 32, img_in, sobel_out);
+            invoke_benchmark(&ws, 6); // axc_sobel
             atft_advance_insts(200000);
             if (ecc_events_in_win >= 5) atft_report_ecc_event();
 
-            bench_pid_controller_kernel(ctrl_steps, setpoints, meas, 1.2, 0.4, 0.05, 0.01, pid_out);
-            bench_ekf_attitude_kernel(ctrl_steps, gyro, accel, 0.01, ekf_out);
-            bench_noncritical_telemetry_checksum(ctrl_steps, pid_out);
+            invoke_benchmark(&ws, 10); // gnc_pid
+            invoke_benchmark(&ws, 11); // gnc_ekf
+            bench_noncritical_telemetry_checksum(ws.ctrl_steps, ws.pid_out);
             atft_advance_insts(200000);
 
             if (ecc_events_in_win == 1 && sub == 2) {
@@ -464,25 +434,14 @@ static int run_adaptive_trace_pmu(void) {
     }
 
     harness_pmu_close(&pmu);
-    free(A); free(B); free(C); free(x); free(y);
-    free(fft_re); free(fft_im); free(fft_out_re); free(fft_out_im);
-    free(fir_sig); free(fir_coeffs);
-    free(img_in); free(sobel_out);
-    free(setpoints); free(meas); free(pid_out);
-    free(gyro); free(accel); free(ekf_out);
+    free_workspace(&ws);
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage:\n"
-                        "  %s --dump-golden <golden_dir>\n"
-                        "  %s --pmu-perf <policy_name> <golden_dir>\n"
-                        "  %s --fi-one <policy_name> <golden_dir> <trials>\n"
-                        "  %s --trace-pmu\n", argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
-
     if (strcmp(argv[1], "--dump-golden") == 0 && argc >= 3) {
         return run_pmu_perf_and_qor("native", argv[2], 1);
     } else if (strcmp(argv[1], "--pmu-perf") == 0 && argc >= 4) {

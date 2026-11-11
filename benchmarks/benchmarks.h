@@ -8,27 +8,62 @@
 extern "C" {
 #endif
 
-// 1. 数值计算: dgemm (双精度矩阵乘 C = A * B) 与 dgemv (双精度矩阵向量乘 y = A * x)
-void bench_dgemm_kernel(int n, const double *A, const double *B, double *C);
-void bench_dgemv_kernel(int n, const double *A, const double *x, double *y);
+// ============================================================================
+// 标准开源基准测试套件接口 (12 Benchmarks across 4 Standard Domains)
+//   Suite A: PolyBench/C 4.2.1 (Pouchet & Yuki, OSU/Inria)
+//     1. pb_gemm      (linear-algebra/blas/gemm)
+//     2. pb_2mm       (linear-algebra/kernels/2mm)
+//     3. pb_atax      (linear-algebra/kernels/atax)
+//     4. pb_bicg      (linear-algebra/kernels/bicg)
+//     5. pb_jacobi2d  (stencils/jacobi-2d)
+//   Suite B: PARSEC & ACCEPT Approximate Computing Benchmark Suite
+//     6. parsec_blackscholes (PARSEC 3.0 / Intel Black-Scholes PDE pricing)
+//     7. axc_sobel           (ACCEPT / loop-perforation Sobel gradient filter)
+//     8. axc_gaussian        (ACCEPT / 5x5 Gaussian image convolution)
+//   Suite C: Digital Signal Processing (KissFFT & CMSIS-DSP)
+//     9. dsp_kissfft         (KissFFT mixed-radix spectral transform)
+//    10. dsp_fir             (Time-domain FIR filter kernel)
+//   Suite D: GNC Attitude & Flight Control (Guidance, Navigation, and Control)
+//    11. gnc_pid             (Closed-loop PID attitude controller)
+//    12. gnc_ekf             (2-state Extended Kalman Filter with covariance update)
+// ============================================================================
 
-// 2. 数字信号处理: FFT (蝶形运算+旋转因子计算) 与 FIR 有限冲激响应滤波
-void bench_fft_radix2_kernel(int n, const double *in_re, const double *in_im,
-                             double *out_re, double *out_im);
-void bench_fir_filter_kernel(int n_samples, int n_taps, const double *signal,
-                             const double *coeffs, double *output);
+void bench_pb_gemm(int ni, int nj, int nk, double alpha, double beta,
+                   const double *A, const double *B, double *C);
 
-// 3. 图像处理: Sobel 边缘检测 与 Gaussian 5x5 高斯平滑滤波
-void bench_sobel_kernel(int h, int w, const double *img_in, double *img_out);
-void bench_gaussian_blur_kernel(int h, int w, const double *img_in, double *img_out);
+void bench_pb_2mm(int ni, int nj, int nk, int nl, double alpha, double beta,
+                  double *tmp, const double *A, const double *B,
+                  const double *C, double *D);
 
-// 4. 控制算法: PID 姿态控制器 与 EKF 扩展卡尔曼滤波状态更新
-void bench_pid_controller_kernel(int steps, const double *setpoints, const double *measurements,
-                                 double kp, double ki, double kd, double dt, double *control_out);
-void bench_ekf_attitude_kernel(int steps, const double *gyro_rates, const double *accel_angles,
-                               double dt, double *state_est_out);
+void bench_pb_atax(int m, int n, const double *A, const double *x,
+                   double *y, double *tmp);
 
-// 辅助函数: 非关键遥测日志统计函数 (用于测试编译期关键性分级: NON_CRITICAL)
+void bench_pb_bicg(int m, int n, const double *A, double *s, double *q,
+                   const double *p, const double *r);
+
+void bench_pb_jacobi2d(int tsteps, int n, double *A, double *B);
+
+void bench_parsec_blackscholes(int n_options, const double *sptprice,
+                               const double *strike, const double *rate,
+                               const double *volatility, const double *otime,
+                               double *prices_out);
+
+void bench_axc_sobel(int h, int w, const double *img_in, double *img_out);
+
+void bench_axc_gaussian(int h, int w, const double *img_in, double *img_out);
+
+void bench_dsp_kissfft(int n, const double *in_re, const double *in_im,
+                       double *out_re, double *out_im);
+
+void bench_dsp_fir(int n_samples, int n_taps, const double *signal,
+                   const double *coeffs, double *output);
+
+void bench_gnc_pid(int steps, const double *setpoints, const double *measurements,
+                   double kp, double ki, double kd, double dt, double *control_out);
+
+void bench_gnc_ekf(int steps, const double *gyro_rates, const double *accel_angles,
+                   double dt, double *state_est_out);
+
 double bench_noncritical_telemetry_checksum(int n, const double *buf);
 
 #ifdef __cplusplus

@@ -77,7 +77,10 @@ void atft_advance_insts(uint64_t inst_count);
 void atft_report_ecc_event(void);
 void atft_step_window(void);
 
-// 传统精确 TMR 多数表决器 (Baseline: 3次精确计算)
+// EDDI (Oh et al., IEEE TR'02) / SWIFT (Reis et al., CGO'05) 双模校验器 (DMR: 仅检错触发 DUE，无法三模自恢复)
+double  atft_eddi_swift_check_f64(double r_master, double r_shadow);
+
+// 传统精确 TMR 多数表决器 (Baseline: 3次精确计算, COAST IEEE TNS'19)
 double  atft_voter_exact_f64(double r1, double r2, double r3);
 int32_t atft_voter_exact_i32(int32_t r1, int32_t r2, int32_t r3);
 
