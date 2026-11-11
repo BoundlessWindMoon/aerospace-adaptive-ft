@@ -101,15 +101,15 @@
   }
   .grid-equal {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 22px;
-    align-items: start;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 20px;
+    align-items: stretch;
   }
   .grid-3 {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 18px;
-    align-items: start;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+    align-items: stretch;
   }
   @media (max-width: 1200px) {
     .kpi-grid, .grid-equal, .grid-3 { grid-template-columns: 1fr; }
@@ -120,6 +120,9 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    overflow-x: auto;
   }
   .panel-box h3 {
     font-size: 14px;
@@ -333,23 +336,18 @@
   <p class="desc">在完全相同的 12 个标准负载与独立评测器下，集中对比三类主流容错方案（<strong>EDDI</strong> [IEEE TR'02]、<strong>SWIFT</strong> [CGO'05]、<strong>COAST-TMR</strong> [IEEE TNS'19]）以及四类选择性保护排序算法（<strong>Random</strong>、<strong>HotPath</strong>、<strong>SDCTune</strong> [HPDC'14]、<strong>Shoestring</strong> [ASPLOS'10]）。</p>
   <div class="grid-equal">
     <div class="panel-box">
-      <h3>4.1 容错冗余机制横向对比 (12 个标准负载均值与五分类故障分布)</h3>
-      <div class="legend" style="margin-top:6px;">
-        <span><i class="dot" style="background:#64748b"></i>完全掩盖</span>
-        <span><i class="dot" style="background:#10b981"></i>检出并恢复</span>
-        <span><i class="dot" style="background:#38bdf8"></i>良性误差</span>
-        <span><i class="dot" style="background:#f59e0b"></i>不可恢复中断 (DUE)</span>
-        <span><i class="dot" style="background:#ef4444"></i>静默损坏 (SDC)</span>
-      </div>
+      <h3>4.1 容错冗余机制横向对比 (12 个标准负载均值)</h3>
+      <p class="sub-desc">对比双模检错方案 (EDDI / SWIFT，检出即中断 DUE) 与三模表决方案 (COAST-TMR / 本文方案，支持在线自恢复)。</p>
+      <svg class="chart" id="svg-rq1-baseline" viewBox="0 0 580 215"></svg>
       <table id="tbl-baseline-mech">
         <thead>
           <tr>
             <th>容错方案</th>
             <th>代表文献</th>
-            <th style="text-align:left;width:155px;">五分类故障分布</th>
             <th>指令倍率</th>
-            <th>平均 DUE</th>
-            <th>平均 SDC</th>
+            <th>检出恢复</th>
+            <th>中断 DUE</th>
+            <th>静默 SDC</th>
             <th>综合 MWTF</th>
           </tr>
         </thead>
@@ -357,16 +355,17 @@
       </table>
     </div>
     <div class="panel-box">
-      <h3>4.2 选择性保护排序算法横向对比 (25%–100% 指令保护预算下的平均 SDC 率)</h3>
+      <h3>4.2 选择性保护排序算法横向对比 (25%–100% 指令预算)</h3>
+      <p class="sub-desc">在受限指令保护比例下，对比各静态/动态排序算法将冗余资源分配给高脆弱性指令后的剩余 SDC 率。</p>
       <svg class="chart" id="svg-rq2" viewBox="0 0 580 215"></svg>
       <table id="tbl-rq2">
         <thead>
           <tr>
-            <th>保护比例预算</th>
+            <th>保护预算</th>
             <th>Random</th>
             <th>HotPath</th>
-            <th>SDCTune (HPDC'14)</th>
-            <th>Shoestring (ASPLOS'10)</th>
+            <th>SDCTune</th>
+            <th>Shoestring</th>
             <th>Semantic (本文)</th>
           </tr>
         </thead>
@@ -616,25 +615,21 @@ const avgFI = (pol, col) => {
 
   const svg6 = document.getElementById("svg-rq6");
   let h6 = `<line x1="35" y1="175" x2="420" y2="175" stroke="#334155" />
-            <rect x="40" y="10" width="9" height="9" fill="#10b981" />
-            <text x="53" y="18" fill="#cbd5e1" font-size="10.5">本方案完好存活率</text>
-            <rect x="180" y="10" width="9" height="9" fill="#f59e0b" />
-            <text x="193" y="18" fill="#cbd5e1" font-size="10.5">SWIFT 存活率</text>
-            <rect x="300" y="10" width="9" height="9" fill="#ef4444" />
-            <text x="313" y="18" fill="#cbd5e1" font-size="10.5">Native SDC 率</text>`;
+            <rect x="45" y="10" width="9" height="9" fill="#10b981" />
+            <text x="58" y="18" fill="#cbd5e1" font-size="10.5">本方案完好存活率 (%)</text>
+            <rect x="225" y="10" width="9" height="9" fill="#ef4444" />
+            <text x="238" y="18" fill="#cbd5e1" font-size="10.5">Native 静默损坏 SDC 率 (%)</text>`;
   const burstLv = ["k=1 Fault/Run", "k=2 Faults/Run", "k=4 Faults/Run", "k=8 Faults/Run"];
   const ptsSimdOk = burstLv.map((lv, idx) => `${65 + idx*105},${175 - (Number(stMap["approx_simd_" + lv].survive_ok_pct)/100)*140}`).join(" ");
-  const ptsSwiftOk = burstLv.map((lv, idx) => `${65 + idx*105},${175 - (Number(stMap["swift_" + lv].survive_ok_pct)/100)*140}`).join(" ");
   const ptsNatSdc = burstLv.map((lv, idx) => `${65 + idx*105},${175 - (Number(stMap["native_" + lv].sdc_pct)/100)*140}`).join(" ");
-  h6 += `<polyline fill="none" stroke="#10b981" stroke-width="2.3" points="${ptsSimdOk}" />`;
-  h6 += `<polyline fill="none" stroke="#f59e0b" stroke-width="2.0" stroke-dasharray="4,3" points="${ptsSwiftOk}" />`;
-  h6 += `<polyline fill="none" stroke="#ef4444" stroke-width="2.2" points="${ptsNatSdc}" />`;
+  h6 += `<polyline fill="none" stroke="#10b981" stroke-width="2.4" points="${ptsSimdOk}" />`;
+  h6 += `<polyline fill="none" stroke="#ef4444" stroke-width="2.3" points="${ptsNatSdc}" />`;
   ["k=1", "k=2", "k=4", "k=8"].forEach((lb, idx) => {
     h6 += `<text x="${65 + idx*105}" y="194" fill="#94a3b8" font-size="10.5" text-anchor="middle">连续 ${lb} 故障</text>`;
   });
   svg6.innerHTML = h6;
 
-  // 3.3 跨 Cache 层级规模扩展
+  // 3.3 跨 Cache 层级规模扩展 (仅展示 Native / Approx-Scalar / Approx-SIMD，保持模块3纯粹)
   const scMap = {};
   DATA.rq7_scale.forEach(r => { scMap[r.policy + "_" + r.matrix_n] = r; });
   const sizes = [32, 64, 128, 256];
@@ -653,22 +648,18 @@ const avgFI = (pol, col) => {
 
   const svg7 = document.getElementById("svg-rq7");
   let h7 = `<line x1="35" y1="175" x2="420" y2="175" stroke="#334155" />
-            <rect x="45" y="10" width="9" height="9" fill="#ef4444" />
-            <text x="58" y="18" fill="#cbd5e1" font-size="10.5">COAST-TMR 耗时倍率</text>
-            <rect x="195" y="10" width="9" height="9" fill="#a855f7" />
-            <text x="208" y="18" fill="#cbd5e1" font-size="10.5">Approx-Scalar</text>
-            <rect x="315" y="10" width="9" height="9" fill="#38bdf8" />
-            <text x="328" y="18" fill="#cbd5e1" font-size="10.5">Approx-SIMD (本文)</text>`;
+            <rect x="55" y="10" width="9" height="9" fill="#a855f7" />
+            <text x="68" y="18" fill="#cbd5e1" font-size="10.5">标量近似耗时倍率</text>
+            <rect x="225" y="10" width="9" height="9" fill="#38bdf8" />
+            <text x="238" y="18" fill="#cbd5e1" font-size="10.5">SIMD 向量近似耗时倍率</text>`;
   sizes.forEach((n, i) => {
-    const x0 = 52 + i * 92;
+    const x0 = 58 + i * 92;
     const tNat = Number(scMap["native_" + n].exec_time_us);
-    const rTmr = Number(scMap["exact_tmr_" + n].exec_time_us) / tNat;
     const rSca = Number(scMap["approx_scalar_" + n].exec_time_us) / tNat;
     const rSimd = Number(scMap["approx_simd_" + n].exec_time_us) / tNat;
-    h7 += `<rect x="${x0}" y="${175 - Math.min(145, rTmr*14)}" width="14" height="${Math.min(145, rTmr*14)}" fill="#ef4444" rx="1.5"><title>TMR: ${rTmr.toFixed(2)}x</title></rect>`;
-    h7 += `<rect x="${x0+16}" y="${175 - Math.min(145, rSca*14)}" width="14" height="${Math.min(145, rSca*14)}" fill="#a855f7" rx="1.5"><title>Scalar: ${rSca.toFixed(2)}x</title></rect>`;
-    h7 += `<rect x="${x0+32}" y="${175 - Math.min(145, rSimd*14)}" width="14" height="${Math.min(145, rSimd*14)}" fill="#38bdf8" rx="1.5"><title>SIMD: ${rSimd.toFixed(2)}x</title></rect>`;
-    h7 += `<text x="${x0+23}" y="194" fill="#94a3b8" font-size="10" text-anchor="middle">N=${n}</text>`;
+    h7 += `<rect x="${x0}" y="${175 - Math.min(145, rSca*20)}" width="18" height="${Math.min(145, rSca*20)}" fill="#a855f7" rx="2"><title>Scalar: ${rSca.toFixed(2)}x</title></rect>`;
+    h7 += `<rect x="${x0+22}" y="${175 - Math.min(145, rSimd*20)}" width="18" height="${Math.min(145, rSimd*20)}" fill="#38bdf8" rx="2"><title>SIMD: ${rSimd.toFixed(2)}x</title></rect>`;
+    h7 += `<text x="${x0+20}" y="194" fill="#94a3b8" font-size="10" text-anchor="middle">N=${n}</text>`;
   });
   svg7.innerHTML = h7;
 })();
@@ -677,17 +668,15 @@ const avgFI = (pol, col) => {
 (function renderBaselineComparison() {
   const natI = sumInst("native");
   const mechs = [
-    { pol: "native",        name: "Native (无保护)",          cite: "Baseline" },
-    { pol: "eddi",          name: "EDDI (全指令+访存双模检测)", cite: "Oh et al., IEEE TR'02" },
-    { pol: "swift",         name: "SWIFT (寄存器链双模检测)",  cite: "Reis et al., CGO'05" },
-    { pol: "exact_tmr",     name: "COAST-TMR (全精度三模表决)", cite: "Chielle et al., IEEE TNS'19" },
-    { pol: "approx_simd",   name: "Approx-SIMD (本文方案)",   cite: "Proposed" }
+    { pol: "native",      short: "Native",      name: "Native (无保护)",        cite: "Baseline" },
+    { pol: "eddi",        short: "EDDI",        name: "EDDI (全复制双模)",      cite: "IEEE TR'02" },
+    { pol: "swift",       short: "SWIFT",       name: "SWIFT (寄存器双模)",     cite: "CGO'05" },
+    { pol: "exact_tmr",   short: "COAST-TMR",   name: "COAST-TMR (精确三模)",   cite: "IEEE TNS'19" },
+    { pol: "approx_simd", short: "Approx-SIMD", name: "Approx-SIMD (本文方案)", cite: "Proposed" }
   ];
 
   document.querySelector("#tbl-baseline-mech tbody").innerHTML = mechs.map(mc => {
-    const m = avgFI(mc.pol, "masked_pct");
     const d = avgFI(mc.pol, "det_recovered_pct");
-    const b = avgFI(mc.pol, "benign_pct");
     const u = avgFI(mc.pol, "due_pct");
     const s = avgFI(mc.pol, "sdc_pct");
     const ratio = sumInst(mc.pol) / natI;
@@ -696,21 +685,49 @@ const avgFI = (pol, col) => {
     return `<tr style="${isOurs ? 'background:rgba(16,185,129,0.08)' : ''}">
       <td><strong>${mc.name}</strong></td>
       <td style="color:var(--muted)">${mc.cite}</td>
-      <td>
-        <div class="bar-wrap">
-          <div class="bar-seg" style="width:${m}%;background:#64748b" title="完全掩盖: ${m.toFixed(1)}%"></div>
-          <div class="bar-seg" style="width:${d}%;background:#10b981" title="检出并恢复: ${d.toFixed(1)}%"></div>
-          <div class="bar-seg" style="width:${b}%;background:#38bdf8" title="良性误差: ${b.toFixed(1)}%"></div>
-          <div class="bar-seg" style="width:${u}%;background:#f59e0b" title="不可恢复 DUE: ${u.toFixed(1)}%"></div>
-          <div class="bar-seg" style="width:${s}%;background:#ef4444" title="静默损坏 SDC: ${s.toFixed(2)}%"></div>
-        </div>
-      </td>
       <td style="color:${isOurs ? '#38bdf8' : 'inherit'};font-weight:600">${ratio.toFixed(2)}×</td>
+      <td style="color:#10b981;font-weight:600">${d.toFixed(1)}%</td>
       <td style="color:${u > 20 ? '#fbbf24' : '#94a3b8'}">${u.toFixed(2)}%</td>
       <td style="color:${s > 1 ? '#f87171' : '#10b981'};font-weight:700">${s.toFixed(2)}%</td>
       <td style="color:#a855f7;font-weight:700">${mwtf.toFixed(1)}</td>
     </tr>`;
   }).join("");
+
+  // 绘制 4.1 容错机制五分类堆叠水平条形图 + 指令倍率对比
+  const svg1 = document.getElementById("svg-rq1-baseline");
+  let h1 = `<rect x="20" y="10" width="9" height="9" fill="#64748b" /><text x="33" y="18" fill="#cbd5e1" font-size="10.5">完全掩盖</text>
+            <rect x="105" y="10" width="9" height="9" fill="#10b981" /><text x="118" y="18" fill="#cbd5e1" font-size="10.5">检出并在线恢复</text>
+            <rect x="220" y="10" width="9" height="9" fill="#38bdf8" /><text x="233" y="18" fill="#cbd5e1" font-size="10.5">良性误差</text>
+            <rect x="305" y="10" width="9" height="9" fill="#f59e0b" /><text x="318" y="18" fill="#cbd5e1" font-size="10.5">不可恢复中断 (DUE)</text>
+            <rect x="445" y="10" width="9" height="9" fill="#ef4444" /><text x="458" y="18" fill="#cbd5e1" font-size="10.5">静默损坏 (SDC)</text>`;
+  mechs.forEach((mc, idx) => {
+    const y = 36 + idx * 34;
+    const m = avgFI(mc.pol, "masked_pct");
+    const d = avgFI(mc.pol, "det_recovered_pct");
+    const b = avgFI(mc.pol, "benign_pct");
+    const u = avgFI(mc.pol, "due_pct");
+    const s = avgFI(mc.pol, "sdc_pct");
+    const ratio = (sumInst(mc.pol) / natI).toFixed(2) + "×";
+    h1 += `<text x="18" y="${y + 14}" fill="#e2e8f0" font-size="11" font-weight="600">${mc.short}</text>`;
+    let curX = 110;
+    const totW = 390;
+    const segs = [
+      { w: m, c: "#64748b" },
+      { w: d, c: "#10b981" },
+      { w: b, c: "#38bdf8" },
+      { w: u, c: "#f59e0b" },
+      { w: s, c: "#ef4444" }
+    ];
+    segs.forEach(sg => {
+      const sw = (sg.w / 100.0) * totW;
+      if (sw > 0.3) {
+        h1 += `<rect x="${curX}" y="${y}" width="${sw}" height="18" fill="${sg.c}" />`;
+        curX += sw;
+      }
+    });
+    h1 += `<text x="512" y="${y + 14}" fill="#38bdf8" font-size="11" font-weight="600">${ratio}</text>`;
+  });
+  svg1.innerHTML = h1;
 
   const budgets = [0.25, 0.5, 0.75, 1.0];
   const avgSDCFor = (rm, bgt) => {
@@ -719,7 +736,7 @@ const avgFI = (pol, col) => {
   };
 
   document.querySelector("#tbl-rq2 tbody").innerHTML = budgets.map(bgt => `<tr>
-    <td><strong>保护前 ${Math.round(bgt*100)}% 指令</strong></td>
+    <td><strong>前 ${Math.round(bgt*100)}% 指令</strong></td>
     <td>${avgSDCFor("random", bgt).toFixed(2)}%</td>
     <td>${avgSDCFor("hotpath", bgt).toFixed(2)}%</td>
     <td>${avgSDCFor("sdctune", bgt).toFixed(2)}%</td>
@@ -731,15 +748,16 @@ const avgFI = (pol, col) => {
   const methods = [
     { key: "random", color: "#94a3b8", label: "Random" },
     { key: "hotpath", color: "#ef4444", label: "HotPath" },
-    { key: "sdctune", color: "#f59e0b", label: "SDCTune (HPDC'14)" },
-    { key: "shoestring", color: "#38bdf8", label: "Shoestring (ASPLOS'10)" },
+    { key: "sdctune", color: "#f59e0b", label: "SDCTune" },
+    { key: "shoestring", color: "#38bdf8", label: "Shoestring" },
     { key: "semantic", color: "#10b981", label: "Semantic (本文)" }
   ];
   let h2 = `<line x1="40" y1="185" x2="555" y2="185" stroke="#334155" />
             <line x1="40" y1="25" x2="40" y2="185" stroke="#334155" />`;
   methods.forEach((m, i) => {
-    h2 += `<rect x="${45 + i*105}" y="8" width="9" height="9" fill="${m.color}" />
-           <text x="${57 + i*105}" y="16" fill="#cbd5e1" font-size="10">${m.label}</text>`;
+    const lx = 42 + i * 106;
+    h2 += `<rect x="${lx}" y="10" width="9" height="9" fill="${m.color}" />
+           <text x="${lx + 13}" y="18" fill="#cbd5e1" font-size="10.5">${m.label}</text>`;
     const pts = budgets.map((bgt, idx) => {
       const x = 80 + idx * 145;
       const val = avgSDCFor(m.key, bgt);
