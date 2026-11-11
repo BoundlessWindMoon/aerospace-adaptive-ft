@@ -438,6 +438,238 @@ static int run_adaptive_trace_pmu(void) {
     return 0;
 }
 
+// ============================================================================
+// 模式 4 (RQ5): IEEE-754 比特位域脆弱性剖析 (Sign / Exponent / Mantissa-High / Mantissa-Low)
+// 解释为什么全位宽均匀采样下 ~90% 故障被掩盖，以及近似容错对高位致命翻转的精准拦截机理
+// ============================================================================
+static int run_bitfield_sensitivity(const char *policy_name) {
+    suite_workspace_t ws;
+    alloc_and_init_workspace(&ws, 1);
+
+    const char *field_names[4] = {
+        "Sign (Bit 63)",
+        "Exponent (Bits 52-62)",
+        "Mantissa_High (Bits 32-51)",
+        "Mantissa_Low (Bits 0-31)"
+    };
+    const int target_benches[6] = {0, 4, 5, 6, 9, 11}; // pb_gemm, pb_jacobi2d, blackscholes, sobel, fir, ekf
+
+    for (int f = 0; f < 4; f++) {
+        int total_trials = 0;
+        int cnt_masked = 0, cnt_det_rec = 0, cnt_benign = 0, cnt_sdc = 0, cnt_due = 0;
+
+        for (int bi = 0; bi < 6; bi++) {
+            int b = target_benches[bi];
+            double *golden_buf = calloc(ws.out_sizes[b], sizeof(double));
+            atft_init(10000.0, 4.0, 3, 4, 3);
+            harness_fi_reset_profile();
+            invoke_benchmark(&ws, b);
+            memcpy(golden_buf, ws.out_ptrs[b], ws.out_sizes[b] * sizeof(double));
+
+            uint64_t total_dyn_insts = harness_fi_get_total_dyn_insts();
+            uint64_t baseline_false_alarms = g_atft_state.detected_faults;
+            uint64_t rng = 0x55aa55aa12345678ULL ^ ((uint64_t)(f * 17 + b) << 24);
+
+            int trials_per_b = 100;
+            for (int t = 0; t < trials_per_b; t++) {
+                uint64_t target_step = 1 + (splitmix64(&rng) % (total_dyn_insts > 0 ? total_dyn_insts : 1));
+                uint32_t target_bit = 0;
+                if (f == 0) target_bit = 63;
+                else if (f == 1) target_bit = 52 + (uint32_t)(splitmix64(&rng) % 11);
+                else if (f == 2) target_bit = 32 + (uint32_t)(splitmix64(&rng) % 20);
+                else target_bit = (uint32_t)(splitmix64(&rng) % 32);
+
+                atft_init(10000.0, 4.0, 3, 4, 3);
+                harness_fi_arm_one_fault(target_step, target_bit);
+                memset(ws.out_ptrs[b], 0, ws.out_sizes[b] * sizeof(double));
+                invoke_benchmark(&ws, b);
+
+                harness_qor_metrics_t qor;
+                harness_compute_qor(ws.out_sizes[b], golden_buf, ws.out_ptrs[b], ws.peak_vals[b], &qor);
+
+                int fault_detected = (g_atft_state.detected_faults > baseline_false_alarms);
+                int unrec = (g_atft_state.unrecoverable_faults > 0);
+                total_trials++;
+
+                if (unrec) cnt_due++;
+                else if (qor.has_nan_or_inf || qor.rel_l2_err > 0.01) cnt_sdc++;
+                else if (fault_detected) cnt_det_rec++;
+                else if (qor.rel_l2_err <= 1e-12) cnt_masked++;
+                else cnt_benign++;
+            }
+            free(golden_buf);
+        }
+
+        printf("BITFIELD_CSV,%s,%s,%d,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+               policy_name, field_names[f], total_trials,
+               100.0 * cnt_masked / total_trials,
+               100.0 * cnt_det_rec / total_trials,
+               100.0 * cnt_benign / total_trials,
+               100.0 * cnt_sdc / total_trials,
+               100.0 * cnt_due / total_trials);
+    }
+
+    free_workspace(&ws);
+    return 0;
+}
+
+// ============================================================================
+// 模式 5 (RQ6): 空间多比特翻转 (Spatial MBU: 1/2/4-bit) 与时间窗口连续故障冲击 (Temporal Burst: k=1/2/4/8)
+// ============================================================================
+static int run_mbu_and_burst_stress(const char *policy_name) {
+    suite_workspace_t ws;
+    alloc_and_init_workspace(&ws, 1);
+    const int target_benches[6] = {0, 1, 4, 6, 9, 11};
+
+    // (A) Spatial MBU: 1-bit SEU, 2-bit DBU, 4-bit QBU (k=1 event per run)
+    int mbu_widths[3] = {1, 2, 4};
+    const char *mbu_labels[3] = {"SEU (1-bit)", "DBU (2-bit Adjacent)", "QBU (4-bit Burst)"};
+    for (int mw = 0; mw < 3; mw++) {
+        int total_trials = 0, cnt_ok = 0, cnt_det_rec = 0, cnt_sdc = 0, cnt_due = 0;
+        for (int bi = 0; bi < 6; bi++) {
+            int b = target_benches[bi];
+            double *golden_buf = calloc(ws.out_sizes[b], sizeof(double));
+            atft_init(10000.0, 4.0, 3, 4, 3);
+            harness_fi_reset_profile();
+            invoke_benchmark(&ws, b);
+            memcpy(golden_buf, ws.out_ptrs[b], ws.out_sizes[b] * sizeof(double));
+            uint64_t total_dyn_insts = harness_fi_get_total_dyn_insts();
+            uint64_t baseline_fa = g_atft_state.detected_faults;
+            uint64_t rng = 0x9988776655443322ULL ^ ((uint64_t)(mw * 31 + b) << 20);
+
+            for (int t = 0; t < 80; t++) {
+                uint64_t st = 1 + (splitmix64(&rng) % (total_dyn_insts > 0 ? total_dyn_insts : 1));
+                uint32_t bt = (uint32_t)(splitmix64(&rng) % 60);
+                atft_init(10000.0, 4.0, 3, 4, 3);
+                harness_fi_arm_mbu_or_burst(&st, &bt, 1, (uint32_t)mbu_widths[mw]);
+                memset(ws.out_ptrs[b], 0, ws.out_sizes[b] * sizeof(double));
+                invoke_benchmark(&ws, b);
+
+                harness_qor_metrics_t qor;
+                harness_compute_qor(ws.out_sizes[b], golden_buf, ws.out_ptrs[b], ws.peak_vals[b], &qor);
+                total_trials++;
+                if (g_atft_state.unrecoverable_faults > 0) cnt_due++;
+                else if (qor.has_nan_or_inf || qor.rel_l2_err > 0.01) cnt_sdc++;
+                else {
+                    cnt_ok++;
+                    if (g_atft_state.detected_faults > baseline_fa) cnt_det_rec++;
+                }
+            }
+            free(golden_buf);
+        }
+        printf("STRESS_CSV,%s,Spatial_MBU,%s,%d,%.2f,%.2f,%.2f,%.2f\n",
+               policy_name, mbu_labels[mw], total_trials,
+               100.0 * cnt_ok / total_trials,
+               100.0 * cnt_det_rec / total_trials,
+               100.0 * cnt_sdc / total_trials,
+               100.0 * cnt_due / total_trials);
+    }
+
+    // (B) Temporal Multi-Fault Burst: k = 1, 2, 4, 8 faults injected within a single execution
+    int burst_counts[4] = {1, 2, 4, 8};
+    const char *burst_labels[4] = {"k=1 Fault/Run", "k=2 Faults/Run", "k=4 Faults/Run", "k=8 Faults/Run"};
+    for (int bc = 0; bc < 4; bc++) {
+        int k_events = burst_counts[bc];
+        int total_trials = 0, cnt_ok = 0, cnt_det_rec = 0, cnt_sdc = 0, cnt_due = 0;
+        for (int bi = 0; bi < 6; bi++) {
+            int b = target_benches[bi];
+            double *golden_buf = calloc(ws.out_sizes[b], sizeof(double));
+            atft_init(10000.0, 4.0, 3, 4, 3);
+            harness_fi_reset_profile();
+            invoke_benchmark(&ws, b);
+            memcpy(golden_buf, ws.out_ptrs[b], ws.out_sizes[b] * sizeof(double));
+            uint64_t total_dyn_insts = harness_fi_get_total_dyn_insts();
+            uint64_t baseline_fa = g_atft_state.detected_faults;
+            uint64_t rng = 0xabcdef0123456789ULL ^ ((uint64_t)(bc * 43 + b) << 20);
+
+            for (int t = 0; t < 80; t++) {
+                uint64_t steps[16];
+                uint32_t bits[16];
+                for (int e = 0; e < k_events; e++) {
+                    steps[e] = 1 + (splitmix64(&rng) % (total_dyn_insts > 0 ? total_dyn_insts : 1));
+                    bits[e]  = (uint32_t)(splitmix64(&rng) % 64);
+                }
+                atft_init(10000.0, 4.0, 3, 4, 3);
+                harness_fi_arm_mbu_or_burst(steps, bits, k_events, 1);
+                memset(ws.out_ptrs[b], 0, ws.out_sizes[b] * sizeof(double));
+                invoke_benchmark(&ws, b);
+
+                harness_qor_metrics_t qor;
+                harness_compute_qor(ws.out_sizes[b], golden_buf, ws.out_ptrs[b], ws.peak_vals[b], &qor);
+                total_trials++;
+                if (g_atft_state.unrecoverable_faults > 0) cnt_due++;
+                else if (qor.has_nan_or_inf || qor.rel_l2_err > 0.01) cnt_sdc++;
+                else {
+                    cnt_ok++;
+                    if (g_atft_state.detected_faults > baseline_fa) cnt_det_rec++;
+                }
+            }
+            free(golden_buf);
+        }
+        printf("STRESS_CSV,%s,Temporal_Burst,%s,%d,%.2f,%.2f,%.2f,%.2f\n",
+               policy_name, burst_labels[bc], total_trials,
+               100.0 * cnt_ok / total_trials,
+               100.0 * cnt_det_rec / total_trials,
+               100.0 * cnt_sdc / total_trials,
+               100.0 * cnt_due / total_trials);
+    }
+
+    free_workspace(&ws);
+    return 0;
+}
+
+// ============================================================================
+// 模式 6 (RQ7): PolyBench 跨存储层次数据规模扩展测试 (L1 Cache -> L2 Cache -> L3/DRAM)
+// 矩阵维度 N ∈ {32 (24KB, L1), 64 (96KB, L2), 128 (384KB, L2/L3), 256 (1.5MB, L3)}
+// ============================================================================
+static int run_scale_sweep_pmu(const char *policy_name) {
+    int sizes[4] = {32, 64, 128, 256};
+    const char *tier_names[4] = {"N=32 (24KB L1 Cache)", "N=64 (96KB L2 Cache)", "N=128 (384KB L2/L3)", "N=256 (1.5MB L3/DRAM)"};
+    int iters_arr[4] = {200, 60, 15, 4};
+
+    harness_pmu_t pmu;
+    harness_pmu_init(&pmu);
+
+    for (int s = 0; s < 4; s++) {
+        int n = sizes[s];
+        int iters = iters_arr[s];
+        double *A = calloc(n * n, sizeof(double));
+        double *B = calloc(n * n, sizeof(double));
+        double *C = calloc(n * n, sizeof(double));
+        for (int i = 0; i < n * n; i++) {
+            A[i] = 0.5 * sin(0.11 * (double)i) + 0.8;
+            B[i] = 0.5 * cos(0.07 * (double)i) + 0.6;
+            C[i] = 0.1;
+        }
+
+        atft_init(10000.0, 4.0, 3, 4, 3);
+        bench_pb_gemm(n, n, n, 1.5, 1.2, A, B, C); // warmup
+
+        uint64_t hw_insts = 0, hw_cycles = 0;
+        double t0 = now_sec();
+        harness_pmu_start(&pmu);
+        for (int it = 0; it < iters; it++) {
+            bench_pb_gemm(n, n, n, 1.5, 1.2, A, B, C);
+        }
+        harness_pmu_stop(&pmu, &hw_insts, &hw_cycles);
+        double t1 = now_sec();
+
+        double avg_us = (t1 - t0) * 1e6 / (double)iters;
+        uint64_t inst_per_iter = hw_insts / (uint64_t)iters;
+        uint64_t cyc_per_iter  = hw_cycles / (uint64_t)iters;
+        double ipc = cyc_per_iter > 0 ? ((double)inst_per_iter / (double)cyc_per_iter) : 0.0;
+
+        printf("SCALE_CSV,%s,%d,%s,%.2f,%lu,%lu,%.2f\n",
+               policy_name, n, tier_names[s], avg_us,
+               (unsigned long)inst_per_iter, (unsigned long)cyc_per_iter, ipc);
+
+        free(A); free(B); free(C);
+    }
+
+    harness_pmu_close(&pmu);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         return 1;
@@ -450,6 +682,12 @@ int main(int argc, char **argv) {
         return run_standard_one_fault_fi(argv[2], argv[3], atoi(argv[4]));
     } else if (strcmp(argv[1], "--trace-pmu") == 0) {
         return run_adaptive_trace_pmu();
+    } else if (strcmp(argv[1], "--bitfield") == 0 && argc >= 3) {
+        return run_bitfield_sensitivity(argv[2]);
+    } else if (strcmp(argv[1], "--stress") == 0 && argc >= 3) {
+        return run_mbu_and_burst_stress(argv[2]);
+    } else if (strcmp(argv[1], "--scale") == 0 && argc >= 3) {
+        return run_scale_sweep_pmu(argv[2]);
     }
     return 1;
 }

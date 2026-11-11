@@ -299,7 +299,84 @@ def run_all_research_questions():
     with open(RES_DIR / "rq4_adaptive_solar_flare_trace.csv", "w") as f:
         f.write(trace_out)
 
-    print("=== All Evaluations (RQ1 - RQ4) Completed! ===")
+    # =========================================================================
+    # RQ5: IEEE-754 Bit-Field Vulnerability Anatomy (Sign / Exponent / Mantissa-High / Mantissa-Low)
+    # =========================================================================
+    print("=== [RQ5] Running IEEE-754 Bit-Field Vulnerability Anatomy (Native vs SWIFT vs Approx-SIMD) ===")
+    rq5_rows = []
+    for pol in ["native", "swift", "approx_simd"]:
+        fi_bin = BUILD_DIR / f"bin_{pol}_fi"
+        bf_out = run_cmd([str(fi_bin), "--bitfield", pol])
+        for line in bf_out.strip().splitlines():
+            if line.startswith("BITFIELD_CSV,"):
+                p = line.split(",")
+                rq5_rows.append({
+                    "policy": p[1],
+                    "bit_field": p[2],
+                    "trials": int(p[3]),
+                    "masked_pct": float(p[4]),
+                    "det_recovered_pct": float(p[5]),
+                    "benign_pct": float(p[6]),
+                    "sdc_pct": float(p[7]),
+                    "due_pct": float(p[8]),
+                })
+    with open(RES_DIR / "rq5_bitfield_sensitivity.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rq5_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rq5_rows)
+
+    # =========================================================================
+    # RQ6: Spatial MBU (1/2/4-bit) & Temporal Multi-Fault Burst (k=1..8) Stress Test
+    # =========================================================================
+    print("=== [RQ6] Running Spatial MBU (1/2/4-bit) & Temporal Multi-Fault Burst (k=1..8) Stress Test ===")
+    rq6_rows = []
+    for pol in ["native", "swift", "exact_tmr", "approx_simd"]:
+        fi_bin = BUILD_DIR / f"bin_{pol}_fi"
+        st_out = run_cmd([str(fi_bin), "--stress", pol])
+        for line in st_out.strip().splitlines():
+            if line.startswith("STRESS_CSV,"):
+                p = line.split(",")
+                rq6_rows.append({
+                    "policy": p[1],
+                    "stress_type": p[2],
+                    "stress_level": p[3],
+                    "trials": int(p[4]),
+                    "survive_ok_pct": float(p[5]),
+                    "det_recovered_pct": float(p[6]),
+                    "sdc_pct": float(p[7]),
+                    "due_pct": float(p[8]),
+                })
+    with open(RES_DIR / "rq6_mbu_burst_stress.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rq6_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rq6_rows)
+
+    # =========================================================================
+    # RQ7: Workload Problem Size Scaling across Cache Hierarchy (N=32..256)
+    # =========================================================================
+    print("=== [RQ7] Running Problem Size Scaling across Cache Hierarchy (L1 -> L2 -> L3/DRAM) ===")
+    rq7_rows = []
+    for pol in ["native", "eddi", "exact_tmr", "approx_scalar", "approx_simd"]:
+        sbin = BUILD_DIR / f"bin_{pol}"
+        sc_out = run_cmd([str(sbin), "--scale", pol])
+        for line in sc_out.strip().splitlines():
+            if line.startswith("SCALE_CSV,"):
+                p = line.split(",")
+                rq7_rows.append({
+                    "policy": p[1],
+                    "matrix_n": int(p[2]),
+                    "cache_tier": p[3],
+                    "exec_time_us": float(p[4]),
+                    "hw_insts": int(p[5]),
+                    "hw_cycles": int(p[6]),
+                    "ipc": float(p[7]),
+                })
+    with open(RES_DIR / "rq7_cache_scaling.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rq7_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rq7_rows)
+
+    print("=== All Evaluations (RQ1 - RQ7) Completed! ===")
 
 
 if __name__ == "__main__":

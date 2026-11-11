@@ -38,10 +38,12 @@ void     harness_pmu_start(harness_pmu_t *pmu);
 void     harness_pmu_stop(harness_pmu_t *pmu, uint64_t *out_insts, uint64_t *out_cycles);
 void     harness_pmu_close(harness_pmu_t *pmu);
 
-// 独立后置故障注入 Pass 调用的钩子函数 (被测策略对此一无所知)
+// 独立后置故障注入 Pass 调用的钩子函数 (支持单故障、空间多比特 MBU 以及时间突发多故障 Burst)
 void     harness_fi_reset_profile(void);
 uint64_t harness_fi_get_total_dyn_insts(void);
 void     harness_fi_arm_one_fault(uint64_t target_step, uint32_t target_bit);
+void     harness_fi_arm_mbu_or_burst(const uint64_t *target_steps, const uint32_t *target_bits,
+                                     int num_events, uint32_t mbu_width);
 int      harness_fi_was_injected(void);
 
 double   __harness_fi_hook_f64(double val, int32_t static_site_id);

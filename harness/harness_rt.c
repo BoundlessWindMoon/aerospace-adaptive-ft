@@ -75,17 +75,21 @@ void harness_pmu_close(harness_pmu_t *pmu) {
 }
 
 // ============================================================================
-// 2. 独立后置故障注入运行时 (LLFI / SASSIFI One-Fault-Per-Run 标准)
+// 2. 独立后置故障注入运行时 (支持 LLFI/SASSIFI One-Fault-Per-Run、Spatial MBU 与 Temporal Burst)
 // ============================================================================
+#define MAX_BURST_FAULTS 32
+
 static uint64_t g_fi_dyn_step = 0;
-static uint64_t g_fi_target_step = 0; // 0 表示仅做 Phase 1 Profiling 不注入故障
-static uint32_t g_fi_target_bit = 0;
+static uint64_t g_fi_steps[MAX_BURST_FAULTS];
+static uint32_t g_fi_bits[MAX_BURST_FAULTS];
+static int      g_fi_num_events = 0;
+static uint32_t g_fi_mbu_width = 1; // 1=SEU(单比特), 2=DBU(相邻双比特), 4=QBU(相邻四比特)
 static int      g_fi_injected = 0;
 
 void harness_fi_reset_profile(void) {
     g_fi_dyn_step = 0;
-    g_fi_target_step = 0;
-    g_fi_target_bit = 0;
+    g_fi_num_events = 0;
+    g_fi_mbu_width = 1;
     g_fi_injected = 0;
 }
 
@@ -95,8 +99,23 @@ uint64_t harness_fi_get_total_dyn_insts(void) {
 
 void harness_fi_arm_one_fault(uint64_t target_step, uint32_t target_bit) {
     g_fi_dyn_step = 0;
-    g_fi_target_step = target_step;
-    g_fi_target_bit = target_bit;
+    g_fi_steps[0] = target_step;
+    g_fi_bits[0] = target_bit;
+    g_fi_num_events = (target_step > 0) ? 1 : 0;
+    g_fi_mbu_width = 1;
+    g_fi_injected = 0;
+}
+
+void harness_fi_arm_mbu_or_burst(const uint64_t *target_steps, const uint32_t *target_bits,
+                                 int num_events, uint32_t mbu_width) {
+    g_fi_dyn_step = 0;
+    if (num_events > MAX_BURST_FAULTS) num_events = MAX_BURST_FAULTS;
+    for (int i = 0; i < num_events; i++) {
+        g_fi_steps[i] = target_steps[i];
+        g_fi_bits[i] = target_bits[i];
+    }
+    g_fi_num_events = num_events;
+    g_fi_mbu_width = (mbu_width >= 1 && mbu_width <= 8) ? mbu_width : 1;
     g_fi_injected = 0;
 }
 
@@ -104,16 +123,29 @@ int harness_fi_was_injected(void) {
     return g_fi_injected;
 }
 
+static inline uint64_t make_mbu_mask64(uint32_t base_bit, uint32_t width) {
+    uint64_t m = ((1ULL << width) - 1ULL);
+    uint32_t shift = base_bit % (65 - width);
+    return m << shift;
+}
+
+static inline uint32_t make_mbu_mask32(uint32_t base_bit, uint32_t width) {
+    uint32_t m = ((1U << width) - 1U);
+    uint32_t shift = base_bit % (33 - width);
+    return m << shift;
+}
+
 double __harness_fi_hook_f64(double val, int32_t static_site_id) {
     (void)static_site_id;
     g_fi_dyn_step++;
-    if (g_fi_target_step > 0 && g_fi_dyn_step == g_fi_target_step) {
-        union { double d; uint64_t u; } conv;
-        conv.d = val;
-        uint32_t b = g_fi_target_bit % 64;
-        conv.u ^= (1ULL << b);
-        g_fi_injected = 1;
-        return conv.d;
+    for (int i = 0; i < g_fi_num_events; i++) {
+        if (g_fi_dyn_step == g_fi_steps[i]) {
+            union { double d; uint64_t u; } conv;
+            conv.d = val;
+            conv.u ^= make_mbu_mask64(g_fi_bits[i], g_fi_mbu_width);
+            g_fi_injected++;
+            val = conv.d;
+        }
     }
     return val;
 }
@@ -121,13 +153,14 @@ double __harness_fi_hook_f64(double val, int32_t static_site_id) {
 float __harness_fi_hook_f32(float val, int32_t static_site_id) {
     (void)static_site_id;
     g_fi_dyn_step++;
-    if (g_fi_target_step > 0 && g_fi_dyn_step == g_fi_target_step) {
-        union { float f; uint32_t u; } conv;
-        conv.f = val;
-        uint32_t b = g_fi_target_bit % 32;
-        conv.u ^= (1U << b);
-        g_fi_injected = 1;
-        return conv.f;
+    for (int i = 0; i < g_fi_num_events; i++) {
+        if (g_fi_dyn_step == g_fi_steps[i]) {
+            union { float f; uint32_t u; } conv;
+            conv.f = val;
+            conv.u ^= make_mbu_mask32(g_fi_bits[i], g_fi_mbu_width);
+            g_fi_injected++;
+            val = conv.f;
+        }
     }
     return val;
 }
@@ -135,11 +168,12 @@ float __harness_fi_hook_f32(float val, int32_t static_site_id) {
 int32_t __harness_fi_hook_i32(int32_t val, int32_t static_site_id) {
     (void)static_site_id;
     g_fi_dyn_step++;
-    if (g_fi_target_step > 0 && g_fi_dyn_step == g_fi_target_step) {
-        uint32_t b = g_fi_target_bit % 32;
-        uint32_t u = (uint32_t)val ^ (1U << b);
-        g_fi_injected = 1;
-        return (int32_t)u;
+    for (int i = 0; i < g_fi_num_events; i++) {
+        if (g_fi_dyn_step == g_fi_steps[i]) {
+            uint32_t u = (uint32_t)val ^ make_mbu_mask32(g_fi_bits[i], g_fi_mbu_width);
+            g_fi_injected++;
+            val = (int32_t)u;
+        }
     }
     return val;
 }
@@ -147,11 +181,12 @@ int32_t __harness_fi_hook_i32(int32_t val, int32_t static_site_id) {
 int16_t __harness_fi_hook_i16(int16_t val, int32_t static_site_id) {
     (void)static_site_id;
     g_fi_dyn_step++;
-    if (g_fi_target_step > 0 && g_fi_dyn_step == g_fi_target_step) {
-        uint32_t b = g_fi_target_bit % 16;
-        uint16_t u = (uint16_t)val ^ (uint16_t)(1U << b);
-        g_fi_injected = 1;
-        return (int16_t)u;
+    for (int i = 0; i < g_fi_num_events; i++) {
+        if (g_fi_dyn_step == g_fi_steps[i]) {
+            uint16_t u = (uint16_t)val ^ (uint16_t)(make_mbu_mask32(g_fi_bits[i], g_fi_mbu_width) & 0xFFFFU);
+            g_fi_injected++;
+            val = (int16_t)u;
+        }
     }
     return val;
 }

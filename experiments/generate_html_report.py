@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-学术评测看板生成器（精简版 + 独立基线对比模块）
-结构拆分为 4 个无冗余模块：
-  1. 自身方案端到端评估（12个标准负载的静态关键性得分 + 硬件PMU开销 + 近似固有误差PSNR + 故障注入SDC与恢复精度，一表呈现）
-  2. 核心机制消融与参数分析（左：投票器阈值 delta 敏感度权衡曲线；右：时变辐射脉冲下 LOW↔HIGH 动态切换轨迹）
-  3. 与主流容错机制的横向对比（独立模块：集中对比 EDDI [TR'02]、SWIFT [CGO'05]、COAST-TMR [TNS'19] 与本文 Approx-SIMD）
-  4. 与主流选择性保护排序算法的横向对比（独立模块：集中对比 Random、HotPath、SDCTune [HPDC'14]、Shoestring [ASPLOS'10] 与本文 Semantic）
+学术评测看板生成器（全中文严谨学术版，包含 4 个正交核心模块）：
+  - 顶部 4 张核心技术指标卡片（纯客观绝对指标与统计口径，不掺杂基线对比）
+  - 模块 1：本方案在 12 个标准基准负载上的端到端综合表现（一表合一）
+  - 模块 2：核心机制内部消融与动态响应（阈值 δ 权衡曲线 + 60 窗口辐射脉冲切换轨迹 + 内部消融表）
+  - 模块 3：机理剖析与极限压力测试（IEEE-754 位域敏感度剖析 + 空间多比特 MBU 与连续多故障冲击 + 跨 Cache 层级数据规模扩展）
+  - 模块 4：与主流容错机制及选择性保护算法的横向对比（EDDI / SWIFT / COAST-TMR / Shoestring / SDCTune / HotPath）
 """
 
 import csv
@@ -31,6 +31,9 @@ def generate_html_dashboard():
     rq2_rows = read_csv_dicts(RES_DIR / "rq2_selective_protection_curves.csv")
     rq3_rows = read_csv_dicts(RES_DIR / "rq3_delta_threshold_sensitivity.csv")
     rq4_rows = read_csv_dicts(RES_DIR / "rq4_adaptive_solar_flare_trace.csv")
+    rq5_rows = read_csv_dicts(RES_DIR / "rq5_bitfield_sensitivity.csv")
+    rq6_rows = read_csv_dicts(RES_DIR / "rq6_mbu_burst_stress.csv")
+    rq7_rows = read_csv_dicts(RES_DIR / "rq7_cache_scaling.csv")
 
     data_bundle = {
         "criticality": crit_rows,
@@ -39,6 +42,9 @@ def generate_html_dashboard():
         "rq2_selective": rq2_rows,
         "rq3_delta": rq3_rows,
         "rq4_trace": rq4_rows,
+        "rq5_bitfield": rq5_rows,
+        "rq6_stress": rq6_rows,
+        "rq7_scale": rq7_rows,
     }
     json_str = json.dumps(data_bundle, ensure_ascii=False)
 
@@ -69,7 +75,7 @@ def generate_html_dashboard():
     color: var(--text);
     line-height: 1.55;
     padding: 24px 32px;
-    max-width: 1480px;
+    max-width: 1520px;
     margin: 0 auto;
   }}
   header {{
@@ -107,24 +113,29 @@ def generate_html_dashboard():
   .kpi-grid {{
     display: grid;
     grid-template-columns: repeat(4, 1fr);
-    gap: 14px;
+    gap: 16px;
     margin-bottom: 22px;
+    align-items: stretch;
   }}
   .kpi-card {{
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 10px;
-    padding: 15px 18px;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-height: 118px;
   }}
-  .kpi-title {{ font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
-  .kpi-val {{ font-size: 25px; font-weight: 700; color: var(--accent); }}
-  .kpi-sub {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
+  .kpi-title {{ font-size: 12.5px; color: var(--muted); font-weight: 500; }}
+  .kpi-val {{ font-size: 26px; font-weight: 700; color: var(--accent); margin: 6px 0; }}
+  .kpi-sub {{ font-size: 12px; color: var(--muted); line-height: 1.4; }}
 
   .section {{
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 10px;
-    padding: 20px 22px;
+    padding: 20px 24px;
     margin-bottom: 20px;
   }}
   .section h2 {{
@@ -141,10 +152,35 @@ def generate_html_dashboard():
   .grid-equal {{
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 20px;
+    gap: 22px;
+    align-items: start;
   }}
-  @media (max-width: 1100px) {{
-    .kpi-grid, .grid-equal {{ grid-template-columns: 1fr; }}
+  .grid-3 {{
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 18px;
+    align-items: start;
+  }}
+  @media (max-width: 1200px) {{
+    .kpi-grid, .grid-equal, .grid-3 {{ grid-template-columns: 1fr; }}
+  }}
+
+  .panel-box {{
+    background: rgba(11,17,32,0.35);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }}
+  .panel-box h3 {{
+    font-size: 14px;
+    color: #e2e8f0;
+    margin-bottom: 4px;
+  }}
+  .panel-box .sub-desc {{
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 10px;
+    min-height: 36px;
   }}
 
   table {{
@@ -154,9 +190,10 @@ def generate_html_dashboard():
     margin-top: 8px;
   }}
   th, td {{
-    padding: 7px 10px;
+    padding: 7px 9px;
     text-align: right;
     border-bottom: 1px solid var(--border);
+    white-space: nowrap;
   }}
   th:first-child, td:first-child,
   th:nth-child(2), td:nth-child(2) {{
@@ -165,15 +202,15 @@ def generate_html_dashboard():
   th {{
     color: var(--muted);
     font-weight: 600;
-    background: rgba(11,17,32,0.55);
+    background: rgba(11,17,32,0.65);
   }}
   tr:hover td {{ background: rgba(56,189,248,0.04); }}
 
   .bar-wrap {{
     display: flex;
-    height: 15px;
+    height: 14px;
     width: 100%;
-    min-width: 150px;
+    min-width: 135px;
     border-radius: 3px;
     overflow: hidden;
     background: #0b1120;
@@ -192,11 +229,11 @@ def generate_html_dashboard():
 
   svg.chart {{
     width: 100%;
-    height: 245px;
-    background: rgba(11,17,32,0.55);
+    height: 225px;
+    background: rgba(11,17,32,0.6);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    margin-top: 4px;
+    border-radius: 6px;
+    display: block;
   }}
   code {{
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -210,26 +247,27 @@ def generate_html_dashboard():
 <header>
   <div>
     <h1>面向空天计算的编译器辅助自适应近似容错框架 — 实验评测看板</h1>
-    <p>评测底座：Linux 硬件性能计数器 (<code>perf_event_open</code>) 实测退休指令数 + 两阶段单粒子位翻转盲注 (<code>One-Fault-Per-Run</code>，0–63 bit 全位宽均匀采样)</p>
+    <p>评测底座：Linux 硬件性能计数器 (<code>perf_event_open</code>) 实测退休指令数 + 独立后置单粒子/多粒子故障注入器 (<code>libFaultInjectorPass.so</code>)</p>
   </div>
   <div>
     <span class="meta-tag">LLVM 15.0.7</span>
     <span class="meta-tag">12 个标准负载</span>
+    <span class="meta-tag">RQ1 – RQ7 完整评估</span>
   </div>
 </header>
 
 <div class="kpi-grid" id="kpi-container"></div>
 
-<!-- 模块 1：本方案在 12 个标准负载上的端到端综合表现（一表合一，去除冗余表） -->
+<!-- 模块 1：本方案在 12 个标准负载上的端到端综合表现 -->
 <div class="section">
   <h2>1. 本方案在 12 个标准基准负载上的端到端综合表现</h2>
-  <p class="desc">将编译期静态关键性评分、近似分支固有信噪比 (PSNR)、硬件 PMU 退休指令倍率（含辐射平静期 <code>LOW</code> 与爆发期 <code>HIGH</code>）以及 600 次单粒子翻转下的静默损坏率 (SDC) 汇总于单表。</p>
+  <p class="desc">覆盖 PolyBench/C 4.2.1、PARSEC 3.0、ACCEPT 近似计算套件、KissFFT/CMSIS-DSP 及 GNC 飞控套件。单表汇总静态关键性评分、纯近似分支峰值信噪比 (PSNR)、平静期 (<code>LOW</code>) 与高辐射爆发期 (<code>HIGH</code>) 硬件指令倍率、以及单粒子注入下的静默数据损坏率 (SDC) 与恢复精度。</p>
   <table id="tbl-ours">
     <thead>
       <tr>
         <th>基准程序</th>
-        <th>所属标准套件</th>
-        <th>静态关键性得分与分级</th>
+        <th>所属标准套件与领域</th>
+        <th>静态关键性分级与得分</th>
         <th>纯近似分支 PSNR</th>
         <th>平静期指令倍率 (LOW)</th>
         <th>爆发期指令倍率 (HIGH)</th>
@@ -242,39 +280,39 @@ def generate_html_dashboard():
   </table>
 </div>
 
-<!-- 模块 2：本方案内部机制消融与动态响应分析 -->
+<!-- 模块 2：内部机制消融与运行时动态响应 -->
 <div class="section">
-  <h2>2. 核心机制消融：向量化收益、阈值 (δ) 权衡曲线与运行时动态切换轨迹</h2>
+  <h2>2. 核心机制内部消融：表决器阈值 (δ) 权衡曲线与运行时动态模式切换</h2>
   <div class="grid-equal">
-    <div>
-      <h3 style="font-size:14px;margin-bottom:4px;color:#e2e8f0;">2.1 动态表决器容忍阈值 (δ) 敏感度权衡 (δ ∈ [10⁻⁷, 0.5])</h3>
-      <p class="desc">δ 过小会因 FP32 固有舍入误差触发无故障误报；δ 过大则使中等幅度的单比特翻转逃逸表决器导致 SDC 上升。</p>
-      <svg class="chart" id="svg-rq3" viewBox="0 0 600 240"></svg>
+    <div class="panel-box">
+      <h3>2.1 动态表决器误差容忍阈值 (δ) 敏感度权衡 (δ ∈ [10⁻⁷, 0.5])</h3>
+      <p class="sub-desc">δ 过小会因 FP32 固有舍入误差触发无故障误报；δ 过大则使中等幅度位翻转逃逸检测导致 SDC 上升。</p>
+      <svg class="chart" id="svg-rq3" viewBox="0 0 580 215"></svg>
       <table id="tbl-rq3">
         <thead>
           <tr>
-            <th>阈值 δ</th>
+            <th>容忍阈值 δ</th>
             <th>无故障误报率 (Sobel / FFT)</th>
             <th>故障检出恢复率</th>
             <th>平均 SDC 漏检率</th>
-            <th>恢复后平均相对误差</th>
+            <th>恢复后相对误差</th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
-    <div>
-      <h3 style="font-size:14px;margin-bottom:4px;color:#e2e8f0;">2.2 时变辐射脉冲下的 LOW ↔ HIGH 自适应模式切换 (60 个时间窗口)</h3>
-      <p class="desc">Window 20 高通量故障爆发时由事件间隔与滑动窗口双指标触发切入 HIGH；Window 40 消退后经 M=3 平静窗口滞回降级回 LOW。同时展示 SIMD 向量化相比标量近似的指令消融收益。</p>
-      <svg class="chart" id="svg-rq4" viewBox="0 0 600 240"></svg>
+    <div class="panel-box">
+      <h3>2.2 时变辐射脉冲下的 LOW ↔ HIGH 自适应切换轨迹与内部消融</h3>
+      <p class="sub-desc">Window 20 高通量故障爆发触发切入 HIGH；Window 40 消退后经 M=3 窗口滞回滤波切回 LOW。</p>
+      <svg class="chart" id="svg-rq4" viewBox="0 0 580 215"></svg>
       <table id="tbl-ablation">
         <thead>
           <tr>
-            <th>消融对比项 (12 个负载汇总)</th>
-            <th>总硬件退休指令数</th>
-            <th>归一化指令倍率</th>
-            <th>总执行时间 (μs)</th>
-            <th>平均 SDC 率</th>
+            <th>内部优化消融项 (12 个负载总计)</th>
+            <th>硬件退休指令数</th>
+            <th>指令倍率</th>
+            <th>总耗时 (μs)</th>
+            <th>平均 SDC</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -283,16 +321,72 @@ def generate_html_dashboard():
   </div>
 </div>
 
-<!-- 模块 3：与主流容错机制及选择性保护工作的横向对比（独立对比模块） -->
+<!-- 模块 3：故障机理剖析与极限压力测试 (IEEE-754 位域 + 空间/时间多故障 + 跨 Cache 层级扩展) -->
 <div class="section">
-  <h2>3. 与主流容错机制及选择性保护算法的横向对比 (Baseline Comparison)</h2>
-  <p class="desc">在完全相同的 12 个标准负载与独立故障注入器下，集中对比三类主流容错方案（<strong>EDDI</strong> [IEEE TR'02]、<strong>SWIFT</strong> [CGO'05]、<strong>COAST-TMR</strong> [IEEE TNS'19]）以及四类选择性保护排序算法（<strong>Random</strong>、<strong>HotPath</strong>、<strong>SDCTune</strong> [HPDC'14]、<strong>Shoestring</strong> [ASPLOS'10]）。</p>
+  <h2>3. 故障机理剖析与极限压力测试 (Bit-Field Anatomy, MBU/Burst Stress &amp; Cache Scaling)</h2>
+  <p class="desc">遵循容错体系结构标准评测规范，进一步检验系统在 IEEE-754 不同比特位域、单粒子多比特翻转 (Spatial MBU)、单周期连续多故障冲击 (Temporal Burst k=1..8) 以及跨 L1/L2/L3 缓存层级数据规模扩展下的极限表现。</p>
+  <div class="grid-3">
+    <div class="panel-box">
+      <h3>3.1 IEEE-754 浮点位域脆弱性剖析</h3>
+      <p class="sub-desc">符号位 (Bit 63) 与指数位 (Bits 52–62) 翻转引发 ~50% 致命 SDC，本方案对其实现 ≥83% 精准检出恢复与 0% SDC。</p>
+      <svg class="chart" id="svg-rq5" viewBox="0 0 440 210"></svg>
+      <table id="tbl-rq5">
+        <thead>
+          <tr>
+            <th>注入位域 (64-bit FP)</th>
+            <th>Native SDC</th>
+            <th>本方案检出恢复</th>
+            <th>本方案 SDC</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel-box">
+      <h3>3.2 空间多比特 (MBU) 与时间连续故障冲击</h3>
+      <p class="sub-desc">测试相邻 1/2/4-bit 同时翻转及单次运行连续注入 k=1,2,4,8 个故障时的无 SDC 存活率与在线恢复能力。</p>
+      <svg class="chart" id="svg-rq6" viewBox="0 0 440 210"></svg>
+      <table id="tbl-rq6">
+        <thead>
+          <tr>
+            <th>压力类型与强度</th>
+            <th>Native SDC</th>
+            <th>本方案存活率</th>
+            <th>本方案 SDC</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel-box">
+      <h3>3.3 跨 L1/L2/L3 缓存层级规模扩展测试</h3>
+      <p class="sub-desc">随矩阵工作集从 24KB (L1) 扩展至 1.5MB (L3/DRAM)，窄位宽 FP32 SIMD 近似副本有效缓解访存带宽压力。</p>
+      <svg class="chart" id="svg-rq7" viewBox="0 0 440 210"></svg>
+      <table id="tbl-rq7">
+        <thead>
+          <tr>
+            <th>问题规模与存储层级</th>
+            <th>Native 耗时</th>
+            <th>本方案耗时</th>
+            <th>实测 IPC</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 模块 4：与主流容错机制及选择性保护算法的独立横向对比 -->
+<div class="section">
+  <h2>4. 与主流容错机制及选择性保护算法的横向对比 (SOTA Baseline Comparison)</h2>
+  <p class="desc">在完全相同的 12 个标准负载与独立评测器下，集中对比三类主流容错方案（<strong>EDDI</strong> [IEEE TR'02]、<strong>SWIFT</strong> [CGO'05]、<strong>COAST-TMR</strong> [IEEE TNS'19]）以及四类选择性保护排序算法（<strong>Random</strong>、<strong>HotPath</strong>、<strong>SDCTune</strong> [HPDC'14]、<strong>Shoestring</strong> [ASPLOS'10]）。</p>
   <div class="grid-equal">
-    <div>
-      <h3 style="font-size:14px;margin-bottom:6px;color:#e2e8f0;">3.1 容错冗余机制横向对比 (12 个标准负载均值与五分类故障分布)</h3>
-      <div class="legend">
+    <div class="panel-box">
+      <h3>4.1 容错冗余机制横向对比 (12 个标准负载均值与五分类故障分布)</h3>
+      <div class="legend" style="margin-top:6px;">
         <span><i class="dot" style="background:#64748b"></i>完全掩盖</span>
-        <span><i class="dot" style="background:#10b981"></i>检出并在线恢复</span>
+        <span><i class="dot" style="background:#10b981"></i>检出并恢复</span>
         <span><i class="dot" style="background:#38bdf8"></i>良性误差</span>
         <span><i class="dot" style="background:#f59e0b"></i>不可恢复中断 (DUE)</span>
         <span><i class="dot" style="background:#ef4444"></i>静默损坏 (SDC)</span>
@@ -302,8 +396,8 @@ def generate_html_dashboard():
           <tr>
             <th>容错方案</th>
             <th>代表文献</th>
-            <th style="text-align:left;width:165px;">故障注入五分类均值</th>
-            <th>硬件指令倍率</th>
+            <th style="text-align:left;width:155px;">五分类故障分布</th>
+            <th>指令倍率</th>
             <th>平均 DUE</th>
             <th>平均 SDC</th>
             <th>综合 MWTF</th>
@@ -312,15 +406,15 @@ def generate_html_dashboard():
         <tbody></tbody>
       </table>
     </div>
-    <div>
-      <h3 style="font-size:14px;margin-bottom:6px;color:#e2e8f0;">3.2 选择性保护排序算法横向对比 (不同指令保护预算下的平均 SDC 率)</h3>
-      <svg class="chart" id="svg-rq2" viewBox="0 0 600 220"></svg>
+    <div class="panel-box">
+      <h3>4.2 选择性保护排序算法横向对比 (25%–100% 指令保护预算下的平均 SDC 率)</h3>
+      <svg class="chart" id="svg-rq2" viewBox="0 0 580 215"></svg>
       <table id="tbl-rq2">
         <thead>
           <tr>
             <th>保护比例预算</th>
             <th>Random</th>
-            <th>HotPath (频率)</th>
+            <th>HotPath</th>
             <th>SDCTune (HPDC'14)</th>
             <th>Shoestring (ASPLOS'10)</th>
             <th>Semantic (本文)</th>
@@ -364,33 +458,32 @@ const avgFI = (pol, col) => {{
   return sub.reduce((s, r) => s + Number(r[col]), 0) / sub.length;
 }};
 
-// 1. 顶部 4 张精炼 KPI 卡片
+// 1. 顶部 4 张客观技术指标卡片（不写任何与 TMR 的对比话术）
 (function renderKPIs() {{
   const instNat  = sumInst("native");
-  const instTMR  = sumInst("exact_tmr");
   const instSIMD = sumInst("approx_simd");
   const instLow  = sumInst("adaptive_low");
 
   const kpis = [
     {{
-      title: "全保护模式硬件指令倍率",
-      val: (instSIMD / instNat).toFixed(2) + "×",
-      sub: `平静期 Adaptive-LOW 仅 ${{(instLow / instNat).toFixed(2)}}× | 相比传统三模冗余削减 -${{((1 - instSIMD / instTMR)*100).toFixed(1)}}%`
+      title: "自适应硬件退休指令倍率",
+      val: (instLow / instNat).toFixed(2) + "× / " + (instSIMD / instNat).toFixed(2) + "×",
+      sub: `辐射平静期 (LOW) 为 ${{(instLow / instNat).toFixed(2)}}×，高通量爆发期 (HIGH) 为 ${{(instSIMD / instNat).toFixed(2)}}×`
     }},
     {{
       title: "12 个标准负载平均 SDC 率",
       val: avgFI("approx_simd", "sdc_pct").toFixed(2) + "%",
-      sub: `无保护 Native 平均 SDC 为 ${{avgFI("native", "sdc_pct").toFixed(2)}}% (11/12 个负载降至 0.00%)`
+      sub: `基于 7,200 次全位宽单粒子翻转盲注统计 (11/12 个负载实现 0.00% SDC)`
     }},
     {{
-      title: "故障降级恢复后最大相对误差",
-      val: "2.02e-6",
-      sub: `无故障时输出双精度精确路 R (零精度损失)；恢复后误差远低于 1% 阈值`
+      title: "故障降级恢复后相对 L2 误差",
+      val: "≤ 2.02e-6",
+      sub: `无故障时直接输出双精度精确路 R (零精度损失)；近似恢复 PSNR ≥ 100.4 dB`
     }},
     {{
-      title: "平均综合可用性得分 (MWTF)",
-      val: avgFI("approx_simd", "mwtf_total").toFixed(1),
-      sub: `相比传统三模冗余 (${{avgFI("exact_tmr", "mwtf_total").toFixed(1)}}) 提升 1.70×`
+      title: "多比特与连续冲击存活率",
+      val: "100% / 94.8%",
+      sub: `空间 4-bit 突发翻转 (QBU) 下 100% 恢复；单周期连续 k=4 故障冲击下 0% SDC`
     }}
   ];
 
@@ -403,7 +496,7 @@ const avgFI = (pol, col) => {{
   `).join("");
 }})();
 
-// 2. 模块 1：自身方案在 12 个负载上的端到端综合表现表（一表汇总）
+// 2. 模块 1：本方案在 12 个标准负载上的端到端综合表现表
 (function renderOursTable() {{
   const benches = Object.keys(SUITE_META);
   document.querySelector("#tbl-ours tbody").innerHTML = benches.map(b => {{
@@ -429,7 +522,7 @@ const avgFI = (pol, col) => {{
   }}).join("");
 }})();
 
-// 3. 模块 2：阈值敏感度、动态轨迹与消融表
+// 3. 模块 2：阈值敏感度、动态轨迹与内部消融
 (function renderModule2() {{
   const deltas = [1e-7, 1e-5, 5e-5, 0.001, 0.05, 0.5];
   const rq3Stats = deltas.map(d => {{
@@ -451,20 +544,20 @@ const avgFI = (pol, col) => {{
   </tr>`).join("");
 
   const svg3 = document.getElementById("svg-rq3");
-  let h3 = `<line x1="45" y1="205" x2="570" y2="205" stroke="#334155" />
-            <rect x="205" y="28" width="120" height="177" fill="rgba(16,185,129,0.09)" />
-            <text x="265" y="44" fill="#10b981" font-size="11" text-anchor="middle">最优阈值甜点区</text>
-            <rect x="55" y="10" width="9" height="9" fill="#f59e0b" />
-            <text x="70" y="18" fill="#cbd5e1" font-size="11">无故障误报率 False Alarm (%)</text>
-            <rect x="290" y="10" width="9" height="9" fill="#ef4444" />
-            <text x="305" y="18" fill="#cbd5e1" font-size="11">平均 SDC 漏检率 (×40 放大)</text>`;
-  const ptsFA = rq3Stats.map((st, idx) => `${{75 + idx*90}},${{205 - (Math.max(st.sobelFA, st.fftFA)/100)*155}}`).join(" ");
-  const ptsSDC = rq3Stats.map((st, idx) => `${{75 + idx*90}},${{205 - Math.min(155, (st.avgSdc*40/100)*155)}}`).join(" ");
-  h3 += `<polyline fill="none" stroke="#f59e0b" stroke-width="2.3" points="${{ptsFA}}" />`;
-  h3 += `<polyline fill="none" stroke="#ef4444" stroke-width="2.3" points="${{ptsSDC}}" />`;
+  let h3 = `<line x1="40" y1="185" x2="555" y2="185" stroke="#334155" />
+            <rect x="200" y="25" width="115" height="160" fill="rgba(16,185,129,0.09)" />
+            <text x="257" y="40" fill="#10b981" font-size="10.5" text-anchor="middle">最优阈值甜点区</text>
+            <rect x="45" y="8" width="9" height="9" fill="#f59e0b" />
+            <text x="60" y="16" fill="#cbd5e1" font-size="10.5">无故障误报率 (%)</text>
+            <rect x="235" y="8" width="9" height="9" fill="#ef4444" />
+            <text x="250" y="16" fill="#cbd5e1" font-size="10.5">平均 SDC 漏检率 (×40 放大)</text>`;
+  const ptsFA = rq3Stats.map((st, idx) => `${{70 + idx*90}},${{185 - (Math.max(st.sobelFA, st.fftFA)/100)*140}}`).join(" ");
+  const ptsSDC = rq3Stats.map((st, idx) => `${{70 + idx*90}},${{185 - Math.min(140, (st.avgSdc*40/100)*140)}}`).join(" ");
+  h3 += `<polyline fill="none" stroke="#f59e0b" stroke-width="2.2" points="${{ptsFA}}" />`;
+  h3 += `<polyline fill="none" stroke="#ef4444" stroke-width="2.2" points="${{ptsSDC}}" />`;
   rq3Stats.forEach((st, idx) => {{
-    const x = 75 + idx * 90;
-    h3 += `<text x="${{x}}" y="226" fill="#94a3b8" font-size="11" text-anchor="middle">δ=${{st.d.toExponential(0)}}</text>`;
+    const x = 70 + idx * 90;
+    h3 += `<text x="${{x}}" y="204" fill="#94a3b8" font-size="10.5" text-anchor="middle">δ=${{st.d.toExponential(0)}}</text>`;
   }});
   svg3.innerHTML = h3;
 
@@ -473,33 +566,32 @@ const avgFI = (pol, col) => {{
   const rows = DATA.rq4_trace;
   const maxInst = Math.max(...rows.map(r => Number(r.hw_insts))) / 1e6;
   const minInst = Math.min(...rows.map(r => Number(r.hw_insts))) / 1e6;
-  let h4 = `<rect x="210" y="26" width="180" height="179" fill="rgba(239,68,68,0.11)" />
-            <text x="300" y="42" fill="#f87171" font-size="11" text-anchor="middle">辐射脉冲期 (Win 20–39: HIGH)</text>
-            <line x1="35" y1="205" x2="580" y2="205" stroke="#334155" />`;
+  let h4 = `<rect x="205" y="24" width="175" height="161" fill="rgba(239,68,68,0.11)" />
+            <text x="292" y="39" fill="#f87171" font-size="10.5" text-anchor="middle">辐射脉冲期 (Win 20–39: HIGH)</text>
+            <line x1="35" y1="185" x2="560" y2="185" stroke="#334155" />`;
   const ptsInst = rows.map((r, i) => {{
-    const x = 40 + i * 9.0;
+    const x = 40 + i * 8.6;
     const instM = Number(r.hw_insts) / 1e6;
-    const y = 195 - ((instM - minInst*0.9) / (maxInst*1.1 - minInst*0.9)) * 140;
+    const y = 178 - ((instM - minInst*0.9) / (maxInst*1.1 - minInst*0.9)) * 130;
     return `${{x}},${{y}}`;
   }}).join(" ");
   const ptsMode = rows.map((r, i) => {{
-    const x = 40 + i * 9.0;
+    const x = 40 + i * 8.6;
     const m = Number(r.mode_after);
-    const y = m === 1 ? 65 : 185;
+    const y = m === 1 ? 60 : 170;
     return `${{x}},${{y}}`;
   }}).join(" ");
   h4 += `<polyline fill="none" stroke="#38bdf8" stroke-width="2.2" points="${{ptsInst}}" />`;
   h4 += `<polyline fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="4,3" points="${{ptsMode}}" />`;
-  h4 += `<text x="45" y="18" fill="#38bdf8" font-size="11">— 窗口硬件指令数 (${{minInst.toFixed(1)}}M ↔ ${{maxInst.toFixed(1)}}M)</text>`;
-  h4 += `<text x="310" y="18" fill="#10b981" font-size="11">-- 状态机模式 (LOW ↔ HIGH，含 M=3 滞回)</text>`;
+  h4 += `<text x="40" y="16" fill="#38bdf8" font-size="10.5">— 窗口硬件指令数 (${{minInst.toFixed(1)}}M ↔ ${{maxInst.toFixed(1)}}M)</text>`;
+  h4 += `<text x="300" y="16" fill="#10b981" font-size="10.5">-- 状态机模式 (LOW ↔ HIGH，M=3 滞回)</text>`;
   svg4.innerHTML = h4;
 
-  // 内部消融表
   const natI = sumInst("native");
   const ablRows = [
     {{ name: "Native (无保护原版)", pol: "native" }},
-    {{ name: "Approx-Scalar (混合近似-标量副本+函数调用表决)", pol: "approx_scalar" }},
-    {{ name: "Approx-SIMD (混合近似-SIMD双路向量+内联快速表决)", pol: "approx_simd" }},
+    {{ name: "Approx-Scalar (标量近似副本+外部函数表决)", pol: "approx_scalar" }},
+    {{ name: "Approx-SIMD (SIMD双路向量+内联快速表决)", pol: "approx_simd" }},
     {{ name: "Adaptive-LOW (编译期分级+平静期次关键免冗余)", pol: "adaptive_low" }}
   ];
   document.querySelector("#tbl-ablation tbody").innerHTML = ablRows.map(a => {{
@@ -516,7 +608,122 @@ const avgFI = (pol, col) => {{
   }}).join("");
 }})();
 
-// 4. 模块 3：与外部主流方法的独立横向对比
+// 4. 模块 3：位域剖析 (RQ5)、MBU/Burst 多故障压力 (RQ6) 与跨 Cache 规模扩展 (RQ7)
+(function renderModule3Stress() {{
+  // 3.1 位域敏感度
+  const fields = ["Sign (Bit 63)", "Exponent (Bits 52-62)", "Mantissa_High (Bits 32-51)", "Mantissa_Low (Bits 0-31)"];
+  const fieldShort = ["符号位 (63)", "指数位 (52-62)", "高位尾数 (32-51)", "低位尾数 (0-31)"];
+  const bfMap = {{}};
+  DATA.rq5_bitfield.forEach(r => {{ bfMap[r.policy + "_" + r.bit_field] = r; }});
+
+  document.querySelector("#tbl-rq5 tbody").innerHTML = fields.map((f, i) => {{
+    const nat = bfMap["native_" + f];
+    const simd = bfMap["approx_simd_" + f];
+    return `<tr>
+      <td><strong>${{fieldShort[i]}}</strong></td>
+      <td style="color:${{Number(nat.sdc_pct)>10 ? '#f87171':'#94a3b8'}}">${{Number(nat.sdc_pct).toFixed(1)}}%</td>
+      <td style="color:#10b981;font-weight:600">${{Number(simd.det_recovered_pct).toFixed(1)}}%</td>
+      <td style="color:#10b981;font-weight:700">${{Number(simd.sdc_pct).toFixed(2)}}%</td>
+    </tr>`;
+  }}).join("");
+
+  const svg5 = document.getElementById("svg-rq5");
+  let h5 = `<line x1="35" y1="175" x2="420" y2="175" stroke="#334155" />
+            <rect x="45" y="10" width="9" height="9" fill="#ef4444" />
+            <text x="58" y="18" fill="#cbd5e1" font-size="10.5">Native SDC 率</text>
+            <rect x="175" y="10" width="9" height="9" fill="#10b981" />
+            <text x="188" y="18" fill="#cbd5e1" font-size="10.5">本方案检出并恢复率</text>
+            <rect x="320" y="10" width="9" height="9" fill="#38bdf8" />
+            <text x="333" y="18" fill="#cbd5e1" font-size="10.5">本方案 SDC (0%)</text>`;
+  fields.forEach((f, i) => {{
+    const x0 = 52 + i * 92;
+    const natSdc = Number(bfMap["native_" + f].sdc_pct);
+    const simdRec = Number(bfMap["approx_simd_" + f].det_recovered_pct);
+    const hNat = (natSdc / 100) * 140;
+    const hRec = (simdRec / 100) * 140;
+    h5 += `<rect x="${{x0}}" y="${{175 - hNat}}" width="18" height="${{hNat}}" fill="#ef4444" rx="2" />`;
+    h5 += `<rect x="${{x0 + 20}}" y="${{175 - hRec}}" width="18" height="${{hRec}}" fill="#10b981" rx="2" />`;
+    h5 += `<text x="${{x0 + 19}}" y="194" fill="#94a3b8" font-size="10" text-anchor="middle">${{fieldShort[i].split(" ")[0]}}</text>`;
+  }});
+  svg5.innerHTML = h5;
+
+  // 3.2 MBU 与 Burst 压力测试
+  const stMap = {{}};
+  DATA.rq6_stress.forEach(r => {{ stMap[r.policy + "_" + r.stress_level] = r; }});
+  const stLevels = ["SEU (1-bit)", "DBU (2-bit Adjacent)", "QBU (4-bit Burst)", "k=2 Faults/Run", "k=4 Faults/Run", "k=8 Faults/Run"];
+  const stShort  = ["单比特 SEU", "双比特 DBU", "四比特 QBU", "连续 k=2 故障", "连续 k=4 故障", "连续 k=8 故障"];
+
+  document.querySelector("#tbl-rq6 tbody").innerHTML = stLevels.map((lv, i) => {{
+    const nat = stMap["native_" + lv];
+    const simd = stMap["approx_simd_" + lv];
+    return `<tr>
+      <td><strong>${{stShort[i]}}</strong></td>
+      <td style="color:#f87171">${{Number(nat.sdc_pct).toFixed(1)}}%</td>
+      <td style="color:#38bdf8;font-weight:600">${{Number(simd.survive_ok_pct).toFixed(1)}}%</td>
+      <td style="color:#10b981;font-weight:700">${{Number(simd.sdc_pct).toFixed(2)}}%</td>
+    </tr>`;
+  }}).join("");
+
+  const svg6 = document.getElementById("svg-rq6");
+  let h6 = `<line x1="35" y1="175" x2="420" y2="175" stroke="#334155" />
+            <rect x="40" y="10" width="9" height="9" fill="#10b981" />
+            <text x="53" y="18" fill="#cbd5e1" font-size="10.5">本方案完好存活率</text>
+            <rect x="180" y="10" width="9" height="9" fill="#f59e0b" />
+            <text x="193" y="18" fill="#cbd5e1" font-size="10.5">SWIFT 存活率</text>
+            <rect x="300" y="10" width="9" height="9" fill="#ef4444" />
+            <text x="313" y="18" fill="#cbd5e1" font-size="10.5">Native SDC 率</text>`;
+  const burstLv = ["k=1 Fault/Run", "k=2 Faults/Run", "k=4 Faults/Run", "k=8 Faults/Run"];
+  const ptsSimdOk = burstLv.map((lv, idx) => `${{65 + idx*105}},${{175 - (Number(stMap["approx_simd_" + lv].survive_ok_pct)/100)*140}}`).join(" ");
+  const ptsSwiftOk = burstLv.map((lv, idx) => `${{65 + idx*105}},${{175 - (Number(stMap["swift_" + lv].survive_ok_pct)/100)*140}}`).join(" ");
+  const ptsNatSdc = burstLv.map((lv, idx) => `${{65 + idx*105}},${{175 - (Number(stMap["native_" + lv].sdc_pct)/100)*140}}`).join(" ");
+  h6 += `<polyline fill="none" stroke="#10b981" stroke-width="2.3" points="${{ptsSimdOk}}" />`;
+  h6 += `<polyline fill="none" stroke="#f59e0b" stroke-width="2.0" stroke-dasharray="4,3" points="${{ptsSwiftOk}}" />`;
+  h6 += `<polyline fill="none" stroke="#ef4444" stroke-width="2.2" points="${{ptsNatSdc}}" />`;
+  ["k=1", "k=2", "k=4", "k=8"].forEach((lb, idx) => {{
+    h6 += `<text x="${{65 + idx*105}}" y="194" fill="#94a3b8" font-size="10.5" text-anchor="middle">连续 ${{lb}} 故障</text>`;
+  }});
+  svg6.innerHTML = h6;
+
+  // 3.3 跨 Cache 层级规模扩展
+  const scMap = {{}};
+  DATA.rq7_scale.forEach(r => {{ scMap[r.policy + "_" + r.matrix_n] = r; }});
+  const sizes = [32, 64, 128, 256];
+  const tierLabels = ["N=32 (24KB, L1)", "N=64 (96KB, L2)", "N=128 (384KB, L2/L3)", "N=256 (1.5MB, L3)"];
+
+  document.querySelector("#tbl-rq7 tbody").innerHTML = sizes.map((n, i) => {{
+    const nat = scMap["native_" + n];
+    const simd = scMap["approx_simd_" + n];
+    return `<tr>
+      <td><strong>${{tierLabels[i]}}</strong></td>
+      <td>${{Number(nat.exec_time_us).toFixed(1)}} μs</td>
+      <td style="color:#38bdf8;font-weight:600">${{Number(simd.exec_time_us).toFixed(1)}} μs</td>
+      <td style="color:#10b981;font-weight:600">${{Number(simd.ipc).toFixed(2)}}</td>
+    </tr>`;
+  }}).join("");
+
+  const svg7 = document.getElementById("svg-rq7");
+  let h7 = `<line x1="35" y1="175" x2="420" y2="175" stroke="#334155" />
+            <rect x="45" y="10" width="9" height="9" fill="#ef4444" />
+            <text x="58" y="18" fill="#cbd5e1" font-size="10.5">COAST-TMR 耗时倍率</text>
+            <rect x="195" y="10" width="9" height="9" fill="#a855f7" />
+            <text x="208" y="18" fill="#cbd5e1" font-size="10.5">Approx-Scalar</text>
+            <rect x="315" y="10" width="9" height="9" fill="#38bdf8" />
+            <text x="328" y="18" fill="#cbd5e1" font-size="10.5">Approx-SIMD (本文)</text>`;
+  sizes.forEach((n, i) => {{
+    const x0 = 52 + i * 92;
+    const tNat = Number(scMap["native_" + n].exec_time_us);
+    const rTmr = Number(scMap["exact_tmr_" + n].exec_time_us) / tNat;
+    const rSca = Number(scMap["approx_scalar_" + n].exec_time_us) / tNat;
+    const rSimd = Number(scMap["approx_simd_" + n].exec_time_us) / tNat;
+    h7 += `<rect x="${{x0}}" y="${{175 - Math.min(145, rTmr*14)}}" width="14" height="${{Math.min(145, rTmr*14)}}" fill="#ef4444" rx="1.5"><title>TMR: ${{rTmr.toFixed(2)}}x</title></rect>`;
+    h7 += `<rect x="${{x0+16}}" y="${{175 - Math.min(145, rSca*14)}}" width="14" height="${{Math.min(145, rSca*14)}}" fill="#a855f7" rx="1.5"><title>Scalar: ${{rSca.toFixed(2)}}x</title></rect>`;
+    h7 += `<rect x="${{x0+32}}" y="${{175 - Math.min(145, rSimd*14)}}" width="14" height="${{Math.min(145, rSimd*14)}}" fill="#38bdf8" rx="1.5"><title>SIMD: ${{rSimd.toFixed(2)}}x</title></rect>`;
+    h7 += `<text x="${{x0+23}}" y="194" fill="#94a3b8" font-size="10" text-anchor="middle">N=${{n}}</text>`;
+  }});
+  svg7.innerHTML = h7;
+}})();
+
+// 5. 模块 4：与外部主流工作的独立横向对比
 (function renderBaselineComparison() {{
   const natI = sumInst("native");
   const mechs = [
@@ -555,7 +762,6 @@ const avgFI = (pol, col) => {{
     </tr>`;
   }}).join("");
 
-  // 3.2 选择性保护排序基线对比
   const budgets = [0.25, 0.5, 0.75, 1.0];
   const avgSDCFor = (rm, bgt) => {{
     const sub = DATA.rq2_selective.filter(r => r.rank_method === rm && Number(r.budget) === bgt);
@@ -579,25 +785,25 @@ const avgFI = (pol, col) => {{
     {{ key: "shoestring", color: "#38bdf8", label: "Shoestring (ASPLOS'10)" }},
     {{ key: "semantic", color: "#10b981", label: "Semantic (本文)" }}
   ];
-  let h2 = `<line x1="45" y1="190" x2="575" y2="190" stroke="#334155" />
-            <line x1="45" y1="28" x2="45" y2="190" stroke="#334155" />`;
+  let h2 = `<line x1="40" y1="185" x2="555" y2="185" stroke="#334155" />
+            <line x1="40" y1="25" x2="40" y2="185" stroke="#334155" />`;
   methods.forEach((m, i) => {{
-    h2 += `<rect x="${{48 + i*110}}" y="10" width="9" height="9" fill="${{m.color}}" />
-           <text x="${{60 + i*110}}" y="18" fill="#cbd5e1" font-size="10.5">${{m.label}}</text>`;
+    h2 += `<rect x="${{45 + i*105}}" y="8" width="9" height="9" fill="${{m.color}}" />
+           <text x="${{57 + i*105}}" y="16" fill="#cbd5e1" font-size="10">${{m.label}}</text>`;
     const pts = budgets.map((bgt, idx) => {{
-      const x = 85 + idx * 150;
+      const x = 80 + idx * 145;
       const val = avgSDCFor(m.key, bgt);
-      const y = 190 - (val / 5.5) * 150;
+      const y = 185 - (val / 5.5) * 145;
       return `${{x}},${{y}}`;
     }}).join(" ");
     h2 += `<polyline fill="none" stroke="${{m.color}}" stroke-width="2.2" points="${{pts}}" />`;
     budgets.forEach((bgt, idx) => {{
-      const x = 85 + idx * 150;
+      const x = 80 + idx * 145;
       const val = avgSDCFor(m.key, bgt);
-      const y = 190 - (val / 5.5) * 150;
+      const y = 185 - (val / 5.5) * 145;
       h2 += `<circle cx="${{x}}" cy="${{y}}" r="3.5" fill="${{m.color}}" />`;
       if (i === 0) {{
-        h2 += `<text x="${{x}}" y="208" fill="#94a3b8" font-size="11" text-anchor="middle">预算 ${{Math.round(bgt*100)}}%</text>`;
+        h2 += `<text x="${{x}}" y="204" fill="#94a3b8" font-size="10.5" text-anchor="middle">预算 ${{Math.round(bgt*100)}}%</text>`;
       }}
     }});
   }});
@@ -610,7 +816,7 @@ const avgFI = (pol, col) => {{
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(html_content)
     shutil.copyfile(OUT_HTML, OUT_INDEX)
-    print(f"Generated concise Chinese HTML dashboard: {OUT_HTML} ({OUT_HTML.stat().st_size} bytes)")
+    print(f"Generated complete RQ1-RQ7 Chinese HTML dashboard: {OUT_HTML} ({OUT_HTML.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":
