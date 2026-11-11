@@ -1,0 +1,6 @@
+build/
+results/golden/*.bin
+third_party/
+*.o
+*.so
+*.a
