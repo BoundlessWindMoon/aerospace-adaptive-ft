@@ -290,6 +290,10 @@ def run_all_research_questions():
     with open(RES_DIR / "rq4_adaptive_solar_flare_trace.csv", "w") as f:
         f.write(trace_out)
 
+    print("=== Rendering Interactive HTML Evaluation Dashboard ===")
+    from generate_html_report import generate_html_dashboard
+    generate_html_dashboard()
+
     print("=== All Decoupled Benchmark Evaluations (RQ1 - RQ4) Completed! ===")
 
 

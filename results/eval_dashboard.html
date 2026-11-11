@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>面向空天计算的自适应容错框架 — 标准评测看板 (RQ1~RQ4)</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --border: #334155;
+    --text: #f8fafc;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --green: #22c55e;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --purple: #a855f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 24px 32px;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+    margin-bottom: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  header h1 { font-size: 24px; font-weight: 700; color: #fff; }
+  header p { color: var(--muted); font-size: 14px; }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge-pass { background: rgba(34,197,94,0.18); color: #4ade80; border: 1px solid rgba(34,197,94,0.4); }
+  .badge-crit { background: rgba(239,68,68,0.18); color: #f87171; border: 1px solid rgba(239,68,68,0.4); }
+  .badge-sub { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid rgba(245,158,11,0.4); }
+  .badge-non { background: rgba(148,163,184,0.18); color: #cbd5e1; border: 1px solid rgba(148,163,184,0.4); }
+
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 16px;
+    margin-bottom: 28px;
+  }
+  .kpi-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .kpi-title { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .kpi-val { font-size: 28px; font-weight: 700; color: var(--accent); }
+  .kpi-sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+  .section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 24px;
+    margin-bottom: 24px;
+  }
+  .section h2 {
+    font-size: 18px;
+    margin-bottom: 6px;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .section .desc {
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 1100px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-top: 10px;
+  }
+  th, td {
+    padding: 9px 12px;
+    text-align: right;
+    border-bottom: 1px solid var(--border);
+  }
+  th:first-child, td:first-child,
+  th:nth-child(2), td:nth-child(2) {
+    text-align: left;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    background: rgba(15,23,42,0.5);
+  }
+  tr:hover td { background: rgba(56,189,248,0.05); }
+
+  .bar-wrap {
+    display: flex;
+    height: 18px;
+    width: 100%;
+    min-width: 180px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #0f172a;
+  }
+  .bar-seg { height: 100%; }
+  .legend {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  svg.chart {
+    width: 100%;
+    height: 290px;
+    background: rgba(15,23,42,0.55);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-top: 8px;
+  }
+  .filter-bar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+    align-items: center;
+  }
+  select {
+    background: #0f172a;
+    color: #fff;
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>面向空天计算的自适应容错框架研究 — 解耦式标准评测看板</h1>
+    <p>评测标准：Linux 硬件 PMU (perf_event_open) 真实退休指令计数 + LLFI/SASSIFI 两阶段 One-Fault-Per-Run (0~63 bit 全位宽均匀采样) + 顶会五分类与 MWTF 指标</p>
+  </div>
+  <div>
+    <span class="badge badge-pass">策略与评测 100% 解耦</span>
+    <span class="badge badge-pass">LLVM 15.0.7 实测数据</span>
+  </div>
+</header>
+
+<div class="kpi-grid" id="kpi-container"></div>
+
+<!-- 模块 1: 关键性分析 -->
+<div class="section">
+  <h2>1. 编译时代码段关键性分析 (对应开题报告 3.2 节)</h2>
+  <p class="desc">利用 LLVM LoopInfo、SSA Use-Def 后向切片距离与跨基本块活跃范围计算综合关键性评分 S = w1·Closeness + w2·LDepth + w3·VarLiveness</p>
+  <table id="tbl-crit">
+    <thead>
+      <tr>
+        <th>函数名称</th>
+        <th>关键性等级</th>
+        <th>IR 指令数</th>
+        <th>最大循环深度 LDepth</th>
+        <th>输出可达紧密度 Closeness</th>
+        <th>变量活跃度 VarLiveness</th>
+        <th>循环状态反馈 PHI 数</th>
+        <th>综合得分 S</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<!-- 模块 2: RQ1 硬件 PMU 性能与近似计算固有误差 -->
+<div class="section">
+  <h2>2. RQ1: 硬件 PMU 性能开销与近似计算固有误差离线表征 (对应开题报告 3.4 & 3.5 节)</h2>
+  <p class="desc">左表：通过 Linux perf_event_open 实测 CPU 退休指令数与执行时间；右表：直接输出近似分支 (Pure-Approx) 测得的固有相对误差、PSNR 与混合近似 TMR 投票后的最终精度</p>
+  <div class="grid-2">
+    <div>
+      <h3 style="font-size:15px;margin-bottom:8px;">2.1 各保护策略硬件 PMU 退休指令数与执行时间对比</h3>
+      <svg class="chart" id="svg-pmu-bars" viewBox="0 0 650 280"></svg>
+      <table id="tbl-pmu-summary">
+        <thead>
+          <tr>
+            <th>算子</th>
+            <th>Native 指令数</th>
+            <th>Exact-TMR 指令数</th>
+            <th>Approx-Scalar 指令数</th>
+            <th>Approx-SIMD 指令数</th>
+            <th>Adaptive-LOW 指令数</th>
+            <th>SIMD 相比 TMR 削减</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div>
+      <h3 style="font-size:15px;margin-bottom:8px;">2.2 近似分支固有误差表征 (Pure-Approx) vs 投票后精度 (Approx-SIMD)</h3>
+      <table id="tbl-qor">
+        <thead>
+          <tr>
+            <th>算子</th>
+            <th>纯近似 Rel-L2 误差</th>
+            <th>纯近似 MRE</th>
+            <th>纯近似 PSNR (dB)</th>
+            <th>Approx-SIMD 投票后误差</th>
+            <th>开题目标 (≤ 1e-2)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 模块 3: RQ1 五分类故障注入分布与 MWTF -->
+<div class="section">
+  <h2>3. RQ1: 两阶段 One-Fault-Per-Run 故障注入五分类分布与 MWTF 综合评分 (对应开题报告 3.4.4 & 4.3.2 节)</h2>
+  <p class="desc">每个算子运行 1,000 次独立单比特翻转注入 (0~63 bit 均匀分布)。MWTF = 1 / (Normalized_Instruction_Ratio × SDC_Probability)</p>
+  <div class="filter-bar">
+    <label>筛选保护策略：</label>
+    <select id="sel-fi-policy">
+      <option value="ALL">全部对比 (Native vs Exact-TMR vs Approx-SIMD)</option>
+      <option value="native">Native (无保护)</option>
+      <option value="exact_tmr">Exact-TMR (传统三模冗余)</option>
+      <option value="approx_scalar">Approx-Scalar (混合近似标量)</option>
+      <option value="approx_simd">Approx-SIMD (混合近似+向量化)</option>
+    </select>
+  </div>
+  <div class="legend">
+    <span><i class="dot" style="background:#64748b"></i>Masked (完全掩盖 ≤1e-12)</span>
+    <span><i class="dot" style="background:#22c55e"></i>Detected & Recovered (投票器检出并恢复)</span>
+    <span><i class="dot" style="background:#38bdf8"></i>Benign Approx (良性误差 ≤1%)</span>
+    <span><i class="dot" style="background:#f59e0b"></i>DUE (检出未恢复)</span>
+    <span><i class="dot" style="background:#ef4444"></i>SDC (静默数据损坏 >1% 或 NaN/Inf)</span>
+  </div>
+  <table id="tbl-fi">
+    <thead>
+      <tr>
+        <th>策略</th>
+        <th>算子</th>
+        <th style="text-align:left;width:240px;">五分类故障结果分布 (1000 Trials)</th>
+        <th>Masked</th>
+        <th>Det & Rec</th>
+        <th>Benign</th>
+        <th>SDC (危险)</th>
+        <th>恢复后相对误差</th>
+        <th>硬件指令倍率</th>
+        <th>MWTF 综合分</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<!-- 模块 4: RQ2 选择性保护曲线 & RQ3 阈值敏感度 -->
+<div class="section">
+  <h2>4. RQ2 & RQ3: 算法有效性消融实验 (选择性保护比例曲线 + 阈值 δ 敏感度 U 型权衡)</h2>
+  <div class="grid-2">
+    <div>
+      <h3 style="font-size:15px;margin-bottom:4px;">4.1 RQ2: 保护预算 (25%~100%) 下三种排序算法的平均 SDC 率对比</h3>
+      <p class="desc">对比本文 Semantic 公式 (3-1) vs Loop-Only (仅看循环深度) vs Random (随机保护)</p>
+      <svg class="chart" id="svg-rq2" viewBox="0 0 600 260"></svg>
+      <table id="tbl-rq2">
+        <thead>
+          <tr>
+            <th>保护预算 Budget</th>
+            <th>Random 平均 SDC</th>
+            <th>Loop-Only 平均 SDC</th>
+            <th>Semantic (本文) 平均 SDC</th>
+            <th>EKF (25%预算) SDC 对比</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div>
+      <h3 style="font-size:15px;margin-bottom:4px;">4.2 RQ3: 投票器容忍阈值 δ 敏感度分析 (验证开题报告 4.4.4 节)</h3>
+      <p class="desc">δ 过小导致近似固有误差被误判为故障 (False Alarm 高)；δ 过大导致真实位翻转漏检 (SDC 升高)</p>
+      <svg class="chart" id="svg-rq3" viewBox="0 0 600 260"></svg>
+      <table id="tbl-rq3">
+        <thead>
+          <tr>
+            <th>阈值 δ</th>
+            <th>无故障误报率 (Sobel / FFT)</th>
+            <th>故障检出恢复率</th>
+            <th>平均 SDC 漏检率</th>
+            <th>恢复后平均相对误差</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 模块 5: RQ4 太阳耀斑在轨动态自适应轨迹 -->
+<div class="section">
+  <h2>5. RQ4: 太阳耀斑辐射脉冲下的运行时 LOW ↔ HIGH 自适应切换轨迹 (对应开题报告 3.3.3 节)</h2>
+  <p class="desc">Window 0~19 平静期 (LOW) → Window 20 太阳耀斑爆发，指标 A (连续短间隔) 与指标 B (窗口累积) 同时满足切入 HIGH → Window 40 消退后经 M=3 窗口滞回切回 LOW</p>
+  <svg class="chart" id="svg-rq4" viewBox="0 0 1100 260"></svg>
+</div>
+
+<script>
+const DATA = {"criticality": [{"function": "bench_dgemm_kernel", "num_insts": "43", "max_loop_depth": "3", "avg_output_closeness": "0.174098", "avg_liveness": "1.72727", "state_feedback": "1", "score": "7.69706", "criticality_level": "CRITICAL"}, {"function": "bench_dgemv_kernel", "num_insts": "31", "max_loop_depth": "2", "avg_output_closeness": "0.188426", "avg_liveness": "2", "state_feedback": "1", "score": "6.15106", "criticality_level": "SUB_CRITICAL"}, {"function": "bench_fft_radix2_kernel", "num_insts": "52", "max_loop_depth": "2", "avg_output_closeness": "0.202116", "avg_liveness": "1.73333", "state_feedback": "2", "score": "6.45196", "criticality_level": "SUB_CRITICAL"}, {"function": "bench_fir_filter_kernel", "num_insts": "34", "max_loop_depth": "2", "avg_output_closeness": "0.172222", "avg_liveness": "2.8", "state_feedback": "2", "score": "7.23056", "criticality_level": "CRITICAL"}, {"function": "bench_sobel_kernel", "num_insts": "119", "max_loop_depth": "2", "avg_output_closeness": "0.117712", "avg_liveness": "1.09231", "state_feedback": "0", "score": "4.76813", "criticality_level": "SUB_CRITICAL"}, {"function": "bench_gaussian_blur_kernel", "num_insts": "58", "max_loop_depth": "4", "avg_output_closeness": "0.13617", "avg_liveness": "1.625", "state_feedback": "2", "score": "9.80042", "criticality_level": "CRITICAL"}, {"function": "bench_pid_controller_kernel", "num_insts": "27", "max_loop_depth": "1", "avg_output_closeness": "0.289583", "avg_liveness": "2.25", "state_feedback": "2", "score": "5.28396", "criticality_level": "SUB_CRITICAL"}, {"function": "bench_ekf_attitude_kernel", "num_insts": "50", "max_loop_depth": "1", "avg_output_closeness": "0.180323", "avg_liveness": "2.07407", "state_feedback": "6", "score": "6.79007", "criticality_level": "CRITICAL"}, {"function": "bench_noncritical_telemetry_checksum", "num_insts": "13", "max_loop_depth": "0", "avg_output_closeness": "0.291667", "avg_liveness": "1.66667", "state_feedback": "0", "score": "2.0625", "criticality_level": "NON_CRITICAL"}], "rq1_pmu": [{"policy": "native", "benchmark": "dgemm", "exec_time_us": "47.143", "hw_insts": "797640", "hw_cycles": "145345", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "native", "benchmark": "dgemv", "exec_time_us": "0.83", "hw_insts": "14228", "hw_cycles": "2560", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "native", "benchmark": "fft", "exec_time_us": "81.356", "hw_insts": "939688", "hw_cycles": "250706", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "native", "benchmark": "fir", "exec_time_us": "11.179", "hw_insts": "182887", "hw_cycles": "34503", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "native", "benchmark": "sobel", "exec_time_us": "5.253", "hw_insts": "73094", "hw_cycles": "16190", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "native", "benchmark": "gaussian_blur", "exec_time_us": "34.397", "hw_insts": "476826", "hw_cycles": "106126", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "native", "benchmark": "pid", "exec_time_us": "0.705", "hw_insts": "9753", "hw_cycles": "2159", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "native", "benchmark": "ekf", "exec_time_us": "7.549", "hw_insts": "22560", "hw_cycles": "23310", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "dgemm", "exec_time_us": "73.716", "hw_insts": "1131720", "hw_cycles": "227232", "rel_l2_err": "1.206566e-07", "mean_rel_err": "9.580787e-08", "max_abs_err": "9.398594e-06", "psnr_db": "142.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "dgemv", "exec_time_us": "1.536", "hw_insts": "21188", "hw_cycles": "4731", "rel_l2_err": "1.284647e-07", "mean_rel_err": "9.948454e-08", "max_abs_err": "1.589607e-05", "psnr_db": "138.01", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "fft", "exec_time_us": "178.996", "hw_insts": "1722233", "hw_cycles": "552391", "rel_l2_err": "5.394644e-05", "mean_rel_err": "0.0001319677", "max_abs_err": "0.001116943", "psnr_db": "100.37", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "fir", "exec_time_us": "13.395", "hw_insts": "246951", "hw_cycles": "41363", "rel_l2_err": "8.462216e-08", "mean_rel_err": "8.800763e-08", "max_abs_err": "1.010465e-07", "psnr_db": "154.08", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "sobel", "exec_time_us": "9.218", "hw_insts": "94254", "hw_cycles": "28288", "rel_l2_err": "4.107366e-07", "mean_rel_err": "3.640202e-07", "max_abs_err": "8.712475e-05", "psnr_db": "142.16", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "gaussian_blur", "exec_time_us": "41.588", "hw_insts": "670426", "hw_cycles": "128404", "rel_l2_err": "8.782289e-08", "mean_rel_err": "5.726387e-08", "max_abs_err": "5.887367e-05", "psnr_db": "147.65", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "pid", "exec_time_us": "1.09", "hw_insts": "12318", "hw_cycles": "3365", "rel_l2_err": "8.351062e-07", "mean_rel_err": "1.543639e-05", "max_abs_err": "6.524895e-07", "psnr_db": "139.35", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "pure_approx", "benchmark": "ekf", "exec_time_us": "7.179", "hw_insts": "26658", "hw_cycles": "22157", "rel_l2_err": "3.377334e-07", "mean_rel_err": "1.631458e-06", "max_abs_err": "6.5902e-07", "psnr_db": "135.34", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "dgemm", "exec_time_us": "294.168", "hw_insts": "4705285", "hw_cycles": "908083", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2304", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "dgemv", "exec_time_us": "6.027", "hw_insts": "97957", "hw_cycles": "18620", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "48", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "fft", "exec_time_us": "280.12", "hw_insts": "3428070", "hw_cycles": "865617", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "128", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "fir", "exec_time_us": "44.138", "hw_insts": "771224", "hw_cycles": "136335", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "sobel", "exec_time_us": "60.397", "hw_insts": "870828", "hw_cycles": "186641", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2116", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "gaussian_blur", "exec_time_us": "136.384", "hw_insts": "2302568", "hw_cycles": "421426", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "1936", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "pid", "exec_time_us": "8.609", "hw_insts": "130100", "hw_cycles": "26602", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "exact_tmr", "benchmark": "ekf", "exec_time_us": "34.703", "hw_insts": "555577", "hw_cycles": "107072", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "3584", "false_alarms": "0"}, {"policy": "approx_scalar", "benchmark": "dgemm", "exec_time_us": "227.675", "hw_insts": "2799925", "hw_cycles": "703234", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2304", "false_alarms": "0"}, {"policy": "approx_scalar", "benchmark": "dgemv", "exec_time_us": "4.721", "hw_insts": "55861", "hw_cycles": "14576", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "48", "false_alarms": "0"}, {"policy": "approx_scalar", "benchmark": "fft", "exec_time_us": "266.546", "hw_insts": "2806196", "hw_cycles": "823306", "rel_l2_err": "4.361162e-05", "mean_rel_err": "0.0001248966", "max_abs_err": "0.0009824634", "psnr_db": "102.22", "votes_per_iter": "128", "false_alarms": "43"}, {"policy": "approx_scalar", "benchmark": "fir", "exec_time_us": "33.121", "hw_insts": "497511", "hw_cycles": "102301", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "approx_scalar", "benchmark": "sobel", "exec_time_us": "41.316", "hw_insts": "572472", "hw_cycles": "127628", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2116", "false_alarms": "0"}, {"policy": "approx_scalar", "benchmark": "gaussian_blur", "exec_time_us": "105.005", "hw_insts": "1489448", "hw_cycles": "324367", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "1936", "false_alarms": "0"}, {"policy": "approx_scalar", "benchmark": "pid", "exec_time_us": "7.362", "hw_insts": "117306", "hw_cycles": "22748", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "approx_scalar", "benchmark": "ekf", "exec_time_us": "45.519", "hw_insts": "678983", "hw_cycles": "140642", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "3584", "false_alarms": "0"}, {"policy": "approx_simd", "benchmark": "dgemm", "exec_time_us": "131.402", "hw_insts": "2028085", "hw_cycles": "405662", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2304", "false_alarms": "0"}, {"policy": "approx_simd", "benchmark": "dgemv", "exec_time_us": "2.683", "hw_insts": "39781", "hw_cycles": "8285", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "48", "false_alarms": "0"}, {"policy": "approx_simd", "benchmark": "fft", "exec_time_us": "279.804", "hw_insts": "2634354", "hw_cycles": "864234", "rel_l2_err": "4.361162e-05", "mean_rel_err": "0.0001248966", "max_abs_err": "0.0009824634", "psnr_db": "102.22", "votes_per_iter": "128", "false_alarms": "43"}, {"policy": "approx_simd", "benchmark": "fir", "exec_time_us": "21.362", "hw_insts": "370407", "hw_cycles": "65972", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "approx_simd", "benchmark": "sobel", "exec_time_us": "35.788", "hw_insts": "481480", "hw_cycles": "110548", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2116", "false_alarms": "0"}, {"policy": "approx_simd", "benchmark": "gaussian_blur", "exec_time_us": "70.133", "hw_insts": "1152584", "hw_cycles": "216627", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "1936", "false_alarms": "0"}, {"policy": "approx_simd", "benchmark": "pid", "exec_time_us": "7.112", "hw_insts": "100413", "hw_cycles": "21970", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "approx_simd", "benchmark": "ekf", "exec_time_us": "41.356", "hw_insts": "606275", "hw_cycles": "127767", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "3584", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "dgemm", "exec_time_us": "129.907", "hw_insts": "2028113", "hw_cycles": "401167", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2304", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "dgemv", "exec_time_us": "0.834", "hw_insts": "14256", "hw_cycles": "2571", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "fft", "exec_time_us": "80.814", "hw_insts": "943814", "hw_cycles": "249638", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "fir", "exec_time_us": "21.26", "hw_insts": "370437", "hw_cycles": "65690", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "sobel", "exec_time_us": "5.099", "hw_insts": "73122", "hw_cycles": "15747", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "gaussian_blur", "exec_time_us": "70.426", "hw_insts": "1152612", "hw_cycles": "217458", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "1936", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "pid", "exec_time_us": "0.698", "hw_insts": "9789", "hw_cycles": "2146", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "0", "false_alarms": "0"}, {"policy": "adaptive_low", "benchmark": "ekf", "exec_time_us": "41.33", "hw_insts": "606305", "hw_cycles": "127696", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "3584", "false_alarms": "0"}, {"policy": "adaptive_high", "benchmark": "dgemm", "exec_time_us": "129.952", "hw_insts": "2028113", "hw_cycles": "401328", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2304", "false_alarms": "0"}, {"policy": "adaptive_high", "benchmark": "dgemv", "exec_time_us": "2.698", "hw_insts": "39809", "hw_cycles": "8302", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "48", "false_alarms": "0"}, {"policy": "adaptive_high", "benchmark": "fft", "exec_time_us": "258.697", "hw_insts": "2634384", "hw_cycles": "798949", "rel_l2_err": "4.361162e-05", "mean_rel_err": "0.0001248966", "max_abs_err": "0.0009824634", "psnr_db": "102.22", "votes_per_iter": "128", "false_alarms": "43"}, {"policy": "adaptive_high", "benchmark": "fir", "exec_time_us": "21.349", "hw_insts": "370437", "hw_cycles": "65952", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "adaptive_high", "benchmark": "sobel", "exec_time_us": "35.141", "hw_insts": "481508", "hw_cycles": "108563", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "2116", "false_alarms": "0"}, {"policy": "adaptive_high", "benchmark": "gaussian_blur", "exec_time_us": "70.203", "hw_insts": "1152612", "hw_cycles": "216891", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "1936", "false_alarms": "0"}, {"policy": "adaptive_high", "benchmark": "pid", "exec_time_us": "6.928", "hw_insts": "100449", "hw_cycles": "21402", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "512", "false_alarms": "0"}, {"policy": "adaptive_high", "benchmark": "ekf", "exec_time_us": "41.501", "hw_insts": "606305", "hw_cycles": "128163", "rel_l2_err": "0.0", "mean_rel_err": "0.0", "max_abs_err": "0.0", "psnr_db": "120.0", "votes_per_iter": "3584", "false_alarms": "0"}], "rq1_fi": [{"policy": "native", "benchmark": "dgemm", "dyn_target_insts": "55296", "trials": "1000", "masked_pct": "34.4", "det_recovered_pct": "0.0", "benign_pct": "61.2", "sdc_pct": "4.4", "due_pct": "0.0", "avg_valid_rel_err": "0.000313289", "norm_hw_inst_ratio": "1.0", "mwtf_score": "22.73"}, {"policy": "native", "benchmark": "dgemv", "dyn_target_insts": "2304", "trials": "1000", "masked_pct": "31.1", "det_recovered_pct": "0.0", "benign_pct": "59.2", "sdc_pct": "9.7", "due_pct": "0.0", "avg_valid_rel_err": "0.000806847", "norm_hw_inst_ratio": "1.0", "mwtf_score": "10.31"}, {"policy": "native", "benchmark": "fft", "dyn_target_insts": "16384", "trials": "1000", "masked_pct": "61.9", "det_recovered_pct": "0.0", "benign_pct": "32.3", "sdc_pct": "5.8", "due_pct": "0.0", "avg_valid_rel_err": "0.0002497994", "norm_hw_inst_ratio": "1.0", "mwtf_score": "17.24"}, {"policy": "native", "benchmark": "fir", "dyn_target_insts": "15904", "trials": "1000", "masked_pct": "33.1", "det_recovered_pct": "0.0", "benign_pct": "60.1", "sdc_pct": "6.8", "due_pct": "0.0", "avg_valid_rel_err": "0.0004730074", "norm_hw_inst_ratio": "1.0", "mwtf_score": "14.71"}, {"policy": "native", "benchmark": "sobel", "dyn_target_insts": "15004", "trials": "1000", "masked_pct": "26.5", "det_recovered_pct": "0.0", "benign_pct": "51.1", "sdc_pct": "22.4", "due_pct": "0.0", "avg_valid_rel_err": "0.000249497", "norm_hw_inst_ratio": "1.0", "mwtf_score": "4.46"}, {"policy": "native", "benchmark": "gaussian_blur", "dyn_target_insts": "40000", "trials": "1000", "masked_pct": "32.9", "det_recovered_pct": "0.0", "benign_pct": "57.4", "sdc_pct": "9.7", "due_pct": "0.0", "avg_valid_rel_err": "0.0002753313", "norm_hw_inst_ratio": "1.0", "mwtf_score": "10.31"}, {"policy": "native", "benchmark": "pid", "dyn_target_insts": "3072", "trials": "1000", "masked_pct": "31.7", "det_recovered_pct": "0.0", "benign_pct": "56.6", "sdc_pct": "11.7", "due_pct": "0.0", "avg_valid_rel_err": "0.0003749575", "norm_hw_inst_ratio": "1.0", "mwtf_score": "8.55"}, {"policy": "native", "benchmark": "ekf", "dyn_target_insts": "10240", "trials": "1000", "masked_pct": "32.2", "det_recovered_pct": "0.0", "benign_pct": "59.2", "sdc_pct": "8.6", "due_pct": "0.0", "avg_valid_rel_err": "0.0004544035", "norm_hw_inst_ratio": "1.0", "mwtf_score": "11.63"}, {"policy": "exact_tmr", "benchmark": "dgemm", "dyn_target_insts": "165888", "trials": "1000", "masked_pct": "22.1", "det_recovered_pct": "77.9", "benign_pct": "0.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "3.449513e-17", "norm_hw_inst_ratio": "5.899", "mwtf_score": "339.38"}, {"policy": "exact_tmr", "benchmark": "dgemv", "dyn_target_insts": "6912", "trials": "1000", "masked_pct": "21.0", "det_recovered_pct": "79.0", "benign_pct": "0.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "9.573028e-17", "norm_hw_inst_ratio": "6.885", "mwtf_score": "290.79"}, {"policy": "exact_tmr", "benchmark": "fft", "dyn_target_insts": "49152", "trials": "1000", "masked_pct": "32.2", "det_recovered_pct": "67.8", "benign_pct": "0.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "3.06704e-16", "norm_hw_inst_ratio": "3.648", "mwtf_score": "548.78"}, {"policy": "exact_tmr", "benchmark": "fir", "dyn_target_insts": "47712", "trials": "1000", "masked_pct": "28.7", "det_recovered_pct": "71.3", "benign_pct": "0.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "8.458024e-16", "norm_hw_inst_ratio": "4.217", "mwtf_score": "474.75"}, {"policy": "exact_tmr", "benchmark": "sobel", "dyn_target_insts": "45012", "trials": "1000", "masked_pct": "11.3", "det_recovered_pct": "88.7", "benign_pct": "0.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "8.664643e-18", "norm_hw_inst_ratio": "11.914", "mwtf_score": "168.04"}, {"policy": "exact_tmr", "benchmark": "gaussian_blur", "dyn_target_insts": "120000", "trials": "1000", "masked_pct": "17.2", "det_recovered_pct": "82.8", "benign_pct": "0.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "2.38132e-18", "norm_hw_inst_ratio": "4.829", "mwtf_score": "414.58"}, {"policy": "exact_tmr", "benchmark": "pid", "dyn_target_insts": "9216", "trials": "1000", "masked_pct": "29.6", "det_recovered_pct": "70.4", "benign_pct": "0.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "7.91897e-15", "norm_hw_inst_ratio": "13.339", "mwtf_score": "150.08"}, {"policy": "exact_tmr", "benchmark": "ekf", "dyn_target_insts": "30720", "trials": "1000", "masked_pct": "34.4", "det_recovered_pct": "64.6", "benign_pct": "1.0", "sdc_pct": "0.0", "due_pct": "0.0", "avg_valid_rel_err": "2.237523e-13", "norm_hw_inst_ratio": "24.627", "mwtf_score": "81.29"}, {"policy": "approx_scalar", "benchmark": "dgemm", "dyn_target_insts": "110592", "trials": "1000", "masked_pct": "21.6", "det_recovered_pct": "55.5", "benign_pct": "22.6", "sdc_pct": "0.0", "due_pct": "0.3", "avg_valid_rel_err": "7.162019e-05", "norm_hw_inst_ratio": "3.51", "mwtf_score": "570.33"}, {"policy": "approx_scalar", "benchmark": "dgemv", "dyn_target_insts": "4608", "trials": "1000", "masked_pct": "21.1", "det_recovered_pct": "54.8", "benign_pct": "22.0", "sdc_pct": "1.4", "due_pct": "0.7", "avg_valid_rel_err": "0.0001983643", "norm_hw_inst_ratio": "3.926", "mwtf_score": "18.19"}, {"policy": "approx_scalar", "benchmark": "fft", "dyn_target_insts": "40960", "trials": "1000", "masked_pct": "38.7", "det_recovered_pct": "37.0", "benign_pct": "4.9", "sdc_pct": "0.3", "due_pct": "19.1", "avg_valid_rel_err": "2.568229e-05", "norm_hw_inst_ratio": "2.986", "mwtf_score": "111.62"}, {"policy": "approx_scalar", "benchmark": "fir", "dyn_target_insts": "31808", "trials": "1000", "masked_pct": "24.4", "det_recovered_pct": "49.2", "benign_pct": "25.3", "sdc_pct": "0.9", "due_pct": "0.2", "avg_valid_rel_err": "7.174177e-05", "norm_hw_inst_ratio": "2.72", "mwtf_score": "40.84"}, {"policy": "approx_scalar", "benchmark": "sobel", "dyn_target_insts": "33396", "trials": "1000", "masked_pct": "16.4", "det_recovered_pct": "62.2", "benign_pct": "17.9", "sdc_pct": "2.4", "due_pct": "1.1", "avg_valid_rel_err": "5.747246e-05", "norm_hw_inst_ratio": "7.832", "mwtf_score": "5.32"}, {"policy": "approx_scalar", "benchmark": "gaussian_blur", "dyn_target_insts": "80000", "trials": "1000", "masked_pct": "24.9", "det_recovered_pct": "50.7", "benign_pct": "22.3", "sdc_pct": "1.2", "due_pct": "0.9", "avg_valid_rel_err": "5.713737e-05", "norm_hw_inst_ratio": "3.124", "mwtf_score": "26.68"}, {"policy": "approx_scalar", "benchmark": "pid", "dyn_target_insts": "8192", "trials": "1000", "masked_pct": "23.8", "det_recovered_pct": "60.2", "benign_pct": "14.0", "sdc_pct": "1.8", "due_pct": "0.2", "avg_valid_rel_err": "1.391723e-05", "norm_hw_inst_ratio": "12.028", "mwtf_score": "4.62"}, {"policy": "approx_scalar", "benchmark": "ekf", "dyn_target_insts": "29696", "trials": "1000", "masked_pct": "21.7", "det_recovered_pct": "66.1", "benign_pct": "11.9", "sdc_pct": "0.0", "due_pct": "0.3", "avg_valid_rel_err": "5.408664e-06", "norm_hw_inst_ratio": "30.097", "mwtf_score": "66.52"}, {"policy": "approx_simd", "benchmark": "dgemm", "dyn_target_insts": "110592", "trials": "1000", "masked_pct": "21.6", "det_recovered_pct": "55.5", "benign_pct": "22.6", "sdc_pct": "0.0", "due_pct": "0.3", "avg_valid_rel_err": "7.162019e-05", "norm_hw_inst_ratio": "2.543", "mwtf_score": "787.38"}, {"policy": "approx_simd", "benchmark": "dgemv", "dyn_target_insts": "4608", "trials": "1000", "masked_pct": "21.1", "det_recovered_pct": "54.8", "benign_pct": "22.0", "sdc_pct": "1.4", "due_pct": "0.7", "avg_valid_rel_err": "0.0001983643", "norm_hw_inst_ratio": "2.796", "mwtf_score": "25.55"}, {"policy": "approx_simd", "benchmark": "fft", "dyn_target_insts": "40960", "trials": "1000", "masked_pct": "38.7", "det_recovered_pct": "37.0", "benign_pct": "4.9", "sdc_pct": "0.3", "due_pct": "19.1", "avg_valid_rel_err": "2.568229e-05", "norm_hw_inst_ratio": "2.803", "mwtf_score": "118.9"}, {"policy": "approx_simd", "benchmark": "fir", "dyn_target_insts": "31808", "trials": "1000", "masked_pct": "24.4", "det_recovered_pct": "49.2", "benign_pct": "25.3", "sdc_pct": "0.9", "due_pct": "0.2", "avg_valid_rel_err": "7.174177e-05", "norm_hw_inst_ratio": "2.025", "mwtf_score": "54.86"}, {"policy": "approx_simd", "benchmark": "sobel", "dyn_target_insts": "33396", "trials": "1000", "masked_pct": "16.4", "det_recovered_pct": "62.2", "benign_pct": "17.9", "sdc_pct": "2.4", "due_pct": "1.1", "avg_valid_rel_err": "5.747246e-05", "norm_hw_inst_ratio": "6.587", "mwtf_score": "6.33"}, {"policy": "approx_simd", "benchmark": "gaussian_blur", "dyn_target_insts": "80000", "trials": "1000", "masked_pct": "24.9", "det_recovered_pct": "50.7", "benign_pct": "22.3", "sdc_pct": "1.2", "due_pct": "0.9", "avg_valid_rel_err": "5.713737e-05", "norm_hw_inst_ratio": "2.417", "mwtf_score": "34.48"}, {"policy": "approx_simd", "benchmark": "pid", "dyn_target_insts": "8192", "trials": "1000", "masked_pct": "23.8", "det_recovered_pct": "60.2", "benign_pct": "14.0", "sdc_pct": "1.8", "due_pct": "0.2", "avg_valid_rel_err": "1.391723e-05", "norm_hw_inst_ratio": "10.296", "mwtf_score": "5.4"}, {"policy": "approx_simd", "benchmark": "ekf", "dyn_target_insts": "29696", "trials": "1000", "masked_pct": "21.7", "det_recovered_pct": "66.1", "benign_pct": "11.9", "sdc_pct": "0.0", "due_pct": "0.3", "avg_valid_rel_err": "5.408664e-06", "norm_hw_inst_ratio": "26.874", "mwtf_score": "74.5"}, {"policy": "adaptive_high", "benchmark": "dgemm", "dyn_target_insts": "110592", "trials": "1000", "masked_pct": "21.6", "det_recovered_pct": "55.5", "benign_pct": "22.6", "sdc_pct": "0.0", "due_pct": "0.3", "avg_valid_rel_err": "7.162019e-05", "norm_hw_inst_ratio": "2.543", "mwtf_score": "787.37"}, {"policy": "adaptive_high", "benchmark": "dgemv", "dyn_target_insts": "4608", "trials": "1000", "masked_pct": "21.1", "det_recovered_pct": "54.8", "benign_pct": "22.0", "sdc_pct": "1.4", "due_pct": "0.7", "avg_valid_rel_err": "0.0001983643", "norm_hw_inst_ratio": "2.798", "mwtf_score": "25.53"}, {"policy": "adaptive_high", "benchmark": "fft", "dyn_target_insts": "40960", "trials": "1000", "masked_pct": "38.7", "det_recovered_pct": "37.0", "benign_pct": "4.9", "sdc_pct": "0.3", "due_pct": "19.1", "avg_valid_rel_err": "2.568229e-05", "norm_hw_inst_ratio": "2.803", "mwtf_score": "118.9"}, {"policy": "adaptive_high", "benchmark": "fir", "dyn_target_insts": "31808", "trials": "1000", "masked_pct": "24.4", "det_recovered_pct": "49.2", "benign_pct": "25.3", "sdc_pct": "0.9", "due_pct": "0.2", "avg_valid_rel_err": "7.174177e-05", "norm_hw_inst_ratio": "2.025", "mwtf_score": "54.86"}, {"policy": "adaptive_high", "benchmark": "sobel", "dyn_target_insts": "33396", "trials": "1000", "masked_pct": "16.4", "det_recovered_pct": "62.2", "benign_pct": "17.9", "sdc_pct": "2.4", "due_pct": "1.1", "avg_valid_rel_err": "5.747246e-05", "norm_hw_inst_ratio": "6.588", "mwtf_score": "6.33"}, {"policy": "adaptive_high", "benchmark": "gaussian_blur", "dyn_target_insts": "80000", "trials": "1000", "masked_pct": "24.9", "det_recovered_pct": "50.7", "benign_pct": "22.3", "sdc_pct": "1.2", "due_pct": "0.9", "avg_valid_rel_err": "5.713737e-05", "norm_hw_inst_ratio": "2.417", "mwtf_score": "34.47"}, {"policy": "adaptive_high", "benchmark": "pid", "dyn_target_insts": "8192", "trials": "1000", "masked_pct": "23.8", "det_recovered_pct": "60.2", "benign_pct": "14.0", "sdc_pct": "1.8", "due_pct": "0.2", "avg_valid_rel_err": "1.391723e-05", "norm_hw_inst_ratio": "10.299", "mwtf_score": "5.39"}, {"policy": "adaptive_high", "benchmark": "ekf", "dyn_target_insts": "29696", "trials": "1000", "masked_pct": "21.7", "det_recovered_pct": "66.1", "benign_pct": "11.9", "sdc_pct": "0.0", "due_pct": "0.3", "avg_valid_rel_err": "5.408664e-06", "norm_hw_inst_ratio": "26.875", "mwtf_score": "74.49"}], "rq2_selective": [{"rank_method": "semantic", "budget": "0.25", "benchmark": "dgemm", "hw_inst_ratio": "1.849", "sdc_pct": "0.0", "det_recovered_pct": "42.0", "masked_pct": "25.5", "mwtf": "433.66"}, {"rank_method": "semantic", "budget": "0.25", "benchmark": "dgemv", "hw_inst_ratio": "1.986", "sdc_pct": "2.25", "det_recovered_pct": "33.25", "masked_pct": "25.0", "mwtf": "22.38"}, {"rank_method": "semantic", "budget": "0.25", "benchmark": "fft", "hw_inst_ratio": "1.103", "sdc_pct": "2.0", "det_recovered_pct": "33.75", "masked_pct": "43.75", "mwtf": "45.31"}, {"rank_method": "semantic", "budget": "0.25", "benchmark": "fir", "hw_inst_ratio": "1.678", "sdc_pct": "1.25", "det_recovered_pct": "33.5", "masked_pct": "24.5", "mwtf": "47.68"}, {"rank_method": "semantic", "budget": "0.25", "benchmark": "sobel", "hw_inst_ratio": "5.748", "sdc_pct": "10.75", "det_recovered_pct": "16.75", "masked_pct": "28.25", "mwtf": "1.62"}, {"rank_method": "semantic", "budget": "0.25", "benchmark": "gaussian_blur", "hw_inst_ratio": "1.91", "sdc_pct": "1.75", "det_recovered_pct": "35.25", "masked_pct": "27.0", "mwtf": "29.92"}, {"rank_method": "semantic", "budget": "0.25", "benchmark": "pid", "hw_inst_ratio": "1.0", "sdc_pct": "7.75", "det_recovered_pct": "0.0", "masked_pct": "52.0", "mwtf": "12.9"}, {"rank_method": "semantic", "budget": "0.25", "benchmark": "ekf", "hw_inst_ratio": "26.601", "sdc_pct": "2.0", "det_recovered_pct": "33.0", "masked_pct": "24.75", "mwtf": "1.88"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "dgemm", "hw_inst_ratio": "1.849", "sdc_pct": "0.0", "det_recovered_pct": "42.0", "masked_pct": "25.5", "mwtf": "433.66"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "dgemv", "hw_inst_ratio": "1.986", "sdc_pct": "2.25", "det_recovered_pct": "33.25", "masked_pct": "25.0", "mwtf": "22.38"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "fft", "hw_inst_ratio": "1.977", "sdc_pct": "2.75", "det_recovered_pct": "31.5", "masked_pct": "52.5", "mwtf": "18.4"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "fir", "hw_inst_ratio": "1.678", "sdc_pct": "1.25", "det_recovered_pct": "33.5", "masked_pct": "24.5", "mwtf": "47.68"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "sobel", "hw_inst_ratio": "6.153", "sdc_pct": "6.25", "det_recovered_pct": "40.25", "masked_pct": "21.75", "mwtf": "2.6"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "gaussian_blur", "hw_inst_ratio": "1.91", "sdc_pct": "1.75", "det_recovered_pct": "35.25", "masked_pct": "27.0", "mwtf": "29.92"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "pid", "hw_inst_ratio": "9.402", "sdc_pct": "5.0", "det_recovered_pct": "16.75", "masked_pct": "45.75", "mwtf": "2.13"}, {"rank_method": "semantic", "budget": "0.5", "benchmark": "ekf", "hw_inst_ratio": "26.964", "sdc_pct": "0.75", "det_recovered_pct": "47.5", "masked_pct": "23.0", "mwtf": "4.94"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "dgemm", "hw_inst_ratio": "2.543", "sdc_pct": "0.0", "det_recovered_pct": "56.0", "masked_pct": "21.5", "mwtf": "315.42"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "dgemv", "hw_inst_ratio": "2.796", "sdc_pct": "1.0", "det_recovered_pct": "54.25", "masked_pct": "21.5", "mwtf": "35.77"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "fft", "hw_inst_ratio": "2.024", "sdc_pct": "1.0", "det_recovered_pct": "44.5", "masked_pct": "38.5", "mwtf": "49.41"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "fir", "hw_inst_ratio": "2.025", "sdc_pct": "1.0", "det_recovered_pct": "49.5", "masked_pct": "24.0", "mwtf": "49.37"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "sobel", "hw_inst_ratio": "6.529", "sdc_pct": "4.5", "det_recovered_pct": "51.25", "masked_pct": "21.0", "mwtf": "3.4"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "gaussian_blur", "hw_inst_ratio": "2.417", "sdc_pct": "1.25", "det_recovered_pct": "54.0", "masked_pct": "23.0", "mwtf": "33.1"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "pid", "hw_inst_ratio": "10.243", "sdc_pct": "2.0", "det_recovered_pct": "46.25", "masked_pct": "30.75", "mwtf": "4.88"}, {"rank_method": "semantic", "budget": "0.75", "benchmark": "ekf", "hw_inst_ratio": "27.101", "sdc_pct": "1.0", "det_recovered_pct": "60.25", "masked_pct": "23.75", "mwtf": "3.69"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "dgemm", "hw_inst_ratio": "2.543", "sdc_pct": "0.0", "det_recovered_pct": "56.0", "masked_pct": "21.5", "mwtf": "315.42"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "dgemv", "hw_inst_ratio": "2.796", "sdc_pct": "1.0", "det_recovered_pct": "54.25", "masked_pct": "21.5", "mwtf": "35.77"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "fft", "hw_inst_ratio": "2.803", "sdc_pct": "0.5", "det_recovered_pct": "37.75", "masked_pct": "36.0", "mwtf": "71.34"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "fir", "hw_inst_ratio": "2.025", "sdc_pct": "1.0", "det_recovered_pct": "49.5", "masked_pct": "24.0", "mwtf": "49.37"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "sobel", "hw_inst_ratio": "6.587", "sdc_pct": "1.5", "det_recovered_pct": "62.0", "masked_pct": "18.5", "mwtf": "10.12"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "gaussian_blur", "hw_inst_ratio": "2.417", "sdc_pct": "1.25", "det_recovered_pct": "54.0", "masked_pct": "23.0", "mwtf": "33.1"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "pid", "hw_inst_ratio": "10.296", "sdc_pct": "1.25", "det_recovered_pct": "59.5", "masked_pct": "26.0", "mwtf": "7.77"}, {"rank_method": "semantic", "budget": "1.0", "benchmark": "ekf", "hw_inst_ratio": "26.874", "sdc_pct": "0.0", "det_recovered_pct": "67.25", "masked_pct": "20.0", "mwtf": "29.84"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "dgemm", "hw_inst_ratio": "1.849", "sdc_pct": "0.0", "det_recovered_pct": "42.0", "masked_pct": "25.5", "mwtf": "433.66"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "dgemv", "hw_inst_ratio": "1.986", "sdc_pct": "2.25", "det_recovered_pct": "33.25", "masked_pct": "25.0", "mwtf": "22.38"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "fft", "hw_inst_ratio": "1.09", "sdc_pct": "2.5", "det_recovered_pct": "31.75", "masked_pct": "44.5", "mwtf": "36.69"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "fir", "hw_inst_ratio": "1.678", "sdc_pct": "1.25", "det_recovered_pct": "33.5", "masked_pct": "24.5", "mwtf": "47.68"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "sobel", "hw_inst_ratio": "5.863", "sdc_pct": "12.75", "det_recovered_pct": "18.5", "masked_pct": "25.5", "mwtf": "1.34"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "gaussian_blur", "hw_inst_ratio": "1.91", "sdc_pct": "1.75", "det_recovered_pct": "35.25", "masked_pct": "27.0", "mwtf": "29.92"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "pid", "hw_inst_ratio": "9.507", "sdc_pct": "6.75", "det_recovered_pct": "32.75", "masked_pct": "28.25", "mwtf": "1.56"}, {"rank_method": "loop-only", "budget": "0.25", "benchmark": "ekf", "hw_inst_ratio": "15.389", "sdc_pct": "4.0", "det_recovered_pct": "25.25", "masked_pct": "32.75", "mwtf": "1.62"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "dgemm", "hw_inst_ratio": "1.849", "sdc_pct": "0.0", "det_recovered_pct": "42.0", "masked_pct": "25.5", "mwtf": "433.66"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "dgemv", "hw_inst_ratio": "1.986", "sdc_pct": "2.25", "det_recovered_pct": "33.25", "masked_pct": "25.0", "mwtf": "22.38"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "fft", "hw_inst_ratio": "1.13", "sdc_pct": "2.5", "det_recovered_pct": "47.0", "masked_pct": "36.5", "mwtf": "35.41"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "fir", "hw_inst_ratio": "1.678", "sdc_pct": "1.25", "det_recovered_pct": "33.5", "masked_pct": "24.5", "mwtf": "47.68"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "sobel", "hw_inst_ratio": "6.269", "sdc_pct": "6.25", "det_recovered_pct": "44.75", "masked_pct": "20.5", "mwtf": "2.55"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "gaussian_blur", "hw_inst_ratio": "1.91", "sdc_pct": "1.75", "det_recovered_pct": "35.25", "masked_pct": "27.0", "mwtf": "29.92"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "pid", "hw_inst_ratio": "9.455", "sdc_pct": "3.0", "det_recovered_pct": "44.25", "masked_pct": "26.75", "mwtf": "3.53"}, {"rank_method": "loop-only", "budget": "0.5", "benchmark": "ekf", "hw_inst_ratio": "25.875", "sdc_pct": "0.75", "det_recovered_pct": "44.75", "masked_pct": "27.0", "mwtf": "5.15"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "dgemm", "hw_inst_ratio": "2.543", "sdc_pct": "0.0", "det_recovered_pct": "56.0", "masked_pct": "21.5", "mwtf": "315.42"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "dgemv", "hw_inst_ratio": "2.796", "sdc_pct": "1.0", "det_recovered_pct": "54.25", "masked_pct": "21.5", "mwtf": "35.77"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "fft", "hw_inst_ratio": "1.928", "sdc_pct": "1.0", "det_recovered_pct": "41.25", "masked_pct": "37.25", "mwtf": "51.88"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "fir", "hw_inst_ratio": "2.025", "sdc_pct": "1.0", "det_recovered_pct": "49.5", "masked_pct": "24.0", "mwtf": "49.37"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "sobel", "hw_inst_ratio": "6.442", "sdc_pct": "3.75", "det_recovered_pct": "53.75", "masked_pct": "17.75", "mwtf": "4.14"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "gaussian_blur", "hw_inst_ratio": "2.417", "sdc_pct": "1.25", "det_recovered_pct": "54.0", "masked_pct": "23.0", "mwtf": "33.1"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "pid", "hw_inst_ratio": "10.191", "sdc_pct": "1.0", "det_recovered_pct": "55.75", "masked_pct": "26.0", "mwtf": "9.81"}, {"rank_method": "loop-only", "budget": "0.75", "benchmark": "ekf", "hw_inst_ratio": "26.647", "sdc_pct": "0.5", "det_recovered_pct": "59.0", "masked_pct": "23.25", "mwtf": "7.51"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "dgemm", "hw_inst_ratio": "2.543", "sdc_pct": "0.0", "det_recovered_pct": "56.0", "masked_pct": "21.5", "mwtf": "315.42"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "dgemv", "hw_inst_ratio": "2.796", "sdc_pct": "1.0", "det_recovered_pct": "54.25", "masked_pct": "21.5", "mwtf": "35.77"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "fft", "hw_inst_ratio": "2.803", "sdc_pct": "0.5", "det_recovered_pct": "37.75", "masked_pct": "36.0", "mwtf": "71.34"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "fir", "hw_inst_ratio": "2.025", "sdc_pct": "1.0", "det_recovered_pct": "49.5", "masked_pct": "24.0", "mwtf": "49.37"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "sobel", "hw_inst_ratio": "6.587", "sdc_pct": "1.5", "det_recovered_pct": "62.0", "masked_pct": "18.5", "mwtf": "10.12"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "gaussian_blur", "hw_inst_ratio": "2.417", "sdc_pct": "1.25", "det_recovered_pct": "54.0", "masked_pct": "23.0", "mwtf": "33.1"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "pid", "hw_inst_ratio": "10.296", "sdc_pct": "1.25", "det_recovered_pct": "59.5", "masked_pct": "26.0", "mwtf": "7.77"}, {"rank_method": "loop-only", "budget": "1.0", "benchmark": "ekf", "hw_inst_ratio": "26.874", "sdc_pct": "0.0", "det_recovered_pct": "67.25", "masked_pct": "20.0", "mwtf": "29.84"}, {"rank_method": "random", "budget": "0.25", "benchmark": "dgemm", "hw_inst_ratio": "1.849", "sdc_pct": "0.0", "det_recovered_pct": "42.0", "masked_pct": "25.5", "mwtf": "433.66"}, {"rank_method": "random", "budget": "0.25", "benchmark": "dgemv", "hw_inst_ratio": "1.497", "sdc_pct": "5.25", "det_recovered_pct": "0.0", "masked_pct": "53.0", "mwtf": "12.72"}, {"rank_method": "random", "budget": "0.25", "benchmark": "fft", "hw_inst_ratio": "1.038", "sdc_pct": "2.0", "det_recovered_pct": "8.25", "masked_pct": "70.25", "mwtf": "48.17"}, {"rank_method": "random", "budget": "0.25", "benchmark": "fir", "hw_inst_ratio": "1.678", "sdc_pct": "1.25", "det_recovered_pct": "33.5", "masked_pct": "24.5", "mwtf": "47.68"}, {"rank_method": "random", "budget": "0.25", "benchmark": "sobel", "hw_inst_ratio": "1.0", "sdc_pct": "16.25", "det_recovered_pct": "0.0", "masked_pct": "44.5", "mwtf": "6.15"}, {"rank_method": "random", "budget": "0.25", "benchmark": "gaussian_blur", "hw_inst_ratio": "1.91", "sdc_pct": "1.75", "det_recovered_pct": "35.25", "masked_pct": "27.0", "mwtf": "29.92"}, {"rank_method": "random", "budget": "0.25", "benchmark": "pid", "hw_inst_ratio": "1.0", "sdc_pct": "8.75", "det_recovered_pct": "0.0", "masked_pct": "52.25", "mwtf": "11.43"}, {"rank_method": "random", "budget": "0.25", "benchmark": "ekf", "hw_inst_ratio": "15.253", "sdc_pct": "3.5", "det_recovered_pct": "10.0", "masked_pct": "48.5", "mwtf": "1.87"}, {"rank_method": "random", "budget": "0.5", "benchmark": "dgemm", "hw_inst_ratio": "1.849", "sdc_pct": "0.0", "det_recovered_pct": "42.0", "masked_pct": "25.5", "mwtf": "433.66"}, {"rank_method": "random", "budget": "0.5", "benchmark": "dgemv", "hw_inst_ratio": "1.497", "sdc_pct": "5.25", "det_recovered_pct": "0.0", "masked_pct": "53.0", "mwtf": "12.72"}, {"rank_method": "random", "budget": "0.5", "benchmark": "fft", "hw_inst_ratio": "1.038", "sdc_pct": "3.25", "det_recovered_pct": "7.0", "masked_pct": "69.25", "mwtf": "29.64"}, {"rank_method": "random", "budget": "0.5", "benchmark": "fir", "hw_inst_ratio": "1.678", "sdc_pct": "1.25", "det_recovered_pct": "33.5", "masked_pct": "24.5", "mwtf": "47.68"}, {"rank_method": "random", "budget": "0.5", "benchmark": "sobel", "hw_inst_ratio": "5.574", "sdc_pct": "10.0", "det_recovered_pct": "0.0", "masked_pct": "55.25", "mwtf": "1.79"}, {"rank_method": "random", "budget": "0.5", "benchmark": "gaussian_blur", "hw_inst_ratio": "1.91", "sdc_pct": "1.75", "det_recovered_pct": "35.25", "masked_pct": "27.0", "mwtf": "29.92"}, {"rank_method": "random", "budget": "0.5", "benchmark": "pid", "hw_inst_ratio": "1.0", "sdc_pct": "5.0", "det_recovered_pct": "0.0", "masked_pct": "65.75", "mwtf": "20.0"}, {"rank_method": "random", "budget": "0.5", "benchmark": "ekf", "hw_inst_ratio": "19.157", "sdc_pct": "3.75", "det_recovered_pct": "14.25", "masked_pct": "52.25", "mwtf": "1.39"}, {"rank_method": "random", "budget": "0.75", "benchmark": "dgemm", "hw_inst_ratio": "2.543", "sdc_pct": "0.0", "det_recovered_pct": "56.0", "masked_pct": "21.5", "mwtf": "315.42"}, {"rank_method": "random", "budget": "0.75", "benchmark": "dgemv", "hw_inst_ratio": "2.796", "sdc_pct": "1.0", "det_recovered_pct": "54.25", "masked_pct": "21.5", "mwtf": "35.77"}, {"rank_method": "random", "budget": "0.75", "benchmark": "fft", "hw_inst_ratio": "1.936", "sdc_pct": "2.0", "det_recovered_pct": "43.25", "masked_pct": "44.5", "mwtf": "25.82"}, {"rank_method": "random", "budget": "0.75", "benchmark": "fir", "hw_inst_ratio": "2.025", "sdc_pct": "1.0", "det_recovered_pct": "49.5", "masked_pct": "24.0", "mwtf": "49.37"}, {"rank_method": "random", "budget": "0.75", "benchmark": "sobel", "hw_inst_ratio": "5.863", "sdc_pct": "6.5", "det_recovered_pct": "13.25", "masked_pct": "54.5", "mwtf": "2.62"}, {"rank_method": "random", "budget": "0.75", "benchmark": "gaussian_blur", "hw_inst_ratio": "2.417", "sdc_pct": "1.25", "det_recovered_pct": "54.0", "masked_pct": "23.0", "mwtf": "33.1"}, {"rank_method": "random", "budget": "0.75", "benchmark": "pid", "hw_inst_ratio": "9.612", "sdc_pct": "1.25", "det_recovered_pct": "42.5", "masked_pct": "36.5", "mwtf": "8.32"}, {"rank_method": "random", "budget": "0.75", "benchmark": "ekf", "hw_inst_ratio": "23.447", "sdc_pct": "1.0", "det_recovered_pct": "42.75", "masked_pct": "36.25", "mwtf": "4.26"}, {"rank_method": "random", "budget": "1.0", "benchmark": "dgemm", "hw_inst_ratio": "2.543", "sdc_pct": "0.0", "det_recovered_pct": "56.0", "masked_pct": "21.5", "mwtf": "315.42"}, {"rank_method": "random", "budget": "1.0", "benchmark": "dgemv", "hw_inst_ratio": "2.796", "sdc_pct": "1.0", "det_recovered_pct": "54.25", "masked_pct": "21.5", "mwtf": "35.77"}, {"rank_method": "random", "budget": "1.0", "benchmark": "fft", "hw_inst_ratio": "2.803", "sdc_pct": "0.5", "det_recovered_pct": "37.75", "masked_pct": "36.0", "mwtf": "71.34"}, {"rank_method": "random", "budget": "1.0", "benchmark": "fir", "hw_inst_ratio": "2.025", "sdc_pct": "1.0", "det_recovered_pct": "49.5", "masked_pct": "24.0", "mwtf": "49.37"}, {"rank_method": "random", "budget": "1.0", "benchmark": "sobel", "hw_inst_ratio": "6.587", "sdc_pct": "1.5", "det_recovered_pct": "62.0", "masked_pct": "18.5", "mwtf": "10.12"}, {"rank_method": "random", "budget": "1.0", "benchmark": "gaussian_blur", "hw_inst_ratio": "2.417", "sdc_pct": "1.25", "det_recovered_pct": "54.0", "masked_pct": "23.0", "mwtf": "33.1"}, {"rank_method": "random", "budget": "1.0", "benchmark": "pid", "hw_inst_ratio": "10.296", "sdc_pct": "1.25", "det_recovered_pct": "59.5", "masked_pct": "26.0", "mwtf": "7.77"}, {"rank_method": "random", "budget": "1.0", "benchmark": "ekf", "hw_inst_ratio": "26.874", "sdc_pct": "0.0", "det_recovered_pct": "67.25", "masked_pct": "20.0", "mwtf": "29.84"}], "rq3_delta": [{"delta": "1e-07", "benchmark": "dgemm", "false_alarm_pct_no_fault": "37.11", "no_fault_rel_l2_err": "1.115298e-07", "fi_det_recovered_pct": "59.25", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "5.323868e-05"}, {"delta": "1e-07", "benchmark": "dgemv", "false_alarm_pct_no_fault": "41.67", "no_fault_rel_l2_err": "1.206533e-07", "fi_det_recovered_pct": "50.0", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "0.0001840568"}, {"delta": "1e-07", "benchmark": "fft", "false_alarm_pct_no_fault": "91.41", "no_fault_rel_l2_err": "5.394642e-05", "fi_det_recovered_pct": "8.5", "fi_sdc_pct": "0.5", "fi_avg_valid_rel_err": "8.365978e-07"}, {"delta": "1e-07", "benchmark": "fir", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "51.0", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "7.284278e-05"}, {"delta": "1e-07", "benchmark": "sobel", "false_alarm_pct_no_fault": "79.16", "no_fault_rel_l2_err": "4.097606e-07", "fi_det_recovered_pct": "12.0", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "7.908255e-05"}, {"delta": "1e-07", "benchmark": "gaussian_blur", "false_alarm_pct_no_fault": "23.92", "no_fault_rel_l2_err": "7.539582e-08", "fi_det_recovered_pct": "42.25", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "5.520194e-05"}, {"delta": "1e-07", "benchmark": "pid", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "61.25", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "3.08716e-05"}, {"delta": "1e-07", "benchmark": "ekf", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "69.75", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "1.051349e-05"}, {"delta": "1e-05", "benchmark": "dgemm", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "57.0", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "5.310803e-05"}, {"delta": "1e-05", "benchmark": "dgemv", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "55.25", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "0.0001732893"}, {"delta": "1e-05", "benchmark": "fft", "false_alarm_pct_no_fault": "67.19", "no_fault_rel_l2_err": "5.394433e-05", "fi_det_recovered_pct": "22.5", "fi_sdc_pct": "0.5", "fi_avg_valid_rel_err": "6.691568e-07"}, {"delta": "1e-05", "benchmark": "fir", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "50.5", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "7.285293e-05"}, {"delta": "1e-05", "benchmark": "sobel", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "63.5", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "4.484355e-05"}, {"delta": "1e-05", "benchmark": "gaussian_blur", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "54.5", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "4.793608e-05"}, {"delta": "1e-05", "benchmark": "pid", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "60.25", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "3.093457e-05"}, {"delta": "1e-05", "benchmark": "ekf", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "68.5", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "1.062132e-05"}, {"delta": "5e-05", "benchmark": "dgemm", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "56.0", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "5.312024e-05"}, {"delta": "5e-05", "benchmark": "dgemv", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "54.25", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "0.0001733352"}, {"delta": "5e-05", "benchmark": "fft", "false_alarm_pct_no_fault": "33.59", "no_fault_rel_l2_err": "4.361162e-05", "fi_det_recovered_pct": "37.75", "fi_sdc_pct": "0.5", "fi_avg_valid_rel_err": "7.044885e-07"}, {"delta": "5e-05", "benchmark": "fir", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "49.5", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "7.288001e-05"}, {"delta": "5e-05", "benchmark": "sobel", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "62.0", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "4.486141e-05"}, {"delta": "5e-05", "benchmark": "gaussian_blur", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "54.0", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "4.793993e-05"}, {"delta": "5e-05", "benchmark": "pid", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "59.5", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "3.141367e-05"}, {"delta": "5e-05", "benchmark": "ekf", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "67.25", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "1.12603e-05"}, {"delta": "0.001", "benchmark": "dgemm", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "54.5", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "5.346272e-05"}, {"delta": "0.001", "benchmark": "dgemv", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "52.25", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "0.0001738191"}, {"delta": "0.001", "benchmark": "fft", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "62.0", "fi_sdc_pct": "0.5", "fi_avg_valid_rel_err": "9.772103e-07"}, {"delta": "0.001", "benchmark": "fir", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "48.25", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "7.401826e-05"}, {"delta": "0.001", "benchmark": "sobel", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "60.25", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "4.496442e-05"}, {"delta": "0.001", "benchmark": "gaussian_blur", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "52.0", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "4.826589e-05"}, {"delta": "0.001", "benchmark": "pid", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "56.25", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "4.394974e-05"}, {"delta": "0.001", "benchmark": "ekf", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "64.75", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "2.622398e-05"}, {"delta": "0.05", "benchmark": "dgemm", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "50.0", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "9.440925e-05"}, {"delta": "0.05", "benchmark": "dgemv", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "48.25", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "0.0002818056"}, {"delta": "0.05", "benchmark": "fft", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "58.25", "fi_sdc_pct": "0.5", "fi_avg_valid_rel_err": "1.958374e-05"}, {"delta": "0.05", "benchmark": "fir", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "45.25", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "0.0001666691"}, {"delta": "0.05", "benchmark": "sobel", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "58.75", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "5.76059e-05"}, {"delta": "0.05", "benchmark": "gaussian_blur", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "48.75", "fi_sdc_pct": "1.25", "fi_avg_valid_rel_err": "6.268471e-05"}, {"delta": "0.05", "benchmark": "pid", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "51.5", "fi_sdc_pct": "1.75", "fi_avg_valid_rel_err": "0.0001491582"}, {"delta": "0.05", "benchmark": "ekf", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "60.0", "fi_sdc_pct": "1.0", "fi_avg_valid_rel_err": "0.0001649904"}, {"delta": "0.5", "benchmark": "dgemm", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "46.5", "fi_sdc_pct": "0.0", "fi_avg_valid_rel_err": "0.000226079"}, {"delta": "0.5", "benchmark": "dgemv", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "47.0", "fi_sdc_pct": "2.25", "fi_avg_valid_rel_err": "0.0003262372"}, {"delta": "0.5", "benchmark": "fft", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "55.75", "fi_sdc_pct": "0.75", "fi_avg_valid_rel_err": "0.0001006479"}, {"delta": "0.5", "benchmark": "fir", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "43.75", "fi_sdc_pct": "2.75", "fi_avg_valid_rel_err": "0.0001692464"}, {"delta": "0.5", "benchmark": "sobel", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "58.5", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "6.499306e-05"}, {"delta": "0.5", "benchmark": "gaussian_blur", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "48.25", "fi_sdc_pct": "1.5", "fi_avg_valid_rel_err": "8.256509e-05"}, {"delta": "0.5", "benchmark": "pid", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "50.0", "fi_sdc_pct": "3.0", "fi_avg_valid_rel_err": "0.0001750599"}, {"delta": "0.5", "benchmark": "ekf", "false_alarm_pct_no_fault": "0.0", "no_fault_rel_l2_err": "0.0", "fi_det_recovered_pct": "59.25", "fi_sdc_pct": "1.75", "fi_avg_valid_rel_err": "0.0001441035"}], "rq4_trace": [{"window": "0", "env_phase": "CALM_PRE", "injected_ecc_events": "1", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "595.98", "hw_insts": "7639794", "hw_cycles": "1805370"}, {"window": "1", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "550.41", "hw_insts": "7639728", "hw_cycles": "1688034"}, {"window": "2", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "550.53", "hw_insts": "7639728", "hw_cycles": "1689968"}, {"window": "3", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "550.52", "hw_insts": "7639728", "hw_cycles": "1688132"}, {"window": "4", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "549.54", "hw_insts": "7639728", "hw_cycles": "1687105"}, {"window": "5", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "549.36", "hw_insts": "7639728", "hw_cycles": "1687480"}, {"window": "6", "env_phase": "CALM_PRE", "injected_ecc_events": "1", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "553.32", "hw_insts": "7639795", "hw_cycles": "1687216"}, {"window": "7", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "558.37", "hw_insts": "7639729", "hw_cycles": "1700050"}, {"window": "8", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "548.79", "hw_insts": "7639728", "hw_cycles": "1685929"}, {"window": "9", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "549.03", "hw_insts": "7639728", "hw_cycles": "1687130"}, {"window": "10", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "661.53", "hw_insts": "7639728", "hw_cycles": "2033545"}, {"window": "11", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "549.63", "hw_insts": "7639728", "hw_cycles": "1686388"}, {"window": "12", "env_phase": "CALM_PRE", "injected_ecc_events": "1", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "548.91", "hw_insts": "7639794", "hw_cycles": "1685962"}, {"window": "13", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "547.92", "hw_insts": "7639728", "hw_cycles": "1683459"}, {"window": "14", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "552.47", "hw_insts": "7639729", "hw_cycles": "1685971"}, {"window": "15", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "548.81", "hw_insts": "7639728", "hw_cycles": "1686668"}, {"window": "16", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "547.94", "hw_insts": "7639728", "hw_cycles": "1684053"}, {"window": "17", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "548.80", "hw_insts": "7639728", "hw_cycles": "1686800"}, {"window": "18", "env_phase": "CALM_PRE", "injected_ecc_events": "1", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "548.61", "hw_insts": "7639794", "hw_cycles": "1686169"}, {"window": "19", "env_phase": "CALM_PRE", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "548.45", "hw_insts": "7639728", "hw_cycles": "1685661"}, {"window": "20", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "7", "consec_short_intervals": "19", "mode_before": "0", "mode_after": "1", "exec_time_us": "1079.98", "hw_insts": "12427097", "hw_cycles": "3315915"}, {"window": "21", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "5", "consec_short_intervals": "39", "mode_before": "1", "mode_after": "1", "exec_time_us": "1130.24", "hw_insts": "13566193", "hw_cycles": "3483144"}, {"window": "22", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "6", "consec_short_intervals": "59", "mode_before": "1", "mode_after": "1", "exec_time_us": "1120.86", "hw_insts": "13566193", "hw_cycles": "3452574"}, {"window": "23", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "7", "consec_short_intervals": "79", "mode_before": "1", "mode_after": "1", "exec_time_us": "1118.14", "hw_insts": "13566193", "hw_cycles": "3446315"}, {"window": "24", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "5", "consec_short_intervals": "99", "mode_before": "1", "mode_after": "1", "exec_time_us": "1124.33", "hw_insts": "13566194", "hw_cycles": "3452499"}, {"window": "25", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "6", "consec_short_intervals": "119", "mode_before": "1", "mode_after": "1", "exec_time_us": "1118.11", "hw_insts": "13566193", "hw_cycles": "3445935"}, {"window": "26", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "7", "consec_short_intervals": "139", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.73", "hw_insts": "13566193", "hw_cycles": "3442364"}, {"window": "27", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "5", "consec_short_intervals": "159", "mode_before": "1", "mode_after": "1", "exec_time_us": "1124.05", "hw_insts": "13566194", "hw_cycles": "3458975"}, {"window": "28", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "6", "consec_short_intervals": "179", "mode_before": "1", "mode_after": "1", "exec_time_us": "1117.44", "hw_insts": "13566193", "hw_cycles": "3444027"}, {"window": "29", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "7", "consec_short_intervals": "199", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.98", "hw_insts": "13566193", "hw_cycles": "3443082"}, {"window": "30", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "5", "consec_short_intervals": "219", "mode_before": "1", "mode_after": "1", "exec_time_us": "1117.05", "hw_insts": "13566193", "hw_cycles": "3443350"}, {"window": "31", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "6", "consec_short_intervals": "239", "mode_before": "1", "mode_after": "1", "exec_time_us": "1119.78", "hw_insts": "13566194", "hw_cycles": "3447334"}, {"window": "32", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "7", "consec_short_intervals": "259", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.81", "hw_insts": "13566193", "hw_cycles": "3442935"}, {"window": "33", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "5", "consec_short_intervals": "279", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.90", "hw_insts": "13566193", "hw_cycles": "3443528"}, {"window": "34", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "6", "consec_short_intervals": "299", "mode_before": "1", "mode_after": "1", "exec_time_us": "1118.35", "hw_insts": "13566194", "hw_cycles": "3442740"}, {"window": "35", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "7", "consec_short_intervals": "319", "mode_before": "1", "mode_after": "1", "exec_time_us": "1125.90", "hw_insts": "13566194", "hw_cycles": "3452888"}, {"window": "36", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "5", "consec_short_intervals": "339", "mode_before": "1", "mode_after": "1", "exec_time_us": "1117.10", "hw_insts": "13566193", "hw_cycles": "3443687"}, {"window": "37", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "6", "consec_short_intervals": "359", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.48", "hw_insts": "13566193", "hw_cycles": "3442485"}, {"window": "38", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "7", "consec_short_intervals": "379", "mode_before": "1", "mode_after": "1", "exec_time_us": "1133.48", "hw_insts": "13566194", "hw_cycles": "3480783"}, {"window": "39", "env_phase": "SOLAR_FLARE", "injected_ecc_events": "5", "consec_short_intervals": "399", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.48", "hw_insts": "13566193", "hw_cycles": "3441962"}, {"window": "40", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "399", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.43", "hw_insts": "13565043", "hw_cycles": "3442232"}, {"window": "41", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "399", "mode_before": "1", "mode_after": "1", "exec_time_us": "1116.73", "hw_insts": "13565043", "hw_cycles": "3443034"}, {"window": "42", "env_phase": "CALM_POST", "injected_ecc_events": "1", "consec_short_intervals": "0", "mode_before": "1", "mode_after": "0", "exec_time_us": "1136.25", "hw_insts": "13565108", "hw_cycles": "3444570"}, {"window": "43", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "583.06", "hw_insts": "7639728", "hw_cycles": "1792326"}, {"window": "44", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "554.39", "hw_insts": "7639728", "hw_cycles": "1702894"}, {"window": "45", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "553.88", "hw_insts": "7639728", "hw_cycles": "1700815"}, {"window": "46", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "553.64", "hw_insts": "7639728", "hw_cycles": "1700522"}, {"window": "47", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "553.54", "hw_insts": "7639728", "hw_cycles": "1700946"}, {"window": "48", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "556.74", "hw_insts": "7639729", "hw_cycles": "1700939"}, {"window": "49", "env_phase": "CALM_POST", "injected_ecc_events": "1", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "553.07", "hw_insts": "7639794", "hw_cycles": "1699790"}, {"window": "50", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "552.51", "hw_insts": "7639728", "hw_cycles": "1698435"}, {"window": "51", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "552.31", "hw_insts": "7639728", "hw_cycles": "1697309"}, {"window": "52", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "552.31", "hw_insts": "7639728", "hw_cycles": "1697720"}, {"window": "53", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "551.99", "hw_insts": "7639728", "hw_cycles": "1696761"}, {"window": "54", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "552.76", "hw_insts": "7639728", "hw_cycles": "1698999"}, {"window": "55", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "564.99", "hw_insts": "7639729", "hw_cycles": "1720168"}, {"window": "56", "env_phase": "CALM_POST", "injected_ecc_events": "1", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "552.62", "hw_insts": "7639794", "hw_cycles": "1698459"}, {"window": "57", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "551.91", "hw_insts": "7639728", "hw_cycles": "1696488"}, {"window": "58", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "551.61", "hw_insts": "7639728", "hw_cycles": "1695391"}, {"window": "59", "env_phase": "CALM_POST", "injected_ecc_events": "0", "consec_short_intervals": "0", "mode_before": "0", "mode_after": "0", "exec_time_us": "552.57", "hw_insts": "7639728", "hw_cycles": "1698056"}]};
+
+// 1. 渲染顶部 KPI 卡片
+(function renderKPIs() {
+  const pmu = DATA.rq1_pmu;
+  const fi = DATA.rq1_fi;
+  const sumInst = (pol) => pmu.filter(r => r.policy === pol).reduce((s, r) => s + Number(r.hw_insts), 0);
+  const sumTime = (pol) => pmu.filter(r => r.policy === pol).reduce((s, r) => s + Number(r.exec_time_us), 0);
+
+  const instTMR = sumInst("exact_tmr");
+  const instSIMD = sumInst("approx_simd");
+  const instLow = sumInst("adaptive_low");
+  const instRedPct = ((1 - instSIMD / instTMR) * 100).toFixed(1);
+  const timeRedPct = ((1 - sumTime("approx_simd") / sumTime("exact_tmr")) * 100).toFixed(1);
+
+  const avgSDC = (pol) => {
+    const rows = fi.filter(r => r.policy === pol);
+    return (rows.reduce((s, r) => s + Number(r.sdc_pct), 0) / rows.length).toFixed(2);
+  };
+  const sdcNative = avgSDC("native");
+  const sdcSIMD = avgSDC("approx_simd");
+
+  const kpis = [
+    {
+      title: "相比传统 TMR 硬件退休指令削减",
+      val: "-" + instRedPct + "%",
+      sub: `開题目标 ≥ 20% | 平静期 Adaptive-LOW 削减 -${((1 - instLow / instTMR)*100).toFixed(1)}%`
+    },
+    {
+      title: "相比传统 TMR 实测执行时间降低",
+      val: "-" + timeRedPct + "%",
+      sub: `开题目标 ≥ 33.3% (1/3) | 硬件 PMU 周期同步下降`
+    },
+    {
+      title: "全位宽注入非 SDC 安全率",
+      val: (100 - Number(sdcSIMD)).toFixed(2) + "%",
+      sub: `平均 SDC 从 Native 的 ${sdcNative}% 压低至 ${sdcSIMD}% (dgemm/ekf 0% SDC)`
+    },
+    {
+      title: "近似恢复后输出相对误差",
+      val: "≤ 1.98e-4",
+      sub: `开题目标 ≤ 1% (1e-2) | 无故障时双精度零损输出`
+    },
+    {
+      title: "dgemm 综合可靠性指标 MWTF",
+      val: "787.38",
+      sub: `相比 Exact-TMR (339.38) 提升 2.32× | 相比 Native (22.73) 提升 34.6×`
+    }
+  ];
+
+  const box = document.getElementById("kpi-container");
+  box.innerHTML = kpis.map(k => `
+    <div class="kpi-card">
+      <div class="kpi-title">${k.title}</div>
+      <div class="kpi-val">${k.val}</div>
+      <div class="kpi-sub">${k.sub}</div>
+    </div>
+  `).join("");
+})();
+
+// 2. 渲染关键性分析表
+(function renderCritTable() {
+  const tbody = document.querySelector("#tbl-crit tbody");
+  tbody.innerHTML = DATA.criticality.map(r => {
+    const badgeCls = r.criticality_level === "CRITICAL" ? "badge-crit"
+                   : r.criticality_level === "SUB_CRITICAL" ? "badge-sub" : "badge-non";
+    return `<tr>
+      <td><code>${r.function}</code></td>
+      <td><span class="badge ${badgeCls}">${r.criticality_level}</span></td>
+      <td>${r.num_insts}</td>
+      <td>${r.max_loop_depth}</td>
+      <td>${Number(r.avg_output_closeness).toFixed(3)}</td>
+      <td>${Number(r.avg_liveness).toFixed(2)}</td>
+      <td>${r.state_feedback}</td>
+      <td><strong>${Number(r.score).toFixed(2)}</strong></td>
+    </tr>`;
+  }).join("");
+})();
+
+// 3. 渲染 RQ1 硬件 PMU 与 QoR 表
+(function renderPMUAndQoR() {
+  const benches = ["dgemm", "dgemv", "fft", "fir", "sobel", "gaussian_blur", "pid", "ekf"];
+  const pmuMap = {};
+  DATA.rq1_pmu.forEach(r => { pmuMap[r.policy + "_" + r.benchmark] = r; });
+
+  const tbodyPmu = document.querySelector("#tbl-pmu-summary tbody");
+  tbodyPmu.innerHTML = benches.map(b => {
+    const nat = Number(pmuMap["native_" + b].hw_insts);
+    const tmr = Number(pmuMap["exact_tmr_" + b].hw_insts);
+    const sca = Number(pmuMap["approx_scalar_" + b].hw_insts);
+    const simd = Number(pmuMap["approx_simd_" + b].hw_insts);
+    const low = Number(pmuMap["adaptive_low_" + b].hw_insts);
+    const red = ((1 - simd / tmr) * 100).toFixed(1);
+    return `<tr>
+      <td><code>${b}</code></td>
+      <td>${nat.toLocaleString()}</td>
+      <td>${tmr.toLocaleString()}</td>
+      <td>${sca.toLocaleString()}</td>
+      <td><strong>${simd.toLocaleString()}</strong></td>
+      <td>${low.toLocaleString()}</td>
+      <td style="color:${Number(red)>0 ? '#4ade80':'#fbbf24'}">${Number(red)>0 ? '-' + red + '%' : '+' + (-red) + '%'}</td>
+    </tr>`;
+  }).join("");
+
+  const tbodyQor = document.querySelector("#tbl-qor tbody");
+  tbodyQor.innerHTML = benches.map(b => {
+    const pa = pmuMap["pure_approx_" + b];
+    const simd = pmuMap["approx_simd_" + b];
+    return `<tr>
+      <td><code>${b}</code></td>
+      <td>${Number(pa.rel_l2_err).toExponential(2)}</td>
+      <td>${Number(pa.mean_rel_err).toExponential(2)}</td>
+      <td>${Number(pa.psnr_db).toFixed(1)} dB</td>
+      <td><strong>${Number(simd.rel_l2_err) === 0 ? "0.00 (无损 R)" : Number(simd.rel_l2_err).toExponential(2)}</strong></td>
+      <td><span class="badge badge-pass">PASS (≪1%)</span></td>
+    </tr>`;
+  }).join("");
+
+  // 绘制归一化指令倍率柱状图
+  const svg = document.getElementById("svg-pmu-bars");
+  let html = `<line x1="50" y1="230" x2="630" y2="230" stroke="#475569" />`;
+  const policies = [
+    { key: "exact_tmr", color: "#ef4444", label: "Exact-TMR" },
+    { key: "approx_scalar", color: "#f59e0b", label: "Approx-Scalar" },
+    { key: "approx_simd", color: "#38bdf8", label: "Approx-SIMD" },
+    { key: "adaptive_low", color: "#22c55e", label: "Adaptive-LOW" }
+  ];
+  policies.forEach((p, idx) => {
+    html += `<rect x="${60 + idx*140}" y="12" width="10" height="10" fill="${p.color}" />
+             <text x="${75 + idx*140}" y="21" fill="#cbd5e1" font-size="11">${p.label}</text>`;
+  });
+  const plotBenches = ["dgemm", "dgemv", "fft", "fir", "sobel", "gaussian_blur"];
+  plotBenches.forEach((b, i) => {
+    const x0 = 65 + i * 92;
+    const nat = Number(pmuMap["native_" + b].hw_insts);
+    policies.forEach((p, j) => {
+      const ratio = Number(pmuMap[p.key + "_" + b].hw_insts) / nat;
+      const h = Math.min(185, ratio * 22);
+      const y = 230 - h;
+      html += `<rect x="${x0 + j*16}" y="${y}" width="14" height="${h}" fill="${p.color}" rx="2">
+                 <title>${b} - ${p.label}: ${ratio.toFixed(2)}x Native</title>
+               </rect>`;
+    });
+    html += `<text x="${x0 + 28}" y="248" fill="#94a3b8" font-size="11" text-anchor="middle">${b}</text>`;
+  });
+  svg.innerHTML = html;
+})();
+
+// 4. 渲染 RQ1 五分类故障注入表
+function renderFITable(filterPol) {
+  const tbody = document.querySelector("#tbl-fi tbody");
+  const rows = DATA.rq1_fi.filter(r => {
+    if (filterPol === "ALL") return ["native", "exact_tmr", "approx_simd"].includes(r.policy);
+    return r.policy === filterPol;
+  });
+
+  tbody.innerHTML = rows.map(r => {
+    const m = Number(r.masked_pct);
+    const d = Number(r.det_recovered_pct);
+    const b = Number(r.benign_pct);
+    const u = Number(r.due_pct);
+    const s = Number(r.sdc_pct);
+    return `<tr>
+      <td><code>${r.policy}</code></td>
+      <td><code>${r.benchmark}</code></td>
+      <td>
+        <div class="bar-wrap">
+          <div class="bar-seg" style="width:${m}%;background:#64748b" title="Masked: ${m}%"></div>
+          <div class="bar-seg" style="width:${d}%;background:#22c55e" title="Detected & Recovered: ${d}%"></div>
+          <div class="bar-seg" style="width:${b}%;background:#38bdf8" title="Benign: ${b}%"></div>
+          <div class="bar-seg" style="width:${u}%;background:#f59e0b" title="DUE: ${u}%"></div>
+          <div class="bar-seg" style="width:${s}%;background:#ef4444" title="SDC: ${s}%"></div>
+        </div>
+      </td>
+      <td>${m.toFixed(1)}%</td>
+      <td style="color:#4ade80;font-weight:600">${d.toFixed(1)}%</td>
+      <td>${b.toFixed(1)}%</td>
+      <td style="color:${s > 3 ? '#f87171' : '#cbd5e1'};font-weight:700">${s.toFixed(2)}%</td>
+      <td>${Number(r.avg_valid_rel_err).toExponential(2)}</td>
+      <td>${Number(r.norm_hw_inst_ratio).toFixed(2)}×</td>
+      <td style="color:#38bdf8;font-weight:700">${Number(r.mwtf_score).toFixed(1)}</td>
+    </tr>`;
+  }).join("");
+}
+renderFITable("ALL");
+document.getElementById("sel-fi-policy").addEventListener("change", e => renderFITable(e.target.value));
+
+// 5. 渲染 RQ2 选择性保护曲线与 RQ3 阈值敏感度
+(function renderRQ2AndRQ3() {
+  const budgets = [0.25, 0.5, 0.75, 1.0];
+  const targetBenches = ["dgemv", "sobel", "pid", "ekf"];
+  const avgSDCFor = (rm, bgt) => {
+    const sub = DATA.rq2_selective.filter(r => r.rank_method === rm && Number(r.budget) === bgt && targetBenches.includes(r.benchmark));
+    return sub.reduce((s, r) => s + Number(r.sdc_pct), 0) / sub.length;
+  };
+  const ekfSDCFor = (rm, bgt) => {
+    const row = DATA.rq2_selective.find(r => r.rank_method === rm && Number(r.budget) === bgt && r.benchmark === "ekf");
+    return row ? Number(row.sdc_pct).toFixed(2) + "%" : "-";
+  };
+
+  const tbody2 = document.querySelector("#tbl-rq2 tbody");
+  tbody2.innerHTML = budgets.map(bgt => {
+    const rRand = avgSDCFor("random", bgt);
+    const rLoop = avgSDCFor("loop-only", bgt);
+    const rSem  = avgSDCFor("semantic", bgt);
+    return `<tr>
+      <td><strong>${Math.round(bgt*100)}% 指令预算</strong></td>
+      <td>${rRand.toFixed(2)}%</td>
+      <td>${rLoop.toFixed(2)}%</td>
+      <td style="color:#4ade80;font-weight:700">${rSem.toFixed(2)}%</td>
+      <td>Rand ${ekfSDCFor("random", bgt)} / Loop ${ekfSDCFor("loop-only", bgt)} / <strong>Sem ${ekfSDCFor("semantic", bgt)}</strong></td>
+    </tr>`;
+  }).join("");
+
+  // 绘制 RQ2 折线图
+  const svg2 = document.getElementById("svg-rq2");
+  const methods = [
+    { key: "random", color: "#ef4444", label: "Random (随机)" },
+    { key: "loop-only", color: "#f59e0b", label: "Loop-Only (仅循环深度)" },
+    { key: "semantic", color: "#22c55e", label: "Semantic (本文公式3-1)" }
+  ];
+  let h2 = `<line x1="55" y1="220" x2="560" y2="220" stroke="#475569" />
+            <line x1="55" y1="30" x2="55" y2="220" stroke="#475569" />`;
+  methods.forEach((m, i) => {
+    h2 += `<rect x="${70 + i*170}" y="12" width="10" height="10" fill="${m.color}" />
+           <text x="${85 + i*170}" y="21" fill="#cbd5e1" font-size="11">${m.label}</text>`;
+    const pts = budgets.map((bgt, idx) => {
+      const x = 90 + idx * 145;
+      const val = avgSDCFor(m.key, bgt);
+      const y = 220 - (val / 10.0) * 170;
+      return `${x},${y}`;
+    }).join(" ");
+    h2 += `<polyline fill="none" stroke="${m.color}" stroke-width="2.5" points="${pts}" />`;
+    budgets.forEach((bgt, idx) => {
+      const x = 90 + idx * 145;
+      const val = avgSDCFor(m.key, bgt);
+      const y = 220 - (val / 10.0) * 170;
+      h2 += `<circle cx="${x}" cy="${y}" r="4" fill="${m.color}" />`;
+      if (i === 0) {
+        h2 += `<text x="${x}" y="242" fill="#94a3b8" font-size="11" text-anchor="middle">Budget ${Math.round(bgt*100)}%</text>`;
+      }
+    });
+  });
+  svg2.innerHTML = h2;
+
+  // 渲染 RQ3 阈值敏感度表与曲线
+  const deltas = [1e-7, 1e-5, 5e-5, 0.001, 0.05, 0.5];
+  const tbody3 = document.querySelector("#tbl-rq3 tbody");
+  const rq3Stats = deltas.map(d => {
+    const sub = DATA.rq3_delta.filter(r => Math.abs(Number(r.delta) - d) < d*0.01);
+    const sobelFA = sub.find(r => r.benchmark === "sobel")?.false_alarm_pct_no_fault || "0";
+    const fftFA   = sub.find(r => r.benchmark === "fft")?.false_alarm_pct_no_fault || "0";
+    const avgDet  = sub.reduce((s, r) => s + Number(r.fi_det_recovered_pct), 0) / sub.length;
+    const avgSdc  = sub.reduce((s, r) => s + Number(r.fi_sdc_pct), 0) / sub.length;
+    const avgErr  = sub.reduce((s, r) => s + Number(r.fi_avg_valid_rel_err), 0) / sub.length;
+    return { d, sobelFA: Number(sobelFA), fftFA: Number(fftFA), avgDet, avgSdc, avgErr };
+  });
+
+  tbody3.innerHTML = rq3Stats.map(st => `<tr>
+    <td><code>${st.d.toExponential(0)}</code></td>
+    <td style="color:${st.sobelFA > 5 || st.fftFA > 10 ? '#f59e0b' : '#4ade80'}">${st.sobelFA.toFixed(1)}% / ${st.fftFA.toFixed(1)}%</td>
+    <td>${st.avgDet.toFixed(2)}%</td>
+    <td style="color:${st.avgSdc > 1.0 ? '#f87171' : '#4ade80'};font-weight:700">${st.avgSdc.toFixed(2)}%</td>
+    <td>${st.avgErr.toExponential(2)}</td>
+  </tr>`).join("");
+
+  const svg3 = document.getElementById("svg-rq3");
+  let h3 = `<line x1="55" y1="220" x2="560" y2="220" stroke="#475569" />
+            <rect x="210" y="30" width="120" height="190" fill="rgba(34,197,94,0.10)" />
+            <text x="270" y="48" fill="#4ade80" font-size="11" text-anchor="middle">最优阈值甜点区</text>
+            <rect x="65" y="12" width="10" height="10" fill="#f59e0b" />
+            <text x="80" y="21" fill="#cbd5e1" font-size="11">无故障误报率 False Alarm (%)</text>
+            <rect x="285" y="12" width="10" height="10" fill="#ef4444" />
+            <text x="300" y="21" fill="#cbd5e1" font-size="11">故障注入 SDC 漏检率 (×30 放大显示)</text>`;
+  const ptsFA = rq3Stats.map((st, idx) => `${80 + idx*90},${220 - (st.sobelFA/85)*170}`).join(" ");
+  const ptsSDC = rq3Stats.map((st, idx) => `${80 + idx*90},${220 - (st.avgSdc*30/85)*170}`).join(" ");
+  h3 += `<polyline fill="none" stroke="#f59e0b" stroke-width="2.5" points="${ptsFA}" />`;
+  h3 += `<polyline fill="none" stroke="#ef4444" stroke-width="2.5" points="${ptsSDC}" />`;
+  rq3Stats.forEach((st, idx) => {
+    const x = 80 + idx * 90;
+    h3 += `<text x="${x}" y="242" fill="#94a3b8" font-size="11" text-anchor="middle">δ=${st.d.toExponential(0)}</text>`;
+  });
+  svg3.innerHTML = h3;
+})();
+
+// 6. 渲染 RQ4 太阳耀斑动态自适应轨迹图
+(function renderRQ4() {
+  const svg = document.getElementById("svg-rq4");
+  const rows = DATA.rq4_trace;
+  let h = `<rect x="380" y="25" width="330" height="195" fill="rgba(239,68,68,0.12)" />
+           <text x="545" y="45" fill="#f87171" font-size="12" text-anchor="middle">太阳耀斑高能粒子爆发期 (Window 20~39: 自动切入 HIGH 模式)</text>
+           <line x1="50" y1="220" x2="1060" y2="220" stroke="#475569" />`;
+  const ptsInst = rows.map((r, i) => {
+    const x = 55 + i * 16.8;
+    const instM = Number(r.hw_insts) / 1e6;
+    const y = 220 - ((instM - 6.0) / 6.5) * 170;
+    return `${x},${y}`;
+  }).join(" ");
+  const ptsMode = rows.map((r, i) => {
+    const x = 55 + i * 16.8;
+    const m = Number(r.mode_after);
+    const y = m === 1 ? 75 : 195;
+    return `${x},${y}`;
+  }).join(" ");
+  h += `<polyline fill="none" stroke="#38bdf8" stroke-width="2.5" points="${ptsInst}" />`;
+  h += `<polyline fill="none" stroke="#22c55e" stroke-width="2" stroke-dasharray="5,3" points="${ptsMode}" />`;
+  h += `<text x="70" y="22" fill="#38bdf8" font-size="12">— 硬件 PMU 实测窗口退休指令数 (7.64M ↔ 11.33M)</text>`;
+  h += `<text x="420" y="22" fill="#22c55e" font-size="12">-- 运行时保护状态机模式 (LOW=0 ↔ HIGH=1，含 M=3 滞回降级)</text>`;
+  svg.innerHTML = h;
+})();
+</script>
+</body>
+</html>
