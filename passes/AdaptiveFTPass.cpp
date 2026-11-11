@@ -51,7 +51,7 @@ namespace {
 
 static cl::opt<std::string> AtftMode(
     "atft-mode",
-    cl::desc("Protection policy: analyze | native | eddi | swift | exact-tmr | approx-scalar | approx-simd | adaptive | pure-approx"),
+    cl::desc("Protection policy: analyze | native | eddi | swift | lltfi-sid | exact-tmr | approx-scalar | approx-simd | adaptive | pure-approx"),
     cl::init("adaptive"));
 
 static cl::opt<std::string> AtftRankMethod(
@@ -132,9 +132,10 @@ bool isTargetMathCall(Instruction *I) {
   if (auto *CI = dyn_cast<CallInst>(I)) {
     if (Function *callee = CI->getCalledFunction()) {
       StringRef name = callee->getName();
-      return ((name == "sin" || name == "cos" || name == "exp" || name == "sqrt" ||
+      return ((name == "sin" || name == "cos" || name == "exp" || name == "sqrt" || name == "log" ||
                name.startswith("llvm.sin") || name.startswith("llvm.cos") ||
-               name.startswith("llvm.exp") || name.startswith("llvm.sqrt")) &&
+               name.startswith("llvm.exp") || name.startswith("llvm.sqrt") ||
+               name.startswith("llvm.log")) &&
               CI->getType()->isDoubleTy());
     }
   }
@@ -501,6 +502,83 @@ void transformFunctionEDDIOrSWIFT(Function &F, LoopInfo &LI, bool duplicateLoads
 }
 
 // ============================================================================
+// 模块 2C: 移植 third_party/LLTFI 官方开源指令链复制与位与修复器
+//   源自: third_party/LLTFI/llvm_passes/instruction_duplication/InstructionDuplication.cpp
+//         & third_party/LLTFI/llvm_passes/instruction_duplication/shared_lib/SIDHelperFunctions.cpp
+//   机制: 用 inst->clone() + llvm::RemapInstruction 复制连续算术指令链，
+//         在链末端调用 LLTFI 的 compareFloatValues (按 IEEE-754 符号位/指数位/尾数位做 bitwise AND 抑制高位尖峰)
+// ============================================================================
+void transformFunctionLLTFI_SID(Function &F, LoopInfo &LI,
+                                const std::string &rankMethod, double budget) {
+  expandFMulAddIntrinsics(F);
+  auto instScores = computeInstructionCriticalityMap(F, LI, rankMethod);
+
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *F64Ty = Type::getDoubleTy(Ctx);
+
+  FunctionCallee CompareFn = M->getOrInsertFunction(
+      "atft_lltfi_sid_compare_f64", F64Ty, F64Ty, F64Ty);
+
+  std::vector<Instruction *> candidates;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (isTargetFP64Op(&I)) candidates.push_back(&I);
+    }
+  }
+  std::set<Instruction *> selectedSet = selectInstructionsByBudget(candidates, instScores, budget);
+  if (selectedSet.empty()) return;
+
+  // 按照 LLTFI doArithmeticChainDuplication (InstructionDuplication.cpp:392) 识别基本块内的连续算术链
+  std::vector<std::vector<Instruction *>> chains;
+  for (BasicBlock &BB : F) {
+    std::vector<Instruction *> curChain;
+    for (Instruction &I : BB) {
+      if (selectedSet.count(&I)) {
+        curChain.push_back(&I);
+      } else if (!curChain.empty()) {
+        chains.push_back(curChain);
+        curChain.clear();
+      }
+    }
+    if (!curChain.empty()) chains.push_back(curChain);
+  }
+
+  // 按照 LLTFI duplicateInstructionChain (InstructionDuplication.cpp:238) 执行克隆与 RemapInstruction
+  for (const auto &insVector : chains) {
+    ValueToValueMapTy vmap;
+    std::vector<Instruction *> new_instructions;
+    Instruction *lastInst = nullptr, *lastInstDupl = nullptr;
+
+    for (Instruction *inst : insVector) {
+      Instruction *duplicatedInst = inst->clone();
+      lastInst = inst;
+      lastInstDupl = duplicatedInst;
+      for (unsigned int i = 0; i < duplicatedInst->getNumOperands(); i++) {
+        duplicatedInst->setOperand(i, inst->getOperand(i));
+      }
+      duplicatedInst->insertAfter(inst);
+      new_instructions.push_back(duplicatedInst);
+      vmap[inst] = duplicatedInst;
+    }
+
+    for (Instruction *i : new_instructions) {
+      llvm::RemapInstruction(i, vmap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+    }
+
+    if (lastInst && lastInstDupl) {
+      IRBuilder<> IRB(lastInst->getParent());
+      IRB.SetInsertPoint(lastInstDupl->getNextNode());
+      Value *duplBar = insertZeroCostCSEBarrier(IRB, lastInstDupl);
+      Value *funret = IRB.CreateCall(CompareFn, {lastInst, duplBar}, "lltfi.sid.cmp");
+      lastInst->replaceUsesWithIf(funret, [&](Use &U) {
+        return U.getUser() != funret && U.getUser() != duplBar;
+      });
+    }
+  }
+}
+
+// ============================================================================
 // 模块 2B: 传统软件精确 TMR 变换 (COAST-TMR Baseline, IEEE TNS'19)
 // ============================================================================
 void transformFunctionExactTMR(Function &F, LoopInfo &LI,
@@ -824,6 +902,10 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       } else if (cname.contains("exp")) {
         res1 = IRB.CreateCall(ApproxExpFn, {argF32_1}, "approx.exp1");
         res2 = IRB.CreateCall(ApproxExpFn, {argF32_2}, "approx.exp2");
+      } else if (cname.contains("log")) {
+        FunctionCallee LogF32 = M->getOrInsertFunction("logf", F32Ty, F32Ty);
+        res1 = IRB.CreateCall(LogF32, {argF32_1}, "approx.log1");
+        res2 = IRB.CreateCall(LogF32, {argF32_2}, "approx.log2");
       } else {
         FunctionCallee SqrtF32 = M->getOrInsertFunction("sqrtf", F32Ty, F32Ty);
         res1 = IRB.CreateCall(SqrtF32, {argF32_1}, "approx.sqrt1");
@@ -1055,11 +1137,14 @@ public:
     auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
     std::vector<Function *> targetFuncs;
+    std::vector<Function *> helperFuncs;
     for (Function &F : M) {
       if (F.isDeclaration()) continue;
       StringRef name = F.getName();
       if (name.startswith("bench_") && !name.endswith(".atft_low") && !name.endswith(".atft_high")) {
         targetFuncs.push_back(&F);
+      } else if (name.startswith("kf_bfly")) {
+        helperFuncs.push_back(&F);
       }
     }
 
@@ -1109,6 +1194,8 @@ public:
         transformFunctionEDDIOrSWIFT(*F, LI, true, AtftRankMethod, AtftBudget);
       } else if (AtftMode == "swift") {
         transformFunctionEDDIOrSWIFT(*F, LI, false, AtftRankMethod, AtftBudget);
+      } else if (AtftMode == "lltfi-sid") {
+        transformFunctionLLTFI_SID(*F, LI, AtftRankMethod, AtftBudget);
       } else if (AtftMode == "exact-tmr") {
         transformFunctionExactTMR(*F, LI, AtftRankMethod, AtftBudget);
       } else if (AtftMode == "approx-scalar") {
@@ -1119,6 +1206,26 @@ public:
         transformFunctionApproxTMR(*F, LI, clevel, AtftDelta, true, AtftRankMethod, 1.0, true);
       } else if (AtftMode == "adaptive") {
         transformFunctionAdaptiveMultiVersion(*F, FAM, clevel, AtftDelta, AtftRankMethod, AtftBudget);
+      }
+    }
+
+    // 对 KissFFT 原版源码中的内部蝶形算子 (kf_bfly2/3/4/5) 同步施加相同的容错变换
+    for (Function *HF : helperFuncs) {
+      auto &LI = FAM.getResult<LoopAnalysis>(*HF);
+      if (AtftMode == "eddi") {
+        transformFunctionEDDIOrSWIFT(*HF, LI, true, AtftRankMethod, AtftBudget);
+      } else if (AtftMode == "swift") {
+        transformFunctionEDDIOrSWIFT(*HF, LI, false, AtftRankMethod, AtftBudget);
+      } else if (AtftMode == "lltfi-sid") {
+        transformFunctionLLTFI_SID(*HF, LI, AtftRankMethod, AtftBudget);
+      } else if (AtftMode == "exact-tmr") {
+        transformFunctionExactTMR(*HF, LI, AtftRankMethod, AtftBudget);
+      } else if (AtftMode == "approx-scalar") {
+        transformFunctionApproxTMR(*HF, LI, CRIT_SUB_CRITICAL, AtftDelta, false, AtftRankMethod, AtftBudget, false);
+      } else if (AtftMode == "approx-simd" || AtftMode == "adaptive") {
+        transformFunctionApproxTMR(*HF, LI, CRIT_SUB_CRITICAL, AtftDelta, true, AtftRankMethod, AtftBudget, false);
+      } else if (AtftMode == "pure-approx") {
+        transformFunctionApproxTMR(*HF, LI, CRIT_SUB_CRITICAL, AtftDelta, true, AtftRankMethod, 1.0, true);
       }
     }
 

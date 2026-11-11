@@ -47,6 +47,11 @@ bool isInjectableDataInstruction(Instruction *I) {
   return false;
 }
 
+bool isTargetBenchmarkFunction(StringRef fname) {
+  return (fname.startswith("bench_") || fname.startswith("kf_bfly") ||
+          fname == "kf_work" || fname == "CNDF" || fname == "BlkSchlsEqEuroNoDiv");
+}
+
 class StandaloneFaultInjectorPass : public PassInfoMixin<StandaloneFaultInjectorPass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
@@ -64,8 +69,7 @@ public:
     for (Function &F : M) {
       if (F.isDeclaration()) continue;
       StringRef fname = F.getName();
-      // 仅对被测基准计算内核（含被策略克隆出的子版本）进行客观故障注入
-      if (!fname.startswith("bench_")) continue;
+      if (!isTargetBenchmarkFunction(fname)) continue;
 
       std::vector<Instruction *> targets;
       for (BasicBlock &BB : F) {

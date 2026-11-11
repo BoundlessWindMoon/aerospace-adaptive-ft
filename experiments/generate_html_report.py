@@ -429,15 +429,15 @@ def generate_html_dashboard():
 const DATA = {json_str};
 
 const SUITE_META = {{
-  "pb_gemm": "PolyBench/C (BLAS 矩阵乘)",
-  "pb_2mm": "PolyBench/C (双矩阵乘链)",
-  "pb_atax": "PolyBench/C (矩阵转置向量乘)",
-  "pb_bicg": "PolyBench/C (BiCGStab 子核)",
-  "pb_jacobi2d": "PolyBench/C (二维五点差分)",
-  "parsec_blackscholes": "PARSEC 3.0 (期权 PDE 解析解)",
-  "axc_sobel": "ACCEPT (Sobel 边缘检测)",
-  "axc_gaussian": "ACCEPT (5×5 高斯滤波)",
-  "dsp_kissfft": "KissFFT (复数频谱变换)",
+  "pb_gemm": "PolyBench/C 原版 (gemm.c)",
+  "pb_2mm": "PolyBench/C 原版 (2mm.c)",
+  "pb_atax": "PolyBench/C 原版 (atax.c)",
+  "pb_bicg": "PolyBench/C 原版 (bicg.c)",
+  "pb_jacobi2d": "PolyBench/C 原版 (jacobi-2d.c)",
+  "parsec_blackscholes": "PARSEC 3.0 原版 (blackscholes.c)",
+  "axc_sobel": "ACCEPT 原版 (sobel.c)",
+  "axc_gaussian": "ACCEPT 原版 (blur.c)",
+  "dsp_kissfft": "KissFFT 原版 (kiss_fft.c 蝶形核)",
   "dsp_fir": "CMSIS-DSP (FIR 时域滤波)",
   "gnc_pid": "GNC (闭环姿态 PID 控制)",
   "gnc_ekf": "GNC (扩展卡尔曼滤波估计)"
@@ -718,11 +718,12 @@ const avgFI = (pol, col) => {{
 (function renderBaselineComparison() {{
   const natI = sumInst("native");
   const mechs = [
-    {{ pol: "native",      short: "Native",      name: "Native (无保护)",        cite: "Baseline" }},
-    {{ pol: "eddi",        short: "EDDI",        name: "EDDI (全复制双模)",      cite: "IEEE TR'02" }},
-    {{ pol: "swift",       short: "SWIFT",       name: "SWIFT (寄存器双模)",     cite: "CGO'05" }},
-    {{ pol: "exact_tmr",   short: "COAST-TMR",   name: "COAST-TMR (精确三模)",   cite: "IEEE TNS'19" }},
-    {{ pol: "approx_simd", short: "Approx-SIMD", name: "Approx-SIMD (本文方案)", cite: "Proposed" }}
+    {{ pol: "native",      short: "Native",      name: "Native (无保护)",          cite: "Baseline" }},
+    {{ pol: "eddi",        short: "EDDI",        name: "EDDI (全复制双模检错)",    cite: "IEEE TR'02 [论文复现]" }},
+    {{ pol: "swift",       short: "SWIFT",       name: "SWIFT (寄存器双模检错)",   cite: "CGO'05 [论文复现]" }},
+    {{ pol: "lltfi_sid",   short: "LLTFI-SID",   name: "LLTFI-SID (双模位与修复)", cite: "third_party/LLTFI [开源移植]" }},
+    {{ pol: "exact_tmr",   short: "COAST-TMR",   name: "COAST-TMR (精确三模表决)", cite: "third_party/coast [开源移植]" }},
+    {{ pol: "approx_simd", short: "Approx-SIMD", name: "Approx-SIMD (本文方案)",   cite: "Proposed" }}
   ];
 
   document.querySelector("#tbl-baseline-mech tbody").innerHTML = mechs.map(mc => {{
@@ -745,20 +746,20 @@ const avgFI = (pol, col) => {{
 
   // 绘制 4.1 容错机制五分类堆叠水平条形图 + 指令倍率对比
   const svg1 = document.getElementById("svg-rq1-baseline");
-  let h1 = `<rect x="20" y="10" width="9" height="9" fill="#64748b" /><text x="33" y="18" fill="#cbd5e1" font-size="10.5">完全掩盖</text>
-            <rect x="105" y="10" width="9" height="9" fill="#10b981" /><text x="118" y="18" fill="#cbd5e1" font-size="10.5">检出并在线恢复</text>
-            <rect x="220" y="10" width="9" height="9" fill="#38bdf8" /><text x="233" y="18" fill="#cbd5e1" font-size="10.5">良性误差</text>
-            <rect x="305" y="10" width="9" height="9" fill="#f59e0b" /><text x="318" y="18" fill="#cbd5e1" font-size="10.5">不可恢复中断 (DUE)</text>
-            <rect x="445" y="10" width="9" height="9" fill="#ef4444" /><text x="458" y="18" fill="#cbd5e1" font-size="10.5">静默损坏 (SDC)</text>`;
+  let h1 = `<rect x="20" y="8" width="9" height="9" fill="#64748b" /><text x="33" y="16" fill="#cbd5e1" font-size="10.5">完全掩盖</text>
+            <rect x="105" y="8" width="9" height="9" fill="#10b981" /><text x="118" y="16" fill="#cbd5e1" font-size="10.5">检出并在线恢复</text>
+            <rect x="220" y="8" width="9" height="9" fill="#38bdf8" /><text x="233" y="16" fill="#cbd5e1" font-size="10.5">良性误差</text>
+            <rect x="305" y="8" width="9" height="9" fill="#f59e0b" /><text x="318" y="16" fill="#cbd5e1" font-size="10.5">不可恢复中断 (DUE)</text>
+            <rect x="445" y="8" width="9" height="9" fill="#ef4444" /><text x="458" y="16" fill="#cbd5e1" font-size="10.5">静默损坏 (SDC)</text>`;
   mechs.forEach((mc, idx) => {{
-    const y = 36 + idx * 34;
+    const y = 30 + idx * 29;
     const m = avgFI(mc.pol, "masked_pct");
     const d = avgFI(mc.pol, "det_recovered_pct");
     const b = avgFI(mc.pol, "benign_pct");
     const u = avgFI(mc.pol, "due_pct");
     const s = avgFI(mc.pol, "sdc_pct");
     const ratio = (sumInst(mc.pol) / natI).toFixed(2) + "×";
-    h1 += `<text x="18" y="${{y + 14}}" fill="#e2e8f0" font-size="11" font-weight="600">${{mc.short}}</text>`;
+    h1 += `<text x="18" y="${{y + 13}}" fill="#e2e8f0" font-size="10.5" font-weight="600">${{mc.short}}</text>`;
     let curX = 110;
     const totW = 390;
     const segs = [
@@ -771,11 +772,11 @@ const avgFI = (pol, col) => {{
     segs.forEach(sg => {{
       const sw = (sg.w / 100.0) * totW;
       if (sw > 0.3) {{
-        h1 += `<rect x="${{curX}}" y="${{y}}" width="${{sw}}" height="18" fill="${{sg.c}}" />`;
+        h1 += `<rect x="${{curX}}" y="${{y}}" width="${{sw}}" height="16" fill="${{sg.c}}" />`;
         curX += sw;
       }}
     }});
-    h1 += `<text x="512" y="${{y + 14}}" fill="#38bdf8" font-size="11" font-weight="600">${{ratio}}</text>`;
+    h1 += `<text x="512" y="${{y + 13}}" fill="#38bdf8" font-size="10.5" font-weight="600">${{ratio}}</text>`;
   }});
   svg1.innerHTML = h1;
 

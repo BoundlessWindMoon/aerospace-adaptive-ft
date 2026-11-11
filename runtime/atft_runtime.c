@@ -142,6 +142,22 @@ double atft_eddi_swift_check_f64(double r_master, double r_shadow) {
     return r_master;
 }
 
+// 移植自 third_party/LLTFI/llvm_passes/instruction_duplication/shared_lib/SIDHelperFunctions.cpp:14
+// LLTFI 的 compareFloatValues: 当两路副本不一致时，对 IEEE-754 的 sign, exponent, mantissa 分别做按位与 (&)，
+// 从而把 0->1 的高位指数爆炸翻回 0（无需重算即可抑制 NaN/Inf 尖峰，但对 1->0 的翻转会产生偏小近似误差）
+double atft_lltfi_sid_compare_f64(double val1, double val2) {
+    g_atft_state.total_votes++;
+    union { double d; uint64_t u; } f1 = {.d = val1}, f2 = {.d = val2}, ret;
+    if (f1.u == f2.u) {
+        g_atft_state.fault_free_votes++;
+        return val1;
+    }
+    g_atft_state.detected_faults++;
+    g_atft_state.recovered_by_approx++;
+    ret.u = f1.u & f2.u;
+    return ret.d;
+}
+
 // ============================================================================
 // 传统精确 TMR 表决器 (COAST Baseline, IEEE TNS'19)
 // ============================================================================

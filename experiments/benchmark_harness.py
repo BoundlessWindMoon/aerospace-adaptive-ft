@@ -68,10 +68,11 @@ def build_infrastructure():
     run_cmd([
         "clang-15", "-O1", "-Xclang", "-disable-llvm-passes",
         "-S", "-emit-llvm", "benchmarks/benchmarks.c",
-        "-Iinclude", "-o", str(raw_ll)
+        "-Iinclude", "-Ithird_party/polybench-c/utilities", "-Ithird_party/kissfft",
+        "-o", str(raw_ll)
     ])
     run_cmd([
-        "opt-15", "-passes=mem2reg,loop-simplify",
+        "opt-15", "-passes=always-inline,sroa,mem2reg,loop-simplify",
         "-S", str(raw_ll), "-o", str(ssa_ll)
     ])
     return ssa_ll
@@ -173,6 +174,7 @@ def run_all_research_questions():
         ("pure_approx",   "pure-approx",   1.0, 5e-5, False, False),
         ("eddi",          "eddi",          1.0, 5e-5, False, True),
         ("swift",         "swift",         1.0, 5e-5, False, True),
+        ("lltfi_sid",     "lltfi-sid",     1.0, 5e-5, False, True),
         ("exact_tmr",     "exact-tmr",     1.0, 5e-5, False, True),
         ("approx_scalar", "approx-scalar", 1.0, 5e-5, False, True),
         ("approx_simd",   "approx-simd",   1.0, 5e-5, False, True),
