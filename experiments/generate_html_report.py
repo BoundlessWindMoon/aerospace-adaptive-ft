@@ -435,18 +435,17 @@ def generate_html_dashboard():
       </table>
     </div>
     <div class="panel-box">
-      <h3>5.2 RISC-V (rv64gcv RVV 1.0) 向量代码生成与 QEMU 实测验证</h3>
-      <p class="sub-desc">通过 <code>clang-15 --target=riscv64-linux-gnu -march=rv64gcv</code> 生成 RVV 1.0 向量指令并在 <code>qemu-riscv64</code> 下完成端到端注错验证。</p>
+      <h3>5.2 RISC-V (rv64gcv RVV 1.0) vs. x86_64 跨架构对比与 QEMU 验证</h3>
+      <p class="sub-desc">对比 <code>rv64gcv</code> 与 <code>x86_64</code> 在 12 个负载上的静态代码生成结构、指令膨胀倍率，以及 <code>qemu-riscv64</code> vs. <code>x86_64</code> 的注错一致性。</p>
       <svg class="chart" id="svg-rq8-rv" viewBox="0 0 580 215"></svg>
       <table id="tbl-rq8-rv">
         <thead>
           <tr>
-            <th>RISC-V 编译策略 (12 负载汇总)</th>
-            <th>静态总指令数</th>
-            <th>FP64 标量指令</th>
-            <th>RVV 向量指令</th>
-            <th>QEMU 检出恢复</th>
-            <th>QEMU 平均 SDC</th>
+            <th>容错策略 (12 负载汇总)</th>
+            <th>RV64 总指令 (倍率)</th>
+            <th>RV64 FP64 / RVV</th>
+            <th>RV64 vs x86 检出恢复</th>
+            <th>RV64 vs x86 平均 SDC</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -916,15 +915,16 @@ const avgFI = (pol, col) => {{
   }});
   svgCat.innerHTML = hc;
 
-  // 5.2 RISC-V (rv64gcv) 静态代码分解与 QEMU 验证
+  // 5.2 RISC-V (rv64gcv) vs x86_64 静态代码分解与 QEMU 验证
   const rvPolicies = [
-    {{ pol: "native",        name: "Native (rv64gc 标量基线)" }},
-    {{ pol: "exact_tmr",     name: "COAST-TMR (rv64gc 精确三模)" }},
-    {{ pol: "approx_scalar", name: "Approx-Scalar (rv64gcv 标量近似)" }},
-    {{ pol: "approx_simd",   name: "Approx-SIMD (rv64gcv RVV 向量近似)" }},
-    {{ pol: "adaptive_low",  name: "Adaptive-LOW (rv64gcv 平静期多版本)" }}
+    {{ pol: "native",        name: "Native (无保护基线)" }},
+    {{ pol: "exact_tmr",     name: "COAST-TMR (精确三模)" }},
+    {{ pol: "approx_scalar", name: "Approx-Scalar (标量近似)" }},
+    {{ pol: "approx_simd",   name: "Approx-SIMD (向量近似)" }},
+    {{ pol: "adaptive_low",  name: "Adaptive-LOW (平静期)" }}
   ];
 
+  const rvNatInst = DATA.rq8_rv.filter(r => r.policy === "native").reduce((s, r) => s + Number(r.rv64gcv_static_insts), 0);
   const rvStats = rvPolicies.map(p => {{
     const sub = DATA.rq8_rv.filter(r => r.policy === p.pol);
     const totInst = sub.reduce((s, r) => s + Number(r.rv64gcv_static_insts), 0);
@@ -933,18 +933,19 @@ const avgFI = (pol, col) => {{
     const fiValid = sub.filter(r => Number(r.qemu_fi_sdc_pct) >= 0);
     const avgDet  = fiValid.length ? fiValid.reduce((s, r) => s + Number(r.qemu_fi_det_recovered_pct), 0) / fiValid.length : -1;
     const avgSdc  = fiValid.length ? fiValid.reduce((s, r) => s + Number(r.qemu_fi_sdc_pct), 0) / fiValid.length : -1;
-    return {{ ...p, totInst, fp64Ops, rvvOps, avgDet, avgSdc }};
+    const x86Det  = avgDet >= 0 ? avgFI(p.pol, "det_recovered_pct") : -1;
+    const x86Sdc  = avgSdc >= 0 ? avgFI(p.pol, "sdc_pct") : -1;
+    return {{ ...p, totInst, ratio: totInst / rvNatInst, fp64Ops, rvvOps, avgDet, avgSdc, x86Det, x86Sdc }};
   }});
 
   document.querySelector("#tbl-rq8-rv tbody").innerHTML = rvStats.map(st => {{
     const isOurs = st.pol === "approx_simd";
     return `<tr style="${{isOurs ? 'background:rgba(16,185,129,0.08)' : ''}}">
       <td><strong>${{st.name}}</strong></td>
-      <td>${{st.totInst.toLocaleString()}}</td>
-      <td>${{st.fp64Ops.toLocaleString()}}</td>
-      <td style="color:#38bdf8;font-weight:700">${{st.rvvOps.toLocaleString()}}</td>
-      <td style="color:#10b981;font-weight:600">${{st.avgDet >= 0 ? st.avgDet.toFixed(1) + "%" : "-"}}</td>
-      <td style="color:${{st.avgSdc === 0 ? '#10b981' : (st.avgSdc > 0 ? '#f87171' : '#94a3b8')}};font-weight:700">${{st.avgSdc >= 0 ? st.avgSdc.toFixed(2) + "%" : "-"}}</td>
+      <td>${{st.totInst.toLocaleString()}} (${{st.ratio.toFixed(2)}}×)</td>
+      <td>${{st.fp64Ops}} / <strong style="color:#38bdf8">${{st.rvvOps}}</strong></td>
+      <td style="color:#10b981;font-weight:600">${{st.avgDet >= 0 ? st.avgDet.toFixed(1) + "% / " + st.x86Det.toFixed(1) + "%" : "-"}}</td>
+      <td style="color:${{st.avgSdc === 0 ? '#10b981' : (st.avgSdc > 0 ? '#f87171' : '#94a3b8')}};font-weight:700">${{st.avgSdc >= 0 ? st.avgSdc.toFixed(2) + "% / " + st.x86Sdc.toFixed(2) + "%" : "-"}}</td>
     </tr>`;
   }}).join("");
 
