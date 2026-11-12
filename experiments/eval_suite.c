@@ -3,10 +3,35 @@
 #include "harness.h"
 
 #include <math.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
+
+static sigjmp_buf g_crash_jmp_buf;
+static volatile sig_atomic_t g_caught_crash_sig = 0;
+
+static void crash_signal_handler(int sig) {
+    g_caught_crash_sig = sig;
+    siglongjmp(g_crash_jmp_buf, sig);
+}
+
+static void install_crash_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = crash_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NODEFER;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
+}
 
 #define NUM_BENCHES 12
 
@@ -286,6 +311,7 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
     (void)golden_dir;
     suite_workspace_t ws;
     alloc_and_init_workspace(&ws, 1);
+    install_crash_handlers();
 
     for (int b = 0; b < NUM_BENCHES; b++) {
         double *golden_buf = calloc(ws.out_sizes[b], sizeof(double));
@@ -311,8 +337,8 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
 
         uint64_t rng = 0x123456789abcdef0ULL ^ ((uint64_t)(b + 1) << 32);
 
-        for (int t = 0; t < trials; t++) {
-            uint64_t target_step = 1 + (splitmix64(&rng) % (total_dyn_insts > 0 ? total_dyn_insts : 1));
+        for (int t = 0; t < trials && total_dyn_insts > 0; t++) {
+            uint64_t target_step = 1 + (splitmix64(&rng) % total_dyn_insts);
             uint32_t target_bit  = (uint32_t)(splitmix64(&rng) % 64);
 
             atft_init(10000.0, 4.0, 3, 4, 3);
@@ -322,13 +348,28 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
             harness_fi_arm_one_fault(target_step, target_bit);
 
             memset(ws.out_ptrs[b], 0, ws.out_sizes[b] * sizeof(double));
-            invoke_benchmark(&ws, b);
+            g_caught_crash_sig = 0;
+            struct itimerval itv;
+            memset(&itv, 0, sizeof(itv));
+            itv.it_value.tv_usec = 8000; // 8ms watchdog for infinite loops caused by branch/int flips
+            setitimer(ITIMER_REAL, &itv, NULL);
+
+            if (sigsetjmp(g_crash_jmp_buf, 1) == 0) {
+                invoke_benchmark(&ws, b);
+                memset(&itv, 0, sizeof(itv));
+                setitimer(ITIMER_REAL, &itv, NULL);
+            } else {
+                // Caught hardware trap (SIGSEGV / SIGBUS / SIGFPE) or hang watchdog (SIGALRM) -> OS/HW DUE!
+                memset(&itv, 0, sizeof(itv));
+                setitimer(ITIMER_REAL, &itv, NULL);
+                g_atft_state.unrecoverable_faults++;
+            }
 
             harness_qor_metrics_t qor;
             harness_compute_qor(ws.out_sizes[b], golden_buf, ws.out_ptrs[b], ws.peak_vals[b], &qor);
 
             int fault_detected = (g_atft_state.detected_faults > baseline_false_alarms);
-            int unrec = (g_atft_state.unrecoverable_faults > 0);
+            int unrec = (g_atft_state.unrecoverable_faults > 0) || (g_caught_crash_sig != 0);
 
             if (unrec) {
                 cnt_due++;

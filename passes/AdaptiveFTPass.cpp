@@ -375,7 +375,7 @@ std::set<Instruction *> selectInstructionsByBudget(
 Value *insertZeroCostCSEBarrier(IRBuilder<> &IRB, Value *val) {
   Type *ty = val->getType();
   InlineAsm *noop = InlineAsm::get(
-      FunctionType::get(ty, {ty}, false), "", "=x,0", false);
+      FunctionType::get(ty, {ty}, false), "", "=r,0", false);
   return IRB.CreateCall(noop, {val});
 }
 
@@ -474,7 +474,7 @@ void transformFunctionEDDIOrSWIFT(Function &F, LoopInfo &LI, bool duplicateLoads
       Value *cmpEq = IRB.CreateFCmpOEQ(inst, rep, "eddi.cmp");
       Value *sel = IRB.CreateSelect(cmpEq, inst, rep, "eddi.chk");
       InlineAsm *keepChk = InlineAsm::get(
-          FunctionType::get(F64Ty, {F64Ty}, false), "", "=x,0", true);
+          FunctionType::get(F64Ty, {F64Ty}, false), "", "=r,0", true);
       IRB.CreateCall(keepChk, {sel});
     }
 
@@ -691,8 +691,13 @@ void transformFunctionExactTMR(Function &F, LoopInfo &LI,
     Value *cmp23 = IRB.CreateFCmpOEQ(rep1, rep2, "tmr.c23");
     Value *sel23 = IRB.CreateSelect(cmp23, rep1, inst, "tmr.s23");
     Value *inlineVoted = IRB.CreateSelect(cmp12, inst, sel23, "tmr.inline.vote");
+    for (Value *vv : {cmp12, cmp23, sel23, inlineVoted}) {
+      if (auto *vi = dyn_cast<Instruction>(vv)) {
+        vi->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+      }
+    }
     InlineAsm *keepVote = InlineAsm::get(
-        FunctionType::get(F64Ty, {F64Ty}, false), "", "=x,0", true);
+        FunctionType::get(F64Ty, {F64Ty}, false), "", "=r,0", true);
     inlineVoted = IRB.CreateCall(keepVote, {inlineVoted});
 
     replica1Map[inst] = rep1;

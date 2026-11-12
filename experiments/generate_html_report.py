@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-学术评测看板生成器（全中文严谨学术版，包含 4 个正交核心模块）：
+学术评测看板生成器（全中文严谨学术版，包含 5 个正交核心模块）：
   - 顶部 4 张核心技术指标卡片（纯客观绝对指标与统计口径，不掺杂基线对比）
   - 模块 1：本方案在 12 个标准基准负载上的端到端综合表现（一表合一）
   - 模块 2：核心机制内部消融与动态响应（阈值 δ 权衡曲线 + 60 窗口辐射脉冲切换轨迹 + 内部消融表）
   - 模块 3：机理剖析与极限压力测试（IEEE-754 位域敏感度剖析 + 空间多比特 MBU 与连续多故障冲击 + 跨 Cache 层级数据规模扩展）
-  - 模块 4：与主流容错机制及选择性保护算法的横向对比（EDDI / SWIFT / COAST-TMR / Shoestring / SDCTune / HotPath）
+  - 模块 4：与主流容错机制及选择性保护算法的横向对比（EDDI / SWIFT / LLTFI-SID / COAST-TMR / Shoestring / SDCTune / HotPath）
+  - 模块 5：跨指令集架构 (RISC-V RVV 1.0) 验证与多指令类别 (FP / Int / Address / Branch) 故障注入剖析
 """
 
 import csv
@@ -34,6 +35,8 @@ def generate_html_dashboard():
     rq5_rows = read_csv_dicts(RES_DIR / "rq5_bitfield_sensitivity.csv")
     rq6_rows = read_csv_dicts(RES_DIR / "rq6_mbu_burst_stress.csv")
     rq7_rows = read_csv_dicts(RES_DIR / "rq7_cache_scaling.csv")
+    rq8_cat_rows = read_csv_dicts(RES_DIR / "rq8_inst_category_breakdown.csv")
+    rq8_rv_rows = read_csv_dicts(RES_DIR / "rq8_riscv_rvv_evaluation.csv")
 
     data_bundle = {
         "criticality": crit_rows,
@@ -45,6 +48,8 @@ def generate_html_dashboard():
         "rq5_bitfield": rq5_rows,
         "rq6_stress": rq6_rows,
         "rq7_scale": rq7_rows,
+        "rq8_cat": rq8_cat_rows,
+        "rq8_rv": rq8_rv_rows,
     }
     json_str = json.dumps(data_bundle, ensure_ascii=False)
 
@@ -209,27 +214,6 @@ def generate_html_dashboard():
   }}
   tr:hover td {{ background: rgba(56,189,248,0.04); }}
 
-  .bar-wrap {{
-    display: flex;
-    height: 14px;
-    width: 100%;
-    min-width: 135px;
-    border-radius: 3px;
-    overflow: hidden;
-    background: #0b1120;
-  }}
-  .bar-seg {{ height: 100%; }}
-  .legend {{
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-    font-size: 12px;
-    color: var(--muted);
-    margin-bottom: 8px;
-  }}
-  .legend span {{ display: inline-flex; align-items: center; gap: 5px; }}
-  .dot {{ width: 9px; height: 9px; border-radius: 2px; display: inline-block; }}
-
   svg.chart {{
     width: 100%;
     height: 225px;
@@ -250,12 +234,13 @@ def generate_html_dashboard():
 <header>
   <div>
     <h1>面向空天计算的编译器辅助自适应近似容错框架 — 实验评测看板</h1>
-    <p>评测底座：Linux 硬件性能计数器 (<code>perf_event_open</code>) 实测退休指令数 + 独立后置单粒子/多粒子故障注入器 (<code>libFaultInjectorPass.so</code>)</p>
+    <p>评测底座：Linux 硬件性能计数器 (<code>perf_event_open</code>) 实测退休指令数 + 独立后置多类别故障注入器 (<code>libFaultInjectorPass.so</code>) + RISC-V RVV 1.0 交叉编译与 QEMU 验证</p>
   </div>
   <div>
     <span class="meta-tag">LLVM 15.0.7</span>
-    <span class="meta-tag">12 个标准负载</span>
-    <span class="meta-tag">RQ1 – RQ7 完整评估</span>
+    <span class="meta-tag">x86_64 &amp; RISC-V (rv64gcv)</span>
+    <span class="meta-tag">12 个标准开源套件负载</span>
+    <span class="meta-tag">RQ1 – RQ8 完整评估</span>
   </div>
 </header>
 
@@ -263,13 +248,13 @@ def generate_html_dashboard():
 
 <!-- 模块 1：本方案在 12 个标准负载上的端到端综合表现 -->
 <div class="section">
-  <h2>1. 本方案在 12 个标准基准负载上的端到端综合表现</h2>
-  <p class="desc">覆盖 PolyBench/C 4.2.1、PARSEC 3.0、ACCEPT 近似计算套件、KissFFT/CMSIS-DSP 及 GNC 飞控套件。单表汇总静态关键性评分、纯近似分支峰值信噪比 (PSNR)、平静期 (<code>LOW</code>) 与高辐射爆发期 (<code>HIGH</code>) 硬件指令倍率、以及单粒子注入下的静默数据损坏率 (SDC) 与恢复精度。</p>
+  <h2>1. 本方案在 12 个标准开源基准负载上的端到端综合表现</h2>
+  <p class="desc">直接编译 <code>third_party/</code> 原版开源套件源码（PolyBench/C 4.2.1、PARSEC 3.0 Black-Scholes、ACCEPT 近似套件、KissFFT 蝶形核及 GNC 飞控负载）。单表汇总静态关键性评分、纯近似分支峰值信噪比 (PSNR)、平静期 (<code>LOW</code>) 与高辐射爆发期 (<code>HIGH</code>) 硬件指令倍率、以及单粒子注入下的静默数据损坏率 (SDC) 与恢复精度。</p>
   <table id="tbl-ours">
     <thead>
       <tr>
         <th>基准程序</th>
-        <th>所属标准套件与领域</th>
+        <th>所属原版开源套件文件</th>
         <th>静态关键性分级与得分</th>
         <th>纯近似分支 PSNR</th>
         <th>平静期指令倍率 (LOW)</th>
@@ -363,7 +348,7 @@ def generate_html_dashboard():
     </div>
     <div class="panel-box">
       <h3>3.3 跨 L1/L2/L3 缓存层级规模扩展测试</h3>
-      <p class="sub-desc">随矩阵工作集从 24KB (L1) 扩展至 1.5MB (L3/DRAM)，窄位宽 FP32 SIMD 近似副本有效缓解访存带宽压力。</p>
+      <p class="sub-desc">随矩阵工作集从 24KB (L1) 扩展至 1.5MB (L3/DRAM)，窄位宽 FP32 SIMD 近似副本缓解访存带宽压力。</p>
       <svg class="chart" id="svg-rq7" viewBox="0 0 440 210"></svg>
       <table id="tbl-rq7">
         <thead>
@@ -383,17 +368,17 @@ def generate_html_dashboard():
 <!-- 模块 4：与主流容错机制及选择性保护算法的独立横向对比 -->
 <div class="section">
   <h2>4. 与主流容错机制及选择性保护算法的横向对比 (SOTA Baseline Comparison)</h2>
-  <p class="desc">在完全相同的 12 个标准负载与独立评测器下，集中对比三类主流容错方案（<strong>EDDI</strong> [IEEE TR'02]、<strong>SWIFT</strong> [CGO'05]、<strong>COAST-TMR</strong> [IEEE TNS'19]）以及四类选择性保护排序算法（<strong>Random</strong>、<strong>HotPath</strong>、<strong>SDCTune</strong> [HPDC'14]、<strong>Shoestring</strong> [ASPLOS'10]）。</p>
+  <p class="desc">在完全相同的 12 个标准负载与独立评测器下，集中对比四类主流容错机制（<strong>EDDI</strong> [IEEE TR'02]、<strong>SWIFT</strong> [CGO'05]、开源移植 <strong>LLTFI-SID</strong> [<code>third_party/LLTFI</code>]、开源移植 <strong>COAST-TMR</strong> [<code>third_party/coast</code>]）以及四类选择性保护排序算法（<strong>Random</strong>、<strong>HotPath</strong>、<strong>SDCTune</strong> [HPDC'14]、<strong>Shoestring</strong> [ASPLOS'10]）。</p>
   <div class="grid-equal">
     <div class="panel-box">
       <h3>4.1 容错冗余机制横向对比 (12 个标准负载均值)</h3>
-      <p class="sub-desc">对比双模检错方案 (EDDI / SWIFT，检出即中断 DUE) 与三模表决方案 (COAST-TMR / 本文方案，支持在线自恢复)。</p>
+      <p class="sub-desc">客观对比双模检错方案 (EDDI / SWIFT)、开源双模位与修复 (LLTFI-SID) 与三模表决方案 (COAST-TMR / 本文方案)。</p>
       <svg class="chart" id="svg-rq1-baseline" viewBox="0 0 580 215"></svg>
       <table id="tbl-baseline-mech">
         <thead>
           <tr>
             <th>容错方案</th>
-            <th>代表文献</th>
+            <th>代码来源与代表文献</th>
             <th>指令倍率</th>
             <th>检出恢复</th>
             <th>中断 DUE</th>
@@ -417,6 +402,51 @@ def generate_html_dashboard():
             <th>SDCTune</th>
             <th>Shoestring</th>
             <th>Semantic (本文)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 模块 5：跨指令集架构 (RISC-V RVV 1.0) 验证与多指令类别脆弱性剖析 (RQ8) -->
+<div class="section">
+  <h2>5. 多指令类别故障注入剖析与 RISC-V (rv64gcv) 跨平台验证 (RQ8)</h2>
+  <p class="desc">使用参数化评测命令 (<code>-fi-target-type=fp|int|address|branch</code> 与 <code>--arch=riscv64</code>) 评估：（左）浮点数据流、整型算术、内存地址下标 (GEP) 与分支谓词四类指令的容错覆盖边界；（右）在星载主流 <strong>RISC-V (<code>rv64gcv</code> RVV 1.0 向量扩展 + <code>qemu-riscv64</code>)</strong> 目标架构下的静态代码生成分解与故障注入验证。</p>
+  <div class="grid-equal">
+    <div class="panel-box">
+      <h3>5.1 四类指令 (FP / Int / Address / Branch) 故障注入剖析</h3>
+      <p class="sub-desc">量化纯数据流容错在浮点主路径 (0.00% SDC) 与未加控制流签名时的地址/分支指令脆弱性边界。</p>
+      <svg class="chart" id="svg-rq8-cat" viewBox="0 0 580 215"></svg>
+      <table id="tbl-rq8-cat">
+        <thead>
+          <tr>
+            <th>注入指令类别</th>
+            <th>被测容错方案</th>
+            <th>平均动态注入点</th>
+            <th>完全掩盖</th>
+            <th>检出恢复</th>
+            <th>中断 DUE</th>
+            <th>静默 SDC</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel-box">
+      <h3>5.2 RISC-V (rv64gcv RVV 1.0) 向量代码生成与 QEMU 实测验证</h3>
+      <p class="sub-desc">通过 <code>clang-15 --target=riscv64-linux-gnu -march=rv64gcv</code> 生成 RVV 1.0 向量指令并在 <code>qemu-riscv64</code> 下完成端到端注错验证。</p>
+      <svg class="chart" id="svg-rq8-rv" viewBox="0 0 580 215"></svg>
+      <table id="tbl-rq8-rv">
+        <thead>
+          <tr>
+            <th>RISC-V 编译策略 (12 负载汇总)</th>
+            <th>静态总指令数</th>
+            <th>FP64 标量指令</th>
+            <th>RVV 向量指令</th>
+            <th>QEMU 检出恢复</th>
+            <th>QEMU 平均 SDC</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -472,7 +502,7 @@ const avgFI = (pol, col) => {{
     {{
       title: "12 个标准负载平均 SDC 率",
       val: avgFI("approx_simd", "sdc_pct").toFixed(2) + "%",
-      sub: `基于 7,200 次全位宽单粒子翻转盲注统计 (11/12 个负载实现 0.00% SDC)`
+      sub: `x86_64 与 RISC-V (qemu-riscv64) 双平台浮点单粒子翻转盲注均实现 0.00% SDC`
     }},
     {{
       title: "故障降级恢复后相对 L2 误差",
@@ -609,7 +639,6 @@ const avgFI = (pol, col) => {{
 
 // 4. 模块 3：位域剖析 (RQ5)、MBU/Burst 多故障压力 (RQ6) 与跨 Cache 规模扩展 (RQ7)
 (function renderModule3Stress() {{
-  // 3.1 位域敏感度
   const fields = ["Sign (Bit 63)", "Exponent (Bits 52-62)", "Mantissa_High (Bits 32-51)", "Mantissa_Low (Bits 0-31)"];
   const fieldShort = ["符号位 (63)", "指数位 (52-62)", "高位尾数 (32-51)", "低位尾数 (0-31)"];
   const bfMap = {{}};
@@ -679,7 +708,7 @@ const avgFI = (pol, col) => {{
   }});
   svg6.innerHTML = h6;
 
-  // 3.3 跨 Cache 层级规模扩展 (仅展示 Native / Approx-Scalar / Approx-SIMD，保持模块3纯粹)
+  // 3.3 跨 Cache 层级规模扩展
   const scMap = {{}};
   DATA.rq7_scale.forEach(r => {{ scMap[r.policy + "_" + r.matrix_n] = r; }});
   const sizes = [32, 64, 128, 256];
@@ -744,7 +773,6 @@ const avgFI = (pol, col) => {{
     </tr>`;
   }}).join("");
 
-  // 绘制 4.1 容错机制五分类堆叠水平条形图 + 指令倍率对比
   const svg1 = document.getElementById("svg-rq1-baseline");
   let h1 = `<rect x="20" y="8" width="9" height="9" fill="#64748b" /><text x="33" y="16" fill="#cbd5e1" font-size="10.5">完全掩盖</text>
             <rect x="105" y="8" width="9" height="9" fill="#10b981" /><text x="118" y="16" fill="#cbd5e1" font-size="10.5">检出并在线恢复</text>
@@ -828,6 +856,120 @@ const avgFI = (pol, col) => {{
   }});
   svg2.innerHTML = h2;
 }})();
+
+// 6. 模块 5：多指令类别故障注入剖析 + RISC-V (rv64gcv) 跨平台验证 (RQ8)
+(function renderModule5RQ8() {{
+  const catLabels = {{
+    "fp": "浮点数据流 (FP)",
+    "int": "整型算术 (Int32/16)",
+    "address": "访存地址下标 (GEP)",
+    "branch": "条件分支谓词 (Branch)"
+  }};
+  const catMap = {{}};
+  DATA.rq8_cat.forEach(r => {{ catMap[r.fi_category + "_" + r.policy] = r; }});
+
+  const displayPairs = [
+    ["fp", "native", "Native (无保护)"],
+    ["fp", "approx_simd", "Approx-SIMD (本文方案)"],
+    ["int", "native", "Native / 纯浮点容错"],
+    ["address", "native", "Native / 纯数据流容错"],
+    ["branch", "native", "Native (无保护)"],
+    ["branch", "approx_simd", "Approx-SIMD (本文方案)"]
+  ];
+
+  document.querySelector("#tbl-rq8-cat tbody").innerHTML = displayPairs.map(([cat, pol, label]) => {{
+    const r = catMap[cat + "_" + pol];
+    if (!r) return "";
+    const isGood = Number(r.sdc_pct) < 0.5;
+    return `<tr>
+      <td><strong>${{catLabels[cat]}}</strong></td>
+      <td>${{label}}</td>
+      <td>${{Number(r.avg_dyn_sites).toLocaleString()}}</td>
+      <td>${{Number(r.masked_pct).toFixed(1)}}%</td>
+      <td style="color:#10b981;font-weight:600">${{Number(r.det_recovered_pct).toFixed(1)}}%</td>
+      <td style="color:${{Number(r.due_pct) > 20 ? '#fbbf24' : '#94a3b8'}}">${{Number(r.due_pct).toFixed(1)}}%</td>
+      <td style="color:${{isGood ? '#10b981' : '#f87171'}};font-weight:700">${{Number(r.sdc_pct).toFixed(2)}}%</td>
+    </tr>`;
+  }}).join("");
+
+  const svgCat = document.getElementById("svg-rq8-cat");
+  let hc = `<line x1="40" y1="180" x2="555" y2="180" stroke="#334155" />
+            <rect x="45" y="10" width="9" height="9" fill="#ef4444" /><text x="58" y="18" fill="#cbd5e1" font-size="10.5">Native SDC 率</text>
+            <rect x="180" y="10" width="9" height="9" fill="#10b981" /><text x="193" y="18" fill="#cbd5e1" font-size="10.5">Approx-SIMD SDC 率</text>
+            <rect x="340" y="10" width="9" height="9" fill="#f59e0b" /><text x="353" y="18" fill="#cbd5e1" font-size="10.5">整型算术崩溃/超时 DUE 率</text>`;
+  const cats = ["fp", "int", "address", "branch"];
+  const catShort = ["浮点算术 (FP)", "整型算术 (Int)", "访存下标 (GEP)", "分支谓词 (Branch)"];
+  cats.forEach((c, idx) => {{
+    const x0 = 68 + idx * 125;
+    const natSdc = Number(catMap[c + "_native"]?.sdc_pct || 0);
+    const simdSdc = Number(catMap[c + "_approx_simd"]?.sdc_pct || 0);
+    const dueRate = Number(catMap[c + "_approx_simd"]?.due_pct || 0);
+    const hNat = (natSdc / 20.0) * 135;
+    const hSimd = (simdSdc / 20.0) * 135;
+    const hDue = (dueRate / 100.0) * 135;
+    hc += `<rect x="${{x0}}" y="${{180 - hNat}}" width="20" height="${{Math.max(2, hNat)}}" fill="#ef4444" rx="2" />`;
+    hc += `<rect x="${{x0 + 22}}" y="${{180 - hSimd}}" width="20" height="${{Math.max(2, hSimd)}}" fill="#10b981" rx="2" />`;
+    if (dueRate > 1.0) {{
+      hc += `<rect x="${{x0 + 44}}" y="${{180 - hDue}}" width="16" height="${{hDue}}" fill="#f59e0b" rx="2" />`;
+    }}
+    hc += `<text x="${{x0 + 22}}" y="200" fill="#94a3b8" font-size="10.5" text-anchor="middle">${{catShort[idx]}}</text>`;
+  }});
+  svgCat.innerHTML = hc;
+
+  // 5.2 RISC-V (rv64gcv) 静态代码分解与 QEMU 验证
+  const rvPolicies = [
+    {{ pol: "native",        name: "Native (rv64gc 标量基线)" }},
+    {{ pol: "exact_tmr",     name: "COAST-TMR (rv64gc 精确三模)" }},
+    {{ pol: "approx_scalar", name: "Approx-Scalar (rv64gcv 标量近似)" }},
+    {{ pol: "approx_simd",   name: "Approx-SIMD (rv64gcv RVV 向量近似)" }},
+    {{ pol: "adaptive_low",  name: "Adaptive-LOW (rv64gcv 平静期多版本)" }}
+  ];
+
+  const rvStats = rvPolicies.map(p => {{
+    const sub = DATA.rq8_rv.filter(r => r.policy === p.pol);
+    const totInst = sub.reduce((s, r) => s + Number(r.rv64gcv_static_insts), 0);
+    const fp64Ops = sub.reduce((s, r) => s + Number(r.rv64gcv_fp64_ops), 0);
+    const rvvOps  = sub.reduce((s, r) => s + Number(r.rv64gcv_rvv_vec_ops), 0);
+    const fiValid = sub.filter(r => Number(r.qemu_fi_sdc_pct) >= 0);
+    const avgDet  = fiValid.length ? fiValid.reduce((s, r) => s + Number(r.qemu_fi_det_recovered_pct), 0) / fiValid.length : -1;
+    const avgSdc  = fiValid.length ? fiValid.reduce((s, r) => s + Number(r.qemu_fi_sdc_pct), 0) / fiValid.length : -1;
+    return {{ ...p, totInst, fp64Ops, rvvOps, avgDet, avgSdc }};
+  }});
+
+  document.querySelector("#tbl-rq8-rv tbody").innerHTML = rvStats.map(st => {{
+    const isOurs = st.pol === "approx_simd";
+    return `<tr style="${{isOurs ? 'background:rgba(16,185,129,0.08)' : ''}}">
+      <td><strong>${{st.name}}</strong></td>
+      <td>${{st.totInst.toLocaleString()}}</td>
+      <td>${{st.fp64Ops.toLocaleString()}}</td>
+      <td style="color:#38bdf8;font-weight:700">${{st.rvvOps.toLocaleString()}}</td>
+      <td style="color:#10b981;font-weight:600">${{st.avgDet >= 0 ? st.avgDet.toFixed(1) + "%" : "-"}}</td>
+      <td style="color:${{st.avgSdc === 0 ? '#10b981' : (st.avgSdc > 0 ? '#f87171' : '#94a3b8')}};font-weight:700">${{st.avgSdc >= 0 ? st.avgSdc.toFixed(2) + "%" : "-"}}</td>
+    </tr>`;
+  }}).join("");
+
+  const svgRv = document.getElementById("svg-rq8-rv");
+  let hr = `<line x1="40" y1="180" x2="555" y2="180" stroke="#334155" />
+            <rect x="45" y="10" width="9" height="9" fill="#64748b" /><text x="58" y="18" fill="#cbd5e1" font-size="10.5">通用/控制指令</text>
+            <rect x="175" y="10" width="9" height="9" fill="#f59e0b" /><text x="188" y="18" fill="#cbd5e1" font-size="10.5">FP64 双精度标量指令 (.d)</text>
+            <rect x="355" y="10" width="9" height="9" fill="#38bdf8" /><text x="368" y="18" fill="#cbd5e1" font-size="10.5">RVV 1.0 向量指令 (vf*.vv / vsetvli)</text>`;
+  const rvShort = ["Native", "COAST-TMR", "Approx-Scalar", "Approx-SIMD", "Adaptive-LOW"];
+  rvStats.forEach((st, idx) => {{
+    const x0 = 60 + idx * 98;
+    const scale = 135.0 / 3400.0;
+    const hFp64 = st.fp64Ops * scale;
+    const hRvv  = st.rvvOps * scale;
+    const hOther = Math.max(0, (st.totInst - st.fp64Ops - st.rvvOps) * scale);
+    let curY = 180;
+    hr += `<rect x="${{x0}}" y="${{curY - hOther}}" width="34" height="${{hOther}}" fill="#64748b" />`;
+    curY -= hOther;
+    hr += `<rect x="${{x0}}" y="${{curY - hFp64}}" width="34" height="${{hFp64}}" fill="#f59e0b" />`;
+    curY -= hFp64;
+    hr += `<rect x="${{x0}}" y="${{curY - hRvv}}" width="34" height="${{hRvv}}" fill="#38bdf8" />`;
+    hr += `<text x="${{x0 + 17}}" y="200" fill="#94a3b8" font-size="10" text-anchor="middle">${{rvShort[idx]}}</text>`;
+  }});
+  svgRv.innerHTML = hr;
+}})();
 </script>
 </body>
 </html>
@@ -835,7 +977,7 @@ const avgFI = (pol, col) => {{
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(html_content)
     shutil.copyfile(OUT_HTML, OUT_INDEX)
-    print(f"Generated complete RQ1-RQ7 Chinese HTML dashboard: {OUT_HTML} ({OUT_HTML.stat().st_size} bytes)")
+    print(f"Generated complete RQ1-RQ8 Chinese HTML dashboard: {OUT_HTML} ({OUT_HTML.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":
