@@ -209,11 +209,13 @@ int32_t atft_voter_exact_i32(int32_t r1, int32_t r2, int32_t r3) {
 // ============================================================================
 // 混合误差容忍与判定机制 (对应开题报告 3.4.4.2 & 3.4.4.3)
 // ============================================================================
-double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
-                             double delta, int32_t crit_level) __attribute__((always_inline));
+double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
+                                    double a1_approx, double a2_approx,
+                                    double delta, int32_t crit_level) __attribute__((always_inline));
 
-double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
-                             double delta, int32_t crit_level) {
+double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
+                                    double a1_approx, double a2_approx,
+                                    double delta, int32_t crit_level) {
     g_atft_state.total_votes++;
 
     double ref_scale = fabs(a1_approx);
@@ -224,34 +226,43 @@ double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
     double diff_r_a1 = fabs(r_exact - a1_approx);
     double diff_a1_a2 = fabs(a1_approx - a2_approx);
 
-    // Fast-path: 绝大多数无软错误情况仅需两次 IEEE-754 比较 (FCMP_OLE 天然排除 NaN)
+    // Fast-path: 无软错误直接返回 r_exact
     if (__builtin_expect((diff_r_a1 <= eff_delta) && (diff_a1_a2 <= 1e-6 * (1.0 + ref_scale)), 1)) {
         g_atft_state.fault_free_votes++;
         return r_exact;
     }
 
-    // Cold-path: 检测到软错误异常时的三路分支恢复逻辑
+    // Cold-path: 检测到软错误异常时的分级恢复逻辑 (对应开题报告 3.4.4.3)
     double diff_r_a2 = fabs(r_exact - a2_approx);
     int r_a1_ok = (diff_r_a1 <= eff_delta) && isfinite(r_exact) && isfinite(a1_approx);
     int r_a2_ok = (diff_r_a2 <= eff_delta) && isfinite(r_exact) && isfinite(a2_approx);
     int a1_a2_ok = (diff_a1_a2 <= 1e-5 * (1.0 + ref_scale)) && isfinite(a1_approx) && isfinite(a2_approx);
 
     g_atft_state.detected_faults++;
+    atft_report_ecc_event();
 
-    // 情况 1: 两条近似副本一致 (a1_a2_ok)，说明主路 R 发生位翻转 (含 R 变为 NaN/Inf 或偏离超过 delta) -> 采纳近似副本恢复
+    // 情况 1: 两条近似副本一致 (a1_a2_ok)，说明主路 R 发生位翻转 -> 按代码段关键性等级分级恢复:
+    //   - 关键代码段 (CRITICAL)     : 校验并采纳冷路径精确重执行结果 r_reexec (零精度损失恢复)
+    //   - 次关键代码段 (SUB_CRITICAL): 直接采纳近似计算结果 a1_approx 替代 (免重执行开销)
+    //   - 非关键代码段 (NON_CRITICAL): 采用安全回退值
     if (a1_a2_ok && (!r_a1_ok || !r_a2_ok)) {
         g_atft_state.exact_branch_faults++;
         if (crit_level >= ATFT_CRIT_CRITICAL) {
             g_atft_state.recovered_by_reexec++;
-            return 0.5 * (a1_approx + a2_approx);
-        } else {
+            if (isfinite(r_reexec) && fabs(r_reexec - a1_approx) <= eff_delta) {
+                return r_reexec;
+            }
+            return a1_approx;
+        } else if (crit_level == ATFT_CRIT_SUB_CRITICAL) {
             g_atft_state.recovered_by_approx++;
             return a1_approx;
+        } else {
+            g_atft_state.recovered_by_approx++;
+            return isfinite(a1_approx) ? a1_approx : 0.0;
         }
     }
 
-    // 情况 2: 某一条近似链路发生软错误 (含变为 NaN/Inf 或大幅偏离，导致 ref_scale 被虚高放大)，
-    // 直接利用健康的另一条近似副本单独重新计算精确阈值:
+    // 情况 2: 某一条近似链路发生软错误 (含变为 NaN/Inf 或大幅偏离)，主路 R 完好:
     if (isfinite(r_exact)) {
         if (isfinite(a1_approx)) {
             double d1_lim = delta * (1.0 + fabs(a1_approx));
@@ -273,11 +284,33 @@ double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
         }
     }
 
+    // 情况 3: 若冷路径提供了精确重执行副本 r_reexec 且与主路一致或与单路近似一致:
+    if (crit_level >= ATFT_CRIT_CRITICAL && isfinite(r_reexec)) {
+        if (isfinite(r_exact) && fabs(r_exact - r_reexec) <= 1e-11 * (1.0 + fabs(r_reexec))) {
+            g_atft_state.approx_branch_faults++;
+            g_atft_state.recovered_by_reexec++;
+            return r_reexec;
+        }
+        if (isfinite(a1_approx) && fabs(r_reexec - a1_approx) <= eff_delta) {
+            g_atft_state.exact_branch_faults++;
+            g_atft_state.recovered_by_reexec++;
+            return r_reexec;
+        }
+    }
+
     g_atft_state.unrecoverable_faults++;
     if (isfinite(r_exact)) return r_exact;
     if (isfinite(a1_approx)) return a1_approx;
     if (isfinite(a2_approx)) return a2_approx;
     return 0.0;
+}
+
+double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
+                             double delta, int32_t crit_level) __attribute__((always_inline));
+
+double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
+                             double delta, int32_t crit_level) {
+    return atft_voter_approx_reexec_f64(r_exact, a1_approx, a1_approx, a2_approx, delta, crit_level);
 }
 
 int32_t atft_voter_approx_i32(int32_t r_exact, int32_t a1_approx, int32_t a2_approx,
@@ -293,6 +326,7 @@ int32_t atft_voter_approx_i32(int32_t r_exact, int32_t a1_approx, int32_t a2_app
     }
 
     g_atft_state.detected_faults++;
+    atft_report_ecc_event();
 
     if (d12 == 0 && (d1 > delta || d2 > delta)) {
         g_atft_state.exact_branch_faults++;

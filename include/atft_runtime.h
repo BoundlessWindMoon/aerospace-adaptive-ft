@@ -88,11 +88,17 @@ double  atft_lltfi_sid_compare_f64(double val1, double val2);
 double  atft_voter_exact_f64(double r1, double r2, double r3);
 int32_t atft_voter_exact_i32(int32_t r1, int32_t r2, int32_t r3);
 
-// 混合近似 TMR 动态阈值投票器 (核心创新点 3.4.4: 1次精确 R + 2次近似 A1, A2)
+// 混合近似 TMR 动态阈值投票器 (核心创新点 3.4.4: 1次精确 R + 2次近似 A1, A2 + 关键代码段冷路径精确重执行 R_reexec)
 // 若 |R - A1| <= delta 且 |R - A2| <= delta -> 返回 R
-// 若 |A1 - A2| <= delta 但 |R - A1| > delta -> 判定精确链路故障，按 crit_level 恢复
+// 若 |A1 - A2| <= delta 但 |R - A1| > delta -> 判定精确链路故障，按 crit_level 分级恢复:
+//   - ATFT_CRIT_CRITICAL     : 采纳冷路径精确重执行结果 r_reexec (零精度损失恢复)
+//   - ATFT_CRIT_SUB_CRITICAL : 采纳近似副本结果 a1_approx (免重执行降级替代)
+//   - ATFT_CRIT_NON_CRITICAL : 安全回退
 double  atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
                               double delta, int32_t crit_level);
+double  atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
+                                     double a1_approx, double a2_approx,
+                                     double delta, int32_t crit_level);
 int32_t atft_voter_approx_i32(int32_t r_exact, int32_t a1_approx, int32_t a2_approx,
                               int32_t delta, int32_t crit_level);
 

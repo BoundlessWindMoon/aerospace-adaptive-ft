@@ -291,15 +291,54 @@ FuncCriticalityInfo analyzeFunctionCriticality(Function &F, FunctionAnalysisMana
   unsigned arithCount = 0;
   unsigned feedbackPhiCount = 0;
 
+  auto isSmallConstantStencilLoop = [](const Loop *L) -> bool {
+    if (!L) return false;
+    BasicBlock *H = L->getHeader();
+    if (!H) return false;
+    if (const auto *BI = dyn_cast<BranchInst>(H->getTerminator())) {
+      if (BI->isConditional()) {
+        if (const auto *cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
+          if (const auto *ci = dyn_cast<ConstantInt>(cmp->getOperand(1))) {
+            if (ci->getSExtValue() <= 3) return true;
+          }
+          // 识别 (base + 2) 这类固定半径 r<=2 的局部模板卷积内层循环
+          if (const auto *bo = dyn_cast<BinaryOperator>(cmp->getOperand(1))) {
+            if (bo->getOpcode() == Instruction::Add) {
+              if (const auto *ci = dyn_cast<ConstantInt>(bo->getOperand(1))) {
+                if (ci->getSExtValue() <= 3) return true;
+              }
+            }
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  unsigned maxEffectiveDepth = 0;
   for (const BasicBlock &BB : F) {
     unsigned depth = LI.getLoopDepth(&BB);
     if (depth > info.maxLoopDepth) {
       info.maxLoopDepth = depth;
     }
 
+    // 区分有递归累积的大规模循环与 3x3 常数小模板卷积窗 (TripCount <= 3)
+    unsigned effDepth = 0;
+    for (const Loop *L = LI.getLoopFor(&BB); L != nullptr; L = L->getParentLoop()) {
+      if (!isSmallConstantStencilLoop(L)) {
+        effDepth++;
+      }
+    }
+    if (effDepth > maxEffectiveDepth) {
+      maxEffectiveDepth = effDepth;
+    }
+
+    const Loop *curLoop = LI.getLoopFor(&BB);
+    bool inSmallStencil = isSmallConstantStencilLoop(curLoop);
+
     for (const Instruction &I : BB) {
       if (const auto *PN = dyn_cast<PHINode>(&I)) {
-        if (PN->getType()->isFloatingPointTy() && depth >= 1) {
+        if (PN->getType()->isFloatingPointTy() && depth >= 1 && !inSmallStencil) {
           feedbackPhiCount++;
         }
       }
@@ -329,14 +368,14 @@ FuncCriticalityInfo analyzeFunctionCriticality(Function &F, FunctionAnalysisMana
   }
   info.stateFeedbackFactor = (double)feedbackPhiCount;
 
-  double effectiveLiveness = info.avgLiveness + 0.6 * info.stateFeedbackFactor;
+  double effectiveLiveness = info.avgLiveness + 0.85 * info.stateFeedbackFactor;
   info.score = AtftW1 * info.avgDistToOutput +
-               AtftW2 * (double)info.maxLoopDepth +
+               AtftW2 * (double)maxEffectiveDepth +
                AtftW3 * effectiveLiveness;
 
   if (info.score >= 6.5) {
     info.level = CRIT_CRITICAL;
-  } else if (info.score >= 3.0) {
+  } else if (info.score >= 5.5) {
     info.level = CRIT_SUB_CRITICAL;
   } else {
     info.level = CRIT_NON_CRITICAL;
@@ -729,7 +768,124 @@ void transformFunctionExactTMR(Function &F, LoopInfo &LI,
 }
 
 // ============================================================================
-// 模块 3: 低开销混合近似 TMR 变换 + 内联无分支阈值表决器 (Inline Branchless Voter)
+// 模块 3A: 中间计算结果位宽压缩变换 (对应开题报告 3.4.2.1: 32-bit -> 16-bit 整数运算链压缩)
+//   - 识别非循环控制/非 GEP 下标的 32-bit 整数数据运算链 (Add/Sub/Mul/Shl/AShr/And/Or/Xor)
+//   - 将其截断为 <2 x i16> 窄位宽双路近似副本并行计算，并在恢复点符号扩展 (SExt) 回 i32 做一致性表决
+// ============================================================================
+void transformFunctionInt32ToInt16Compression(Function &F, CritLevel critLevel, bool useSIMD) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  Type *I16Ty = Type::getInt16Ty(Ctx);
+  VectorType *V2I16Ty = FixedVectorType::get(I16Ty, 2);
+
+  FunctionCallee VoterApproxI32Fn = M->getOrInsertFunction(
+      "atft_voter_approx_i32", I32Ty, I32Ty, I32Ty, I32Ty, I32Ty, I32Ty);
+
+  auto markInternal = [&](Value *V) -> Value * {
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+    }
+    return V;
+  };
+
+  std::vector<Instruction *> intDataOps;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (isa<PHINode>(&I) || I.getMetadata("atft.voter.internal") != nullptr) continue;
+      if (I.isBinaryOp() && I.getType()->isIntegerTy(32)) {
+        bool isLoopOrAddr = false;
+        for (User *U : I.users()) {
+          if (isa<PHINode>(U) || isa<ICmpInst>(U) || isa<GetElementPtrInst>(U) ||
+              isa<SExtInst>(U) || isa<ZExtInst>(U)) {
+            isLoopOrAddr = true;
+            break;
+          }
+        }
+        if (!isLoopOrAddr) {
+          intDataOps.push_back(&I);
+        }
+      }
+    }
+  }
+
+  if (intDataOps.empty()) return;
+
+  std::map<Value *, Value *> i16VecMap;
+  auto getOrCreateI16Vec = [&](Value *v, IRBuilder<> &IRB) -> Value * {
+    auto it = i16VecMap.find(v);
+    if (it != i16VecMap.end()) return it->second;
+    if (auto *CI = dyn_cast<ConstantInt>(v)) {
+      int16_t sval = (int16_t)CI->getSExtValue();
+      Constant *c16 = ConstantInt::getSigned(I16Ty, sval);
+      return ConstantVector::get({c16, c16});
+    }
+    Value *tr16 = markInternal(IRB.CreateTrunc(v, I16Ty, "i32.to.i16"));
+    Value *uVec = UndefValue::get(V2I16Ty);
+    Value *v0 = markInternal(IRB.CreateInsertElement(uVec, tr16, ConstantInt::get(I32Ty, 0)));
+    Value *v1 = markInternal(IRB.CreateInsertElement(v0, tr16, ConstantInt::get(I32Ty, 1), "v2i16.pack"));
+    return v1;
+  };
+
+  for (Instruction *inst : intDataOps) {
+    Instruction *nextNode = inst->getNextNode();
+    if (!nextNode) continue;
+    IRBuilder<> IRB(nextNode);
+
+    Value *op0 = inst->getOperand(0);
+    Value *op1 = inst->getOperand(1);
+    Value *v0 = getOrCreateI16Vec(op0, IRB);
+    Value *v1 = getOrCreateI16Vec(op1, IRB);
+    auto opc = cast<BinaryOperator>(inst)->getOpcode();
+
+    // 针对移位指令确保移位量在 [0, 15] 范围内
+    if (opc == Instruction::Shl || opc == Instruction::AShr || opc == Instruction::LShr) {
+      Constant *mask15 = ConstantInt::get(I16Ty, 15);
+      v1 = markInternal(IRB.CreateAnd(v1, ConstantVector::get({mask15, mask15})));
+    }
+
+    Value *vRes = nullptr;
+    if (useSIMD) {
+      vRes = markInternal(IRB.CreateBinOp(opc, v0, v1, inst->getName() + ".v2i16"));
+    } else {
+      Value *a1_0 = markInternal(IRB.CreateExtractElement(v0, ConstantInt::get(I32Ty, 0)));
+      Value *a2_0 = markInternal(IRB.CreateExtractElement(v0, ConstantInt::get(I32Ty, 1)));
+      Value *a1_1 = markInternal(IRB.CreateExtractElement(v1, ConstantInt::get(I32Ty, 0)));
+      Value *a2_1 = markInternal(IRB.CreateExtractElement(v1, ConstantInt::get(I32Ty, 1)));
+      Value *r1 = markInternal(IRB.CreateBinOp(opc, a1_0, a1_1, "i16.a1"));
+      Value *r2 = markInternal(IRB.CreateBinOp(opc, a2_0, a2_1, "i16.a2"));
+      Value *uVec = UndefValue::get(V2I16Ty);
+      Value *t0 = markInternal(IRB.CreateInsertElement(uVec, r1, ConstantInt::get(I32Ty, 0)));
+      vRes = markInternal(IRB.CreateInsertElement(t0, r2, ConstantInt::get(I32Ty, 1)));
+    }
+    i16VecMap[inst] = vRes;
+
+    // 若该 i32 指令流出到 Store、SExt、GEP 或 FP 转换等恢复汇点，插入 SExt i16->i32 与三路一致性恢复
+    bool isRecoverySink = false;
+    for (User *U : inst->users()) {
+      Instruction *uI = dyn_cast<Instruction>(U);
+      if (!uI || std::find(intDataOps.begin(), intDataOps.end(), uI) == intDataOps.end()) {
+        isRecoverySink = true;
+        break;
+      }
+    }
+    if (isRecoverySink) {
+      Value *lane0 = markInternal(IRB.CreateExtractElement(vRes, ConstantInt::get(I32Ty, 0)));
+      Value *lane1 = markInternal(IRB.CreateExtractElement(vRes, ConstantInt::get(I32Ty, 1)));
+      Value *sext0 = markInternal(IRB.CreateSExt(lane0, I32Ty, "i16.sext0"));
+      Value *sext1 = markInternal(IRB.CreateSExt(lane1, I32Ty, "i16.sext1"));
+      Value *votedI32 = markInternal(IRB.CreateCall(
+          VoterApproxI32Fn,
+          {inst, sext0, sext1, ConstantInt::get(I32Ty, 2), ConstantInt::get(I32Ty, (int)critLevel)},
+          "i16.voted"));
+      inst->replaceUsesWithIf(votedI32, [&](Use &U) {
+        Instruction *uI = dyn_cast<Instruction>(U.getUser());
+        return uI == nullptr || uI->getMetadata("atft.voter.internal") == nullptr;
+      });
+      i16VecMap[votedI32] = vRes;
+    }
+  }
+}
 //   - 在 SIMD 模式下，Store 同步点直接采用 LLVM IR 内联指令实现三路阈值表决：
 //     无需调用外部 C 函数，仅用 5 条 SSE/RVV 标量指令完成 |R - A1| <= eff_delta 判定与恢复！
 // ============================================================================
@@ -785,6 +941,8 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
 
   FunctionCallee VoterApproxFn = M->getOrInsertFunction(
       "atft_voter_approx_f64", F64Ty, F64Ty, F64Ty, F64Ty, F64Ty, I32Ty);
+  FunctionCallee VoterApproxReexecFn = M->getOrInsertFunction(
+      "atft_voter_approx_reexec_f64", F64Ty, F64Ty, F64Ty, F64Ty, F64Ty, F64Ty, I32Ty);
 
   FunctionCallee ApproxSinFn = M->getOrInsertFunction("atft_approx_sinf", F32Ty, F32Ty);
   FunctionCallee ApproxCosFn = M->getOrInsertFunction("atft_approx_cosf", F32Ty, F32Ty);
@@ -987,11 +1145,20 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       Value *inVec = getOrCreateApproxVec(inVal, BBEndBuilder);
       vPhi->addIncoming(inVec, inBB);
 
-      // 对跨时间步状态递归 (如 EKF) 采用全内联零函数调用开销的快速表决同步!
+      // 通用静态结构规则 (无任何函数名特判):
+      // 当循环携带的跨迭代状态反馈 PHINode 在回边块 (inBB) 内没有内存 Store 同步点、
+      // 且函数包含多个递归状态环 (phiNodes.size() >= 4) 时，在回边处插入内联快速同步以阻断跨时间步误差发散
       if (!pureApproxOutput) {
         if (auto *inInst = dyn_cast<Instruction>(inVal)) {
-          if (selectedSet.count(inInst) && LI.getLoopDepth(inBB) == 1 &&
-              storeInsts.size() <= 1 && F.getName().contains("ekf")) {
+          bool hasStoreInLatch = false;
+          for (Instruction &BI : *inBB) {
+            if (isa<StoreInst>(&BI)) {
+              hasStoreInLatch = true;
+              break;
+            }
+          }
+          if (selectedSet.count(inInst) && LI.getLoopDepth(inBB) >= 1 &&
+              !hasStoreInLatch && phiNodes.size() >= 4) {
             Value *votedState = createInlineFastApproxVote(BBEndBuilder, M, inVal, inVec, delta);
             PN->setIncomingValue(i, votedState);
           }
@@ -1011,7 +1178,7 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       if (pureApproxOutput) {
         SI->setOperand(0, a1_f64);
       } else if (useSIMD) {
-        // SIMD 混合近似 TMR 在 Store 同步点采用内联快速无分支比较，仅在检测到故障时调用恢复函数:
+        // SIMD 混合近似 TMR 在 Store 同步点采用内联快速无分支比较，仅在检测到故障时转入 ColdBB:
         // 为防止后置 FaultInjectorPass 在内联比较临时变量上二次注入，为内联比较指令标记 "atft.voter.internal"
         auto markVoterInternal = [&](Value *V) -> Value * {
           if (auto *I = dyn_cast<Instruction>(V)) {
@@ -1048,9 +1215,37 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
         BranchBuilder.CreateCondBr(fastPass, ContBB, ColdBB);
 
         IRBuilder<> ColdBuilder(ColdBB);
+        // 对应开题报告 3.4.4.3 分级恢复策略:
+        // 当 critLevel == CRIT_CRITICAL 时，在 ColdBB 冷路径中直接对当前基本块的精确计算切片执行指令级重执行 (Cold-Path Exact Re-execution)，
+        // 实现零正常执行开销、故障时零精度损失的精确重算恢复!
+        Value *reexecExactVal = a1_f64;
+        if (critLevel == CRIT_CRITICAL) {
+          std::map<Value *, Value *> coldReexecMap;
+          for (Instruction &BI : *CurBB) {
+            if (&BI == fastPass || BI.getMetadata("atft.voter.internal") != nullptr) continue;
+            if (isTargetFP64Op(&BI)) {
+              if (BI.getOpcode() == Instruction::FNeg) {
+                Value *op0 = BI.getOperand(0);
+                Value *r0 = coldReexecMap.count(op0) ? coldReexecMap[op0] : op0;
+                coldReexecMap[&BI] = markVoterInternal(ColdBuilder.CreateFNeg(r0, "cold.reexec.fneg"));
+              } else if (auto *BO = dyn_cast<BinaryOperator>(&BI)) {
+                Value *op0 = BO->getOperand(0);
+                Value *op1 = BO->getOperand(1);
+                Value *r0 = coldReexecMap.count(op0) ? coldReexecMap[op0] : op0;
+                Value *r1 = coldReexecMap.count(op1) ? coldReexecMap[op1] : op1;
+                coldReexecMap[&BI] = markVoterInternal(
+                    ColdBuilder.CreateBinOp(BO->getOpcode(), r0, r1, "cold.reexec.bin"));
+              }
+            }
+          }
+          if (coldReexecMap.count(val)) {
+            reexecExactVal = coldReexecMap[val];
+          }
+        }
+
         Value *coldVoted = markVoterInternal(ColdBuilder.CreateCall(
-            VoterApproxFn,
-            {val, a1_f64, a2_f64, ConstantFP::get(F64Ty, delta),
+            VoterApproxReexecFn,
+            {val, reexecExactVal, a1_f64, a2_f64, ConstantFP::get(F64Ty, delta),
              ConstantInt::get(I32Ty, (int)critLevel)},
             "approx_tmr.cold"));
         ColdBuilder.CreateBr(ContBB);
@@ -1073,21 +1268,30 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       }
     }
   }
+
+  // 对包含 32-bit 整数数据运算链的函数同步应用 32-bit -> 16-bit 中间计算结果压缩 (对应开题报告 3.4.2.1)
+  if (!pureApproxOutput) {
+    transformFunctionInt32ToInt16Compression(F, critLevel, useSIMD);
+  }
 }
 
 // ============================================================================
-// 模块 4: 运行时多版本代码生成与动态自适应分发
+// 模块 4: 运行时多版本代码生成与动态自适应分发 (对应开题报告 3.3.2 & 4.2.1)
+//   - 三级关键性代码段 (CRITICAL / SUB_CRITICAL / NON_CRITICAL) 均生成 LOW 与 HIGH 双版本:
+//     * CRITICAL     : LOW 采用混合近似 TMR (budget), HIGH 采用 100% 混合近似 TMR + 冷路径精确重执行
+//     * SUB_CRITICAL : LOW 采用原始轻量版 (或低预算保护), HIGH 切换为 100% 混合近似 TMR (近似替代恢复)
+//     * NON_CRITICAL : LOW 采用原始无保护版, HIGH 切换为 50% 核心算子轻量近似容错版
 // ============================================================================
 void transformFunctionAdaptiveMultiVersion(Function &F, FunctionAnalysisManager &FAM,
                                            CritLevel critLevel, double delta,
                                            const std::string &rankMethod, double budget) {
-  if (critLevel == CRIT_NON_CRITICAL) {
-    return;
-  }
-
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
   Type *I32Ty = Type::getInt32Ty(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+
+  unsigned staticInstCount = 0;
+  for (BasicBlock &BB : F) staticInstCount += BB.size();
 
   ValueToValueMapTy VMapLow, VMapHigh;
   Function *LowFn = CloneFunction(&F, VMapLow);
@@ -1103,9 +1307,13 @@ void transformFunctionAdaptiveMultiVersion(Function &F, FunctionAnalysisManager 
     transformFunctionApproxTMR(*LowFn, LILow, CRIT_CRITICAL, delta, true, rankMethod, budget);
     auto &LIHigh = FAM.getResult<LoopAnalysis>(*HighFn);
     transformFunctionApproxTMR(*HighFn, LIHigh, CRIT_CRITICAL, delta, true, rankMethod, 1.0);
-  } else {
+  } else if (critLevel == CRIT_SUB_CRITICAL) {
     auto &LIHigh = FAM.getResult<LoopAnalysis>(*HighFn);
     transformFunctionApproxTMR(*HighFn, LIHigh, CRIT_SUB_CRITICAL, delta, true, rankMethod, 1.0);
+  } else {
+    // CRIT_NON_CRITICAL: 平静期 (LOW) 零冗余运行，高通量辐射期 (HIGH) 保护前 50% 关键算子并采用安全回退
+    auto &LIHigh = FAM.getResult<LoopAnalysis>(*HighFn);
+    transformFunctionApproxTMR(*HighFn, LIHigh, CRIT_NON_CRITICAL, delta, true, rankMethod, 0.5);
   }
 
   F.deleteBody();
@@ -1114,6 +1322,8 @@ void transformFunctionAdaptiveMultiVersion(Function &F, FunctionAnalysisManager 
   BasicBlock *HighBB = BasicBlock::Create(Ctx, "mode.high", &F);
 
   IRBuilder<> EntryBuilder(EntryBB);
+  FunctionCallee AdvInstFn = M->getOrInsertFunction("atft_advance_insts", Type::getVoidTy(Ctx), I64Ty);
+  EntryBuilder.CreateCall(AdvInstFn, {ConstantInt::get(I64Ty, staticInstCount * 64)});
   FunctionCallee GetModeFn = M->getOrInsertFunction("atft_get_mode", I32Ty);
   Value *modeVal = EntryBuilder.CreateCall(GetModeFn, {}, "prot.mode");
   Value *isHigh = EntryBuilder.CreateICmpEQ(

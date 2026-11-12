@@ -114,6 +114,7 @@ def generate_html_dashboard():
   }}
   .badge-crit {{ background: rgba(239,68,68,0.16); color: #f87171; border: 1px solid rgba(239,68,68,0.35); }}
   .badge-sub {{ background: rgba(245,158,11,0.16); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); }}
+  .badge-non {{ background: rgba(56,189,248,0.16); color: #38bdf8; border: 1px solid rgba(56,189,248,0.35); }}
 
   .kpi-grid {{
     display: grid;
@@ -536,10 +537,13 @@ const avgFI = (pol, col) => {{
     const fiNat = fiMap["native_" + b];
     const fiOurs = fiMap["approx_simd_" + b];
     const isCrit = cr.criticality_level === "CRITICAL";
+    const isSub  = cr.criticality_level === "SUB_CRITICAL";
+    const badgeCls = isCrit ? "badge-crit" : (isSub ? "badge-sub" : "badge-non");
+    const badgeTxt = isCrit ? "关键 (CRITICAL)" : (isSub ? "次关键 (SUB)" : "非关键 (NON)");
     return `<tr>
       <td><code>${{b}}</code></td>
       <td style="color:var(--muted)">${{SUITE_META[b]}}</td>
-      <td><span class="badge ${{isCrit ? 'badge-crit' : 'badge-sub'}}">${{isCrit ? '关键 (CRITICAL)' : '次关键 (SUB)'}}</span> <strong>${{Number(cr.score).toFixed(2)}}</strong></td>
+      <td><span class="badge ${{badgeCls}}">${{badgeTxt}}</span> <strong>${{Number(cr.score).toFixed(2)}}</strong></td>
       <td>${{Number(pa.psnr_db).toFixed(1)}} dB</td>
       <td style="color:#10b981;font-weight:600">${{(lowInst / natInst).toFixed(2)}}×</td>
       <td style="color:#38bdf8;font-weight:600">${{(highInst / natInst).toFixed(2)}}×</td>
@@ -869,8 +873,9 @@ const avgFI = (pol, col) => {{
 
   const displayPairs = [
     ["fp", "native", "Native (无保护)"],
-    ["fp", "approx_simd", "Approx-SIMD (本文方案)"],
+    ["fp", "approx_simd", "Approx-SIMD (FP32向量近似)"],
     ["int", "native", "Native / 纯浮点容错"],
+    ["int", "approx_simd", "Approx-SIMD (i32→i16压缩容错)"],
     ["address", "native", "Native / 纯数据流容错"],
     ["branch", "native", "Native (无保护)"],
     ["branch", "approx_simd", "Approx-SIMD (本文方案)"]
