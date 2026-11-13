@@ -2,7 +2,7 @@
 """
 学术评测看板生成器（全中文严谨学术版，包含 5 个正交核心模块）：
   - 顶部 4 张核心技术指标卡片（纯客观绝对指标与统计口径，不掺杂基线对比）
-  - 模块 1：本方案在 12 个标准基准负载上的端到端综合表现（一表合一）
+  - 模块 1：本方案在 17 个标准基准负载上的端到端综合表现（一表合一）
   - 模块 2：核心机制内部消融与动态响应（阈值 δ 权衡曲线 + 60 窗口辐射脉冲切换轨迹 + 内部消融表）
   - 模块 3：机理剖析与极限压力测试（IEEE-754 位域敏感度剖析 + 空间多比特 MBU 与连续多故障冲击 + 跨 Cache 层级数据规模扩展）
   - 模块 4：与主流容错机制及选择性保护算法的横向对比（EDDI / SWIFT / LLTFI-SID / COAST-TMR / Shoestring / SDCTune / HotPath）
@@ -240,17 +240,17 @@ def generate_html_dashboard():
   <div>
     <span class="meta-tag">LLVM 15.0.7</span>
     <span class="meta-tag">x86_64 &amp; RISC-V (rv64gcv)</span>
-    <span class="meta-tag">12 个标准开源套件负载</span>
+    <span class="meta-tag">17 个标准开源套件负载</span>
     <span class="meta-tag">RQ1 – RQ8 完整评估</span>
   </div>
 </header>
 
 <div class="kpi-grid" id="kpi-container"></div>
 
-<!-- 模块 1：本方案在 12 个标准负载上的端到端综合表现 -->
+<!-- 模块 1：本方案在 17 个标准负载上的端到端综合表现 -->
 <div class="section">
-  <h2>1. 本方案在 12 个标准开源基准负载上的端到端综合表现</h2>
-  <p class="desc">直接编译 <code>third_party/</code> 原版开源套件源码（PolyBench/C 4.2.1、PARSEC 3.0 Black-Scholes、ACCEPT 近似套件、KissFFT 蝶形核及 GNC 飞控负载）。单表汇总静态关键性评分、纯近似分支峰值信噪比 (PSNR)、平静期 (<code>LOW</code>) 与高辐射爆发期 (<code>HIGH</code>) 硬件指令倍率、以及单粒子注入下的静默数据损坏率 (SDC) 与恢复精度。</p>
+  <h2>1. 本方案在 17 个标准开源基准负载上的端到端综合表现</h2>
+  <p class="desc">直接编译 <code>third_party/</code> 原版开源套件源码（PolyBench/C 4.2.1、PARSEC Black-Scholes（llvm-loop-perforation 单文件移植版）、KissFFT 蝶形核）。单表汇总静态关键性评分、纯近似分支峰值信噪比 (PSNR)、平静期 (<code>LOW</code>) 与高辐射爆发期 (<code>HIGH</code>) 硬件指令倍率、以及单粒子注入下的静默数据损坏率 (SDC) 与恢复精度。</p>
   <table id="tbl-ours">
     <thead>
       <tr>
@@ -297,7 +297,7 @@ def generate_html_dashboard():
       <table id="tbl-ablation">
         <thead>
           <tr>
-            <th>内部优化消融项 (12 个负载总计)</th>
+            <th>内部优化消融项 (17 个负载总计)</th>
             <th>硬件退休指令数</th>
             <th>指令倍率</th>
             <th>总耗时 (μs)</th>
@@ -369,10 +369,10 @@ def generate_html_dashboard():
 <!-- 模块 4：与主流容错机制及选择性保护算法的独立横向对比 -->
 <div class="section">
   <h2>4. 与主流容错机制及选择性保护算法的横向对比 (SOTA Baseline Comparison)</h2>
-  <p class="desc">在完全相同的 12 个标准负载与独立评测器下，集中对比四类主流容错机制（<strong>EDDI</strong> [IEEE TR'02]、<strong>SWIFT</strong> [CGO'05]、开源移植 <strong>LLTFI-SID</strong> [<code>third_party/LLTFI</code>]、开源移植 <strong>COAST-TMR</strong> [<code>third_party/coast</code>]）以及四类选择性保护排序算法（<strong>Random</strong>、<strong>HotPath</strong>、<strong>SDCTune</strong> [HPDC'14]、<strong>Shoestring</strong> [ASPLOS'10]）。</p>
+  <p class="desc">在完全相同的 17 个标准负载与独立评测器下，集中对比四类主流容错机制（<strong>EDDI</strong> [IEEE TR'02]、<strong>SWIFT</strong> [CGO'05]、<strong>LLTFI-SID</strong>（按 LLTFI 指令复制语义在本框架内复现）、<strong>COAST-TMR</strong>（按 COAST [IEEE TNS'19] 语义在本框架内复现））以及四类选择性保护排序算法（<strong>Random</strong>、<strong>HotPath</strong>、<strong>SDCTune</strong> [CASES'14]、<strong>Shoestring</strong> [ASPLOS'10]）。</p>
   <div class="grid-equal">
     <div class="panel-box">
-      <h3>4.1 容错冗余机制横向对比 (12 个标准负载均值)</h3>
+      <h3>4.1 容错冗余机制横向对比 (17 个标准负载均值)</h3>
       <p class="sub-desc">客观对比双模检错方案 (EDDI / SWIFT)、开源双模位与修复 (LLTFI-SID) 与三模表决方案 (COAST-TMR / 本文方案)。</p>
       <svg class="chart" id="svg-rq1-baseline" viewBox="0 0 580 215"></svg>
       <table id="tbl-baseline-mech">
@@ -437,7 +437,7 @@ def generate_html_dashboard():
     </div>
     <div class="panel-box">
       <h3>5.2 RISC-V (rv64gcv RVV 1.0) vs. x86_64 跨架构对比与 QEMU 验证</h3>
-      <p class="sub-desc">对比 <code>rv64gcv</code> 与 <code>x86_64</code> 在 12 个负载上的静态代码生成结构、指令膨胀倍率，以及 <code>qemu-riscv64</code> vs. <code>x86_64</code> 的注错一致性。</p>
+      <p class="sub-desc">对比 <code>rv64gcv</code> 与 <code>x86_64</code> 在 17 个负载上的静态代码生成结构、指令膨胀倍率，以及 <code>qemu-riscv64</code> vs. <code>x86_64</code> 的注错一致性。</p>
       <svg class="chart" id="svg-rq8-rv" viewBox="0 0 580 215"></svg>
       <table id="tbl-rq8-rv">
         <thead>
@@ -500,7 +500,7 @@ const avgFI = (pol, col) => {{
       sub: `辐射平静期 (LOW) 为 ${{(instLow / instNat).toFixed(2)}}×，高通量爆发期 (HIGH) 为 ${{(instSIMD / instNat).toFixed(2)}}×`
     }},
     {{
-      title: "12 个标准负载平均 SDC 率",
+      title: "17 个标准负载平均 SDC 率",
       val: avgFI("approx_simd", "sdc_pct").toFixed(2) + "%",
       sub: `x86_64 与 RISC-V (qemu-riscv64) 双平台浮点单粒子翻转盲注均实现 0.00% SDC`
     }},
@@ -525,7 +525,7 @@ const avgFI = (pol, col) => {{
   `).join("");
 }})();
 
-// 2. 模块 1：本方案在 12 个标准负载上的端到端综合表现表
+// 2. 模块 1：本方案在 17 个标准负载上的端到端综合表现表
 (function renderOursTable() {{
   const benches = Object.keys(SUITE_META);
   document.querySelector("#tbl-ours tbody").innerHTML = benches.map(b => {{
@@ -753,8 +753,8 @@ const avgFI = (pol, col) => {{
     {{ pol: "native",      short: "Native",      name: "Native (无保护)",          cite: "Baseline" }},
     {{ pol: "eddi",        short: "EDDI",        name: "EDDI (全复制双模检错)",    cite: "IEEE TR'02 [论文复现]" }},
     {{ pol: "swift",       short: "SWIFT",       name: "SWIFT (寄存器双模检错)",   cite: "CGO'05 [论文复现]" }},
-    {{ pol: "lltfi_sid",   short: "LLTFI-SID",   name: "LLTFI-SID (双模位与修复)", cite: "third_party/LLTFI [开源移植]" }},
-    {{ pol: "exact_tmr",   short: "COAST-TMR",   name: "COAST-TMR (精确三模表决)", cite: "third_party/coast [开源移植]" }},
+    {{ pol: "lltfi_sid",   short: "LLTFI-SID",   name: "LLTFI-SID (双模位与修复)", cite: "LLTFI 指令复制语义 [本框架复现]" }},
+    {{ pol: "exact_tmr",   short: "COAST-TMR",   name: "COAST-TMR (精确三模表决)", cite: "IEEE TNS'19 COAST TMR 语义 [本框架复现]" }},
     {{ pol: "approx_simd", short: "Approx-SIMD", name: "Approx-SIMD (本文方案)",   cite: "Proposed" }}
   ];
 

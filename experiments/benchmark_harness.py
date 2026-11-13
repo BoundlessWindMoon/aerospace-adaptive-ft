@@ -2,11 +2,19 @@
 """
 Standalone Evaluation Harness & SOTA Baseline Reproduction Runner
 
-Benchmarks (12 Standard Workloads across 4 Suites):
-  - PolyBench/C 4.2.1: pb_gemm, pb_2mm, pb_atax, pb_bicg, pb_jacobi2d
-  - PARSEC 3.0 & AxC:  parsec_blackscholes, axc_sobel, axc_gaussian
-  - Signal Processing: dsp_kissfft, dsp_fir
-  - Spacecraft GNC:    gnc_pid, gnc_ekf
+Benchmarks (17 Standard Workloads across 5 Upstream Suites):
+  - PolyBench/C 4.2.1 (FP64) : pb_gemm, pb_2mm, pb_atax, pb_bicg, pb_jacobi2d,
+                               pb_ludcmp, pb_durbin, pb_deriche
+  - PolyBench/C 4.2.1 (INT32): pb_floyd_warshall, pb_nussinov
+  - PARSEC Black-Scholes (llvm-loop-perforation single-file port): parsec_blackscholes
+  - KissFFT v1.3.1           : dsp_kissfft
+  - llvm-loop-perforation    : axc_sobel (upstream benchmarks/sobel/sobel.c)
+  - COAST tests (BYU/LANL)   : coast_crc16, coast_quicksort
+  - OBPMark v0.3 (ESA + BSC) : obpmark_image_prep, obpmark_image_proc
+                               (benchmark 1.1 on-board image corrections & calibrations)
+
+All 17 kernels are compiled directly from unmodified upstream sources in third_party/;
+no self-written compute kernels remain.
 
 CLI Examples:
   # Run all research questions (RQ1 - RQ8):
@@ -22,13 +30,45 @@ CLI Examples:
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-ROOT_DIR = Path("/home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft")
+
+def wilson_ci95(k, n):
+    """SDC/故障率的 95% 置信区间（Wilson score interval，百分比形式）。
+
+    故障注入是伯努利抽样，单点率值必须附置信区间才有可比性
+    （口径见 Leveugle et al., "Statistical fault injection: Quantified
+    error and confidence", DATE 2009）。小 p 时 Wilson 区间优于正态近似。
+    """
+    if n <= 0:
+        return 0.0, 0.0, 0.0
+    z = 1.959963985
+    p = k / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    lo = max(0.0, center - half)
+    hi = min(1.0, center + half)
+    return 100.0 * lo, 100.0 * hi, 100.0 * (hi - lo) / 2.0
+
+# ---------------------------------------------------------------------------
+# 路径与工具链：全部可配置，不写死绝对路径与版本号
+#   - 仓库根目录由本文件位置推导（experiments/ 的上一级）
+#   - 工具名与交叉编译环境走环境变量，便于换 LLVM 版本或换机器
+# ---------------------------------------------------------------------------
+ROOT_DIR = Path(os.environ.get("ATFT_ROOT", Path(__file__).resolve().parent.parent))
+CLANG = os.environ.get("ATFT_CLANG", "clang-15")
+CLANGXX = os.environ.get("ATFT_CLANGXX", "clang++-15")
+OPT = os.environ.get("ATFT_OPT", "opt-15")
+RISCV_TRIPLE = os.environ.get("ATFT_RISCV_TRIPLE", "riscv64-linux-gnu")
+RISCV_SYSROOT = os.environ.get("ATFT_RISCV_SYSROOT", "/usr/riscv64-linux-gnu")
+QEMU_RISCV = os.environ.get("ATFT_QEMU_RISCV", "qemu-riscv64")
+
 BUILD_DIR = ROOT_DIR / "build"
 TMP_DIR = BUILD_DIR / "tmp"
 RES_DIR = ROOT_DIR / "results"
@@ -44,9 +84,39 @@ LIB_HARNESS_RT = BUILD_DIR / "libharness_rt.a"
 
 CFLAGS = ["-O2", "-fno-unroll-loops", "-fno-vectorize", "-fno-slp-vectorize"]
 
+# 被测负载的头文件搜索路径：新增一个上游套件只需在这里加一行
+BENCH_INCLUDE_DIRS = [
+    "include",
+    "benchmarks/obpmark_shim",
+    "third_party/polybench-c/utilities",
+    "third_party/kissfft",
+    "third_party/obpmark/src/common",
+    "third_party/obpmark/src/1.1-image/src/ports/cpu",
+]
+# 评测器（eval_suite + harness 运行时）的头文件搜索路径
+HARNESS_INCLUDE_DIRS = ["include", "harness", "benchmarks"]
 
-def run_cmd(cmd, cwd=ROOT_DIR, allow_nonzero=False):
-    res = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def inc_flags(dirs):
+    return [f"-I{d}" for d in dirs]
+
+
+# 单条命令墙钟上限：注错后的被测程序可能死循环（整数/分支位翻转会破坏循环边界），
+# 没有上限时一次挂死就会无限阻塞整个 campaign。超时按失败处理并返回已有 stdout，
+# 由调用方决定是否致命。
+DEFAULT_CMD_TIMEOUT_S = 900
+
+
+def run_cmd(cmd, cwd=ROOT_DIR, allow_nonzero=False, timeout_s=DEFAULT_CMD_TIMEOUT_S):
+    try:
+        res = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as e:
+        partial = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        msg = f"[Timeout {timeout_s}s] {' '.join(map(str, cmd))}"
+        if allow_nonzero:
+            print("  !! " + msg)
+            return partial
+        raise RuntimeError(msg) from None
     if res.returncode != 0 and not allow_nonzero:
         raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(map(str, cmd))}\n{res.stderr}")
     return res.stdout
@@ -59,21 +129,21 @@ def build_infrastructure(arch="x86_64"):
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
-    run_cmd(["cmake", "..", "-DCMAKE_C_COMPILER=clang-15", "-DCMAKE_CXX_COMPILER=clang++-15"], cwd=BUILD_DIR)
+    run_cmd(["cmake", "..", f"-DCMAKE_C_COMPILER={CLANG}", f"-DCMAKE_CXX_COMPILER={CLANGXX}"], cwd=BUILD_DIR)
     run_cmd(["make", "-j4"], cwd=BUILD_DIR)
 
     suffix = f"_{arch}" if arch != "x86_64" else ""
     raw_ll = BUILD_DIR / f"benchmarks_raw{suffix}.ll"
     ssa_ll = BUILD_DIR / f"benchmarks_ssa{suffix}.ll"
-    target_flags = ["--target=riscv64-linux-gnu", "-march=rv64gc"] if arch == "riscv64" else []
+    target_flags = [f"--target={RISCV_TRIPLE}", "-march=rv64gc"] if arch == "riscv64" else []
     run_cmd([
-        "clang-15", *target_flags, "-O1", "-Xclang", "-disable-llvm-passes",
+        CLANG, *target_flags, "-O1", "-Xclang", "-disable-llvm-passes",
         "-S", "-emit-llvm", "benchmarks/benchmarks.c",
-        "-Iinclude", "-Ithird_party/polybench-c/utilities", "-Ithird_party/kissfft",
+        *inc_flags(BENCH_INCLUDE_DIRS),
         "-o", str(raw_ll)
     ])
     run_cmd([
-        "opt-15", "-passes=always-inline,sroa,mem2reg,loop-simplify",
+        OPT, "-passes=always-inline,sroa,mem2reg,loop-simplify",
         "-S", str(raw_ll), "-o", str(ssa_ll)
     ])
     return ssa_ll
@@ -87,7 +157,7 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
     sut_bin = BUILD_DIR / f"bin_{tag}_{arch}"
 
     opt_cmd = [
-        "opt-15", f"-load-pass-plugin={PASS_POLICY_SO}",
+        OPT, f"-load-pass-plugin={PASS_POLICY_SO}",
         "-passes=adaptive-ft,verify",
         f"-atft-mode={mode}",
         f"-atft-rank={rank}",
@@ -102,17 +172,17 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
 
     if arch == "riscv64":
         cc_cmd = [
-            "clang-15", "--target=riscv64-linux-gnu", "-march=rv64gc",
+            CLANG, f"--target={RISCV_TRIPLE}", "-march=rv64gc",
             *CFLAGS, "experiments/eval_suite.c", str(sut_ll),
             "runtime/atft_runtime.c", "harness/harness_rt.c",
-            "-Iinclude", "-Iharness", "-Ibenchmarks", "-lm", "-o", str(sut_bin)
+            *inc_flags(HARNESS_INCLUDE_DIRS), "-lm", "-o", str(sut_bin)
         ]
-        exec_prefix = ["qemu-riscv64", "-L", "/usr/riscv64-linux-gnu"]
+        exec_prefix = [QEMU_RISCV, "-L", RISCV_SYSROOT]
     else:
         cc_cmd = [
-            "clang-15", *CFLAGS, "experiments/eval_suite.c", str(sut_ll),
+            CLANG, *CFLAGS, "experiments/eval_suite.c", str(sut_ll),
             str(LIB_ATFT_RT), str(LIB_HARNESS_RT),
-            "-Iinclude", "-Iharness", "-Ibenchmarks", "-lm", "-o", str(sut_bin)
+            *inc_flags(HARNESS_INCLUDE_DIRS), "-lm", "-o", str(sut_bin)
         ]
         exec_prefix = []
 
@@ -145,26 +215,27 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
         sut_fi_ll = BUILD_DIR / f"sut_{tag}_fi_{fi_target_type}.ll"
         sut_fi_bin = BUILD_DIR / f"bin_{tag}_fi_{fi_target_type}_{arch}"
         run_cmd([
-            "opt-15", f"-load-pass-plugin={PASS_FI_SO}",
+            OPT, f"-load-pass-plugin={PASS_FI_SO}",
             "-passes=standalone-fi,verify",
             f"-fi-target-type={fi_target_type}",
             "-S", str(sut_ll), "-o", str(sut_fi_ll)
         ])
         if arch == "riscv64":
             fi_cc_cmd = [
-                "clang-15", "--target=riscv64-linux-gnu", "-march=rv64gc",
+                CLANG, f"--target={RISCV_TRIPLE}", "-march=rv64gc",
                 *CFLAGS, "experiments/eval_suite.c", str(sut_fi_ll),
                 "runtime/atft_runtime.c", "harness/harness_rt.c",
-                "-Iinclude", "-Iharness", "-Ibenchmarks", "-lm", "-o", str(sut_fi_bin)
+                *inc_flags(HARNESS_INCLUDE_DIRS), "-lm", "-o", str(sut_fi_bin)
             ]
         else:
             fi_cc_cmd = [
-                "clang-15", *CFLAGS, "experiments/eval_suite.c", str(sut_fi_ll),
+                CLANG, *CFLAGS, "experiments/eval_suite.c", str(sut_fi_ll),
                 str(LIB_ATFT_RT), str(LIB_HARNESS_RT),
-                "-Iinclude", "-Iharness", "-Ibenchmarks", "-lm", "-o", str(sut_fi_bin)
+                *inc_flags(HARNESS_INCLUDE_DIRS), "-lm", "-o", str(sut_fi_bin)
             ]
         run_cmd(fi_cc_cmd)
-        fi_out = run_cmd([*exec_prefix, str(sut_fi_bin), "--fi-one", tag, str(GOLDEN_DIR), str(fi_trials)])
+        fi_out = run_cmd([*exec_prefix, str(sut_fi_bin), "--fi-one", tag, str(GOLDEN_DIR), str(fi_trials)],
+                         allow_nonzero=True, timeout_s=300)
         for line in fi_out.strip().splitlines():
             if line.startswith("FI5_CSV,"):
                 parts = line.split(",")
@@ -182,6 +253,15 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
                     "due_pct": float(parts[9]),
                     "avg_valid_rel_err": float(parts[10]),
                 })
+                n_trials = fi_rows[-1]["trials"]
+                k_sdc = round(fi_rows[-1]["sdc_pct"] / 100.0 * n_trials)
+                lo, hi, half = wilson_ci95(k_sdc, n_trials)
+                fi_rows[-1]["sdc_ci95_lo"] = round(lo, 3)
+                fi_rows[-1]["sdc_ci95_hi"] = round(hi, 3)
+                fi_rows[-1]["sdc_ci95_halfwidth"] = round(half, 3)
+                k_det = round(fi_rows[-1]["det_recovered_pct"] / 100.0 * n_trials)
+                dlo, dhi, dhalf = wilson_ci95(k_det, n_trials)
+                fi_rows[-1]["det_recovered_ci95_halfwidth"] = round(dhalf, 3)
 
     return pmu_rows, fi_rows
 
@@ -190,7 +270,7 @@ def run_rq8_instruction_category_and_riscv(ssa_ll):
     """
     RQ8:
       (A) Multi-Category Instruction Fault Injection Breakdown (FP vs Int vs Address vs Branch)
-          comparing Native, SWIFT (CGO'05), LLTFI-SID (Open-source), COAST-TMR (IEEE TNS'19), and Approx-SIMD.
+          comparing Native, SWIFT (CGO'05), LLTFI-SID (reimplemented from LLTFI semantics), COAST-TMR (reimplemented from COAST, IEEE TNS'19), and Approx-SIMD.
       (B) RISC-V (rv64gc / rv64gcv RVV 1.0) Cross-Compilation Codegen Analysis & QEMU Execution Verification.
     """
     print("=== [RQ8-A] Evaluating Multi-Category Instruction Fault Injection (fp / int / address / branch) ===")
@@ -247,7 +327,7 @@ def run_rq8_instruction_category_and_riscv(ssa_ll):
     for pol_tag, pol_mode in rv_policies:
         rv_tag = f"{pol_tag}_rv64"
         do_rv_fi = pol_tag in ("native", "exact_tmr", "approx_simd")
-        print(f"  -> Cross-compiling & executing RISC-V ELF under qemu-riscv64 for [{pol_tag}] (run_fi={do_rv_fi})...")
+        print(f"  -> Cross-compiling & executing RISC-V ELF under {QEMU_RISCV} for [{pol_tag}] (run_fi={do_rv_fi})...")
         pmu_rv, fi_rv = compile_and_evaluate_policy(
             ssa_rv_ll, rv_tag, mode=pol_mode, rank="semantic", budget=1.0,
             delta=5e-5, fi_trials=(120 if do_rv_fi else 0), dump_golden=(pol_tag == "native"),
@@ -266,7 +346,7 @@ def run_rq8_instruction_category_and_riscv(ssa_ll):
         )
         rvv_s = BUILD_DIR / f"sut_{pol_tag}_rv64gcv.s"
         run_cmd([
-            "clang-15", "--target=riscv64-linux-gnu", "-march=rv64gcv",
+            CLANG, f"--target={RISCV_TRIPLE}", "-march=rv64gcv",
             "-mllvm", "-riscv-v-vector-bits-min=128",
             *CFLAGS, "-S", str(rvv_ll), "-o", str(rvv_s)
         ])
@@ -363,7 +443,39 @@ def save_or_diff_snapshot(save_name=None, diff_name=None):
                       f"SDC {o_sdc:.2f}% -> {c_sdc:.2f}% ({c_sdc-o_sdc:+.2f}%)")
 
 
+def print_smoke_summary(pmu_rows, fi_rows):
+    native = {r["benchmark"]: r["hw_insts"] for r in pmu_rows if r["policy"] == "native"}
+    fi_map = {(r["policy"], r["benchmark"]): r for r in fi_rows}
+    pols = []
+    for r in pmu_rows:
+        if r["policy"] not in pols:
+            pols.append(r["policy"])
+    print("\n=== [Smoke] 每策略汇总（指令倍率为全部负载均值） ===")
+    print(f"{'policy':14s} {'instRatio':>9s} {'maxRelErr':>11s} {'SDC%':>7s} {'±CI':>6s} {'DUE%':>6s}")
+    for pol in pols:
+        rs = [r for r in pmu_rows if r["policy"] == pol]
+        ratio = sum(r["hw_insts"] / max(1, native.get(r["benchmark"], 1)) for r in rs) / len(rs)
+        max_err = max(r["rel_l2_err"] for r in rs)
+        frs = [fi_map[(pol, r["benchmark"])] for r in rs if (pol, r["benchmark"]) in fi_map]
+        if frs:
+            sdc = sum(x["sdc_pct"] for x in frs) / len(frs)
+            ci = sum(x["sdc_ci95_halfwidth"] for x in frs) / len(frs)
+            due = sum(x["due_pct"] for x in frs) / len(frs)
+            print(f"{pol:14s} {ratio:9.2f} {max_err:11.3e} {sdc:7.2f} {ci:6.2f} {due:6.2f}")
+        else:
+            print(f"{pol:14s} {ratio:9.2f} {max_err:11.3e} {'-':>7s} {'-':>6s} {'-':>6s}")
+    print("=== [Smoke] 未写入 results/*.csv（smoke 模式不覆盖正式数据） ===\n")
+
+
 def run_selected_research_questions(args):
+    if args.smoke:
+        args.rq = "rq1"
+        args.trials = args.smoke_trials
+        if args.policy == "all":
+            args.policy = args.smoke_policies
+        args.save_snapshot = None
+        print(f"=== [Smoke 模式 | 默认] RQ1 | policies={args.policy} | "
+              f"trials={args.trials} | 不写 results/*.csv | 全量请加 --full ===")
     print("=== [Step 0] Building Decoupled Policy Pass & Standalone Evaluation Harness ===")
     ssa_ll = build_infrastructure()
 
@@ -380,10 +492,10 @@ def run_selected_research_questions(args):
                 native_inst_map[r["benchmark"]] = int(r["hw_insts"])
 
     # =========================================================================
-    # RQ1: Redundancy Mechanism Comparison across 12 Standard Benchmarks
+    # RQ1: Redundancy Mechanism Comparison across 17 Standard Benchmarks
     # =========================================================================
     if run_all or "rq1" in rqs:
-        print("=== [RQ1] Evaluating SOTA Baselines & Proposed Methods across 12 Benchmarks ===")
+        print("=== [RQ1] Evaluating SOTA Baselines & Proposed Methods across 17 Benchmarks ===")
         core_configs = [
             ("native",        "native",        1.0, 5e-5, True,  True),
             ("pure_approx",   "pure-approx",   1.0, 5e-5, False, False),
@@ -425,6 +537,23 @@ def run_selected_research_questions(args):
             fr["norm_hw_inst_ratio"] = round(norm_inst_overhead, 3)
             fr["mwtf_sdc"] = round(1.0 / (norm_inst_overhead * sdc_prob), 2)
             fr["mwtf_total"] = round(1.0 / (norm_inst_overhead * fail_prob), 2)
+
+        if args.smoke:
+            print_smoke_summary(rq1_pmu_all, rq1_fi_all)
+
+        # fp campaign 写入主 CSV（看板默认口径）；其他注错类别写入带后缀的 CSV，
+        # 避免"跑了但没落盘"导致结论与数据不一致
+        if not selected_policies and args.arch == "x86_64" and args.fi_type != "fp":
+            suffix = args.fi_type
+            with open(RES_DIR / f"rq1_pmu_performance_qor_{suffix}.csv", "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rq1_pmu_all[0].keys()))
+                writer.writeheader()
+                writer.writerows(rq1_pmu_all)
+            with open(RES_DIR / f"rq1_fault_injection_outcomes_{suffix}.csv", "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rq1_fi_all[0].keys()))
+                writer.writeheader()
+                writer.writerows(rq1_fi_all)
+            print(f"  -> Wrote rq1_fault_injection_outcomes_{suffix}.csv ({len(rq1_fi_all)} rows)")
 
         if not selected_policies and args.arch == "x86_64" and args.fi_type == "fp":
             with open(RES_DIR / "rq1_pmu_performance_qor.csv", "w", newline="") as f:
@@ -633,7 +762,20 @@ def parse_args():
                         help="Save resulting CSVs into results/snapshots/<NAME>")
     parser.add_argument("--diff-snapshot", default=None,
                         help="Compare current results against results/snapshots/<NAME>")
-    return parser.parse_args()
+    parser.add_argument("--smoke", dest="smoke", action="store_true", default=None,
+                        help="Smoke 模式（默认）：只跑 RQ1、3 个策略、少量注入（~10s），"
+                             "打印汇总表且不覆盖 results/*.csv")
+    parser.add_argument("--full", dest="smoke", action="store_false",
+                        help="全量模式：按 --rq/--trials 跑完整 campaign 并写入 results/*.csv")
+    parser.add_argument("--smoke-trials", type=int, default=60,
+                        help="Smoke 模式每个负载的注入次数（默认 60）")
+    parser.add_argument("--smoke-policies", default="native,exact_tmr,approx_simd",
+                        help="Smoke 模式评估的策略列表")
+    args = parser.parse_args()
+    if args.smoke is None:
+        # 默认 smoke：全量要显式 --full（全量约 8 分钟，smoke 约 10 秒）
+        args.smoke = True
+    return args
 
 
 if __name__ == "__main__":

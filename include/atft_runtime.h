@@ -107,18 +107,10 @@ float atft_approx_sinf(float x);
 float atft_approx_cosf(float x);
 float atft_approx_expf(float x);
 
-// 面向两条同构近似路径的 2-lane SIMD 打包计算辅助函数 (对应 3.4.3 自动向量化加速)
-void atft_simd2_fmul_fadd_f32(float a1, float a2, float b1, float b2, float c1, float c2,
-                              float *out1, float *out2);
 
 // 单比特翻转故障注入函数 (供 LLVM IR 插桩或实验评估使用, 参考 LLFI/LLTFI)
-void   atft_configure_fi(int enabled, double prob, int target_branch, uint32_t seed);
-double atft_inject_bitflip_f64(double val, int branch_id);
-float  atft_inject_bitflip_f32(float val, int branch_id);
-int32_t atft_inject_bitflip_i32(int32_t val, int branch_id);
 
 // 打印统计摘要
-void atft_print_summary(const char *tag);
 
 #ifdef __cplusplus
 }
