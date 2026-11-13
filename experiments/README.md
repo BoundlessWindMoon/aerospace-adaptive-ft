@@ -20,9 +20,40 @@ python3 experiments/generate_html_report.py         # 生成 results/eval_dashbo
 | `--trials 1000` | 每个负载的注入次数 |
 | `--fi-type fp\|int\|address\|branch\|all` | 注错的指令类别 |
 | `--smoke-policies` / `--smoke-trials` | smoke 模式的策略与注入次数 |
+| `--config path.yaml` | 指定配置文件（默认 `experiments/config/default.yaml`） |
 | `--save-snapshot NAME` / `--diff-snapshot NAME` | 存档与对比 `results/snapshots/NAME` |
 
 工具链位置由环境变量覆盖：`ATFT_ROOT`、`ATFT_CLANG`、`ATFT_CLANGXX`、`ATFT_OPT`、`ATFT_QEMU_RISCV`、`ATFT_RISCV_TRIPLE`、`ATFT_RISCV_SYSROOT`。
+
+## 配置
+
+实验参数在 `experiments/config/default.yaml`，加载顺序：内置默认值 ← YAML ← 命令行。
+
+```yaml
+trials: 1000
+thresholds:                  # 通过环境变量传给 eval_suite
+  sdc_rel_err: 0.01          # 浮点负载判为 SDC 的相对误差（整数负载恒为按位精确）
+  masked_rel_err: 1.0e-12
+  trial_watchdog_ms: 100     # 单次试验子进程的挂死上限
+  step_budget_factor: 50     # 动态指令预算 = 无故障剖析步数 x 本系数
+smoke: {trials: 60, policies: [native, exact_tmr, approx_simd]}
+policies:                    # RQ1 参与对比的策略
+  - {tag: native,      mode: native,      golden: true, fi: true}
+  - {tag: approx_simd, mode: approx-simd, fi: true, delta: 5.0e-5}
+grids:
+  rq2: {budgets: [0.25, 0.5, 0.75, 1.0], rank_methods: [semantic, sdctune, shoestring, hotpath, random], trials: 300}
+  rq3: {deltas: [1.0e-7, 1.0e-5, 5.0e-5, 1.0e-3, 5.0e-2, 5.0e-1], trials: 300}
+  rq8: {categories: [fp, int, address, branch], policies: [native, swift, exact_tmr, approx_simd], trials: 120}
+defaults: {budget: 1.0, delta: 5.0e-5, weights: {w1: 2.5, w2: 1.8, w3: 0.8}}
+```
+
+换一组对比实验（加策略、改 δ 网格、调判据阈值）只改 YAML：
+
+```bash
+python3 experiments/benchmark_harness.py --full --rq rq3 --config my.yaml
+```
+
+负载清单与保护方法不在 YAML 里：加负载要写 C（见下），加方法要写 Pass。
 
 ## 三层结构
 

@@ -59,6 +59,34 @@ static void install_crash_handlers(void) {
 }
 
 // ============================================================================
+// 可配置项（由环境变量注入，默认值即内置基线）
+//
+// 判据阈值与看护参数不写死在代码里：benchmark_harness.py 从 YAML 读出后
+// 通过环境变量传进来，这样"实验怎么判"是配置而不是源码。
+// ============================================================================
+typedef struct {
+    double        sdc_rel_err;     // 浮点负载判为 SDC 的相对误差阈值
+    double        masked_rel_err;  // 判为完全掩盖的相对误差阈值
+    long          watchdog_us;     // 单次注错试验的子进程挂死上限
+    unsigned long budget_factor;   // 动态指令预算 = 无故障剖析步数 x 本系数
+} eval_config_t;
+
+static eval_config_t g_cfg = { 0.01, 1e-12, 100000L, 50UL };
+
+static void eval_config_from_env(void) {
+    const char *v;
+    if ((v = getenv("ATFT_SDC_REL_ERR")) && *v)        g_cfg.sdc_rel_err = atof(v);
+    if ((v = getenv("ATFT_MASKED_REL_ERR")) && *v)     g_cfg.masked_rel_err = atof(v);
+    if ((v = getenv("ATFT_TRIAL_WATCHDOG_MS")) && *v)  g_cfg.watchdog_us = atol(v) * 1000L;
+    if ((v = getenv("ATFT_STEP_BUDGET_FACTOR")) && *v) g_cfg.budget_factor = strtoul(v, NULL, 10);
+
+    if (g_cfg.sdc_rel_err <= 0.0)    g_cfg.sdc_rel_err = 0.01;
+    if (g_cfg.masked_rel_err < 0.0)  g_cfg.masked_rel_err = 1e-12;
+    if (g_cfg.watchdog_us <= 0L)     g_cfg.watchdog_us = 100000L;
+    if (g_cfg.budget_factor == 0UL)  g_cfg.budget_factor = 50UL;
+}
+
+// ============================================================================
 // 基准注册表（声明式）
 //
 // 新增一个负载 = 在 BENCHES[] 里加一行 + 在 reset/invoke/export 三个 switch 里
@@ -653,16 +681,16 @@ static void fi_stats_accumulate(fi_stats_t *st, int b, int child_ok,
         return;
     }
     // 整数负载不允许近似容忍：任何非零偏差即 SDC
-    double sdc_threshold = bench_is_integer(b) ? 0.0 : 0.01;
+    double sdc_threshold = bench_is_integer(b) ? 0.0 : g_cfg.sdc_rel_err;
     if (r->has_nan_or_inf || r->rel_l2_err > sdc_threshold) {
         st->sdc++;
         return;
     }
     st->valid_runs++;
     st->sum_valid_rel_err += r->rel_l2_err;
-    if (r->fault_detected)            st->det_rec++;
-    else if (r->rel_l2_err <= 1e-12)  st->masked++;
-    else                              st->benign++;
+    if (r->fault_detected)                        st->det_rec++;
+    else if (r->rel_l2_err <= g_cfg.masked_rel_err) st->masked++;
+    else                                          st->benign++;
 }
 
 // 对单个 benchmark 跑 trials 次注入；golden 与动态步数在内部完成剖析
@@ -722,7 +750,7 @@ static void fi_run_campaign(suite_workspace_t *ws, int b, const char *policy_nam
         if (pid == 0) {
             struct itimerval cw;
             memset(&cw, 0, sizeof(cw));
-            cw.it_value.tv_usec = 100000; // 100ms 挂死上限，默认处置直接自杀
+            cw.it_value.tv_usec = g_cfg.watchdog_us; // 挂死上限，默认处置直接自杀
             signal(SIGALRM, SIG_DFL);
             setitimer(ITIMER_REAL, &cw, NULL);
 
@@ -732,7 +760,7 @@ static void fi_run_campaign(suite_workspace_t *ws, int b, const char *policy_nam
 
             harness_fi_arm_mbu_or_burst(spec.steps, spec.bits, spec.n_events, spec.mbu_width);
             // 预算设为无故障剖析步数的 50 倍：正常执行不可能超过，死循环必然超过
-            harness_fi_set_step_budget(st->total_dyn_insts * 50ULL);
+            harness_fi_set_step_budget(st->total_dyn_insts * (uint64_t)g_cfg.budget_factor);
 
             memset(ws->out_ptrs[b], 0, (size_t)ws->out_sizes[b] * sizeof(double));
             invoke_benchmark(ws, b);
@@ -1091,6 +1119,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         return 1;
     }
+    eval_config_from_env();
     if (strcmp(argv[1], "--dump-golden") == 0 && argc >= 3) {
         return run_pmu_perf_and_qor("native", argv[2], 1);
     } else if (strcmp(argv[1], "--pmu-perf") == 0 && argc >= 4) {

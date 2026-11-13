@@ -100,6 +100,87 @@ def inc_flags(dirs):
     return [f"-I{d}" for d in dirs]
 
 
+# ---------------------------------------------------------------------------
+# 配置加载：内置默认值 <- YAML <- 命令行
+# 实验参数（策略清单、参数网格、判据阈值）都在 YAML 里，换一组对比不改源码。
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG_PATH = ROOT_DIR / "experiments" / "config" / "default.yaml"
+
+BUILTIN_CONFIG = {
+    "trials": 1000,
+    "thresholds": {
+        "sdc_rel_err": 0.01,
+        "masked_rel_err": 1.0e-12,
+        "trial_watchdog_ms": 100,
+        "step_budget_factor": 50,
+    },
+    "smoke": {"trials": 60, "policies": ["native", "exact_tmr", "approx_simd"]},
+    "policies": [
+        {"tag": "native", "mode": "native", "golden": True, "fi": True},
+        {"tag": "exact_tmr", "mode": "exact-tmr", "fi": True},
+        {"tag": "approx_simd", "mode": "approx-simd", "fi": True},
+    ],
+    "grids": {
+        "rq2": {"budgets": [0.25, 0.50, 0.75, 1.00],
+                "rank_methods": ["semantic", "sdctune", "shoestring", "hotpath", "random"]},
+        "rq3": {"deltas": [1e-7, 1e-5, 5e-5, 1e-3, 5e-2, 5e-1]},
+        "rq8": {"categories": ["fp", "int", "address", "branch"],
+                "policies": ["native", "swift", "lltfi_sid", "exact_tmr", "approx_simd"]},
+    },
+    "defaults": {"budget": 1.0, "delta": 5.0e-5, "weights": {"w1": 2.5, "w2": 1.8, "w3": 0.8}},
+}
+
+
+def _deep_merge(base, override):
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path=None):
+    cfg_path = Path(path) if path else DEFAULT_CONFIG_PATH
+    if not cfg_path.exists():
+        if path:
+            raise RuntimeError(f"配置文件不存在: {cfg_path}")
+        return dict(BUILTIN_CONFIG)
+    try:
+        import yaml
+    except ImportError:
+        print(f"[config] 未安装 PyYAML，忽略 {cfg_path}，使用内置默认值")
+        return dict(BUILTIN_CONFIG)
+    with open(cfg_path, encoding="utf8") as f:
+        loaded = yaml.safe_load(f) or {}
+    return _deep_merge(BUILTIN_CONFIG, loaded)
+
+
+def apply_threshold_env(cfg):
+    """把判据阈值写入环境变量，由 eval_suite 在启动时读取。"""
+    th = cfg.get("thresholds", {})
+    os.environ["ATFT_SDC_REL_ERR"] = str(th.get("sdc_rel_err", 0.01))
+    os.environ["ATFT_MASKED_REL_ERR"] = str(th.get("masked_rel_err", 1.0e-12))
+    os.environ["ATFT_TRIAL_WATCHDOG_MS"] = str(th.get("trial_watchdog_ms", 100))
+    os.environ["ATFT_STEP_BUDGET_FACTOR"] = str(th.get("step_budget_factor", 50))
+
+
+def policy_entries(cfg):
+    """YAML 的 policies 展开为 (tag, mode, budget, delta, is_golden, do_fi)。"""
+    dflt = cfg.get("defaults", {})
+    out = []
+    for p in cfg.get("policies", []):
+        out.append((
+            p["tag"], p["mode"],
+            float(p.get("budget", dflt.get("budget", 1.0))),
+            float(p.get("delta", dflt.get("delta", 5e-5))),
+            bool(p.get("golden", False)),
+            bool(p.get("fi", False)),
+        ))
+    return out
+
+
 # 单条命令墙钟上限：注错后的被测程序可能死循环（整数/分支位翻转会破坏循环边界），
 # 没有上限时一次挂死就会无限阻塞整个 campaign。超时按失败处理并返回已有 stdout，
 # 由调用方决定是否致命。
@@ -266,7 +347,7 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
     return pmu_rows, fi_rows
 
 
-def run_rq8_instruction_category_and_riscv(ssa_ll):
+def run_rq8_instruction_category_and_riscv(ssa_ll, cfg):
     """
     RQ8:
       (A) Multi-Category Instruction Fault Injection Breakdown (FP vs Int vs Address vs Branch)
@@ -274,14 +355,10 @@ def run_rq8_instruction_category_and_riscv(ssa_ll):
       (B) RISC-V (rv64gc / rv64gcv RVV 1.0) Cross-Compilation Codegen Analysis & QEMU Execution Verification.
     """
     print("=== [RQ8-A] Evaluating Multi-Category Instruction Fault Injection (fp / int / address / branch) ===")
-    cat_policies = [
-        ("native",      "native"),
-        ("swift",       "swift"),
-        ("lltfi_sid",   "lltfi-sid"),
-        ("exact_tmr",   "exact-tmr"),
-        ("approx_simd", "approx-simd"),
-    ]
-    categories = ["fp", "int", "address", "branch"]
+    tag_to_mode = {p["tag"]: p["mode"] for p in cfg.get("policies", [])}
+    cat_policies = [(t, tag_to_mode.get(t, t.replace("_", "-")))
+                    for t in cfg["grids"]["rq8"]["policies"]]
+    categories = list(cfg["grids"]["rq8"]["categories"])
     cat_summary_rows = []
 
     for cat in categories:
@@ -290,7 +367,9 @@ def run_rq8_instruction_category_and_riscv(ssa_ll):
             print(f"  -> Injecting category [{cat}] on policy [{pol_tag}]...")
             _, fi_rows = compile_and_evaluate_policy(
                 ssa_ll, run_tag, mode=pol_mode, rank="semantic", budget=1.0,
-                delta=5e-5, fi_trials=120, dump_golden=False, run_fi=True,
+                delta=float(cfg.get("defaults", {}).get("delta", 5e-5)),
+                fi_trials=int(cfg["grids"]["rq8"].get("trials", 120)),
+                dump_golden=False, run_fi=True,
                 fi_target_type=cat, arch="x86_64"
             )
             valid_rows = [r for r in fi_rows if r["dyn_target_insts"] > 0]
@@ -330,7 +409,9 @@ def run_rq8_instruction_category_and_riscv(ssa_ll):
         print(f"  -> Cross-compiling & executing RISC-V ELF under {QEMU_RISCV} for [{pol_tag}] (run_fi={do_rv_fi})...")
         pmu_rv, fi_rv = compile_and_evaluate_policy(
             ssa_rv_ll, rv_tag, mode=pol_mode, rank="semantic", budget=1.0,
-            delta=5e-5, fi_trials=(120 if do_rv_fi else 0), dump_golden=(pol_tag == "native"),
+            delta=float(cfg.get("defaults", {}).get("delta", 5e-5)),
+            fi_trials=(int(cfg["grids"]["rq8"].get("trials", 120)) if do_rv_fi else 0),
+            dump_golden=(pol_tag == "native"),
             run_fi=do_rv_fi, fi_target_type="fp", arch="riscv64"
         )
         sut_rv_ll = BUILD_DIR / f"sut_{rv_tag}.ll"
@@ -468,11 +549,18 @@ def print_smoke_summary(pmu_rows, fi_rows):
 
 
 def run_selected_research_questions(args):
+    cfg = load_config(args.config)
+    apply_threshold_env(cfg)
+    if args.trials is None:
+        args.trials = int(cfg.get("trials", 1000))
     if args.smoke:
+        smoke_cfg = cfg.get("smoke", {})
         args.rq = "rq1"
-        args.trials = args.smoke_trials
+        args.trials = args.smoke_trials if args.smoke_trials is not None \
+            else int(smoke_cfg.get("trials", 60))
         if args.policy == "all":
-            args.policy = args.smoke_policies
+            args.policy = args.smoke_policies or ",".join(
+                smoke_cfg.get("policies", ["native", "exact_tmr", "approx_simd"]))
         args.save_snapshot = None
         print(f"=== [Smoke 模式 | 默认] RQ1 | policies={args.policy} | "
               f"trials={args.trials} | 不写 results/*.csv | 全量请加 --full ===")
@@ -496,18 +584,8 @@ def run_selected_research_questions(args):
     # =========================================================================
     if run_all or "rq1" in rqs:
         print("=== [RQ1] Evaluating SOTA Baselines & Proposed Methods across 17 Benchmarks ===")
-        core_configs = [
-            ("native",        "native",        1.0, 5e-5, True,  True),
-            ("pure_approx",   "pure-approx",   1.0, 5e-5, False, False),
-            ("eddi",          "eddi",          1.0, 5e-5, False, True),
-            ("swift",         "swift",         1.0, 5e-5, False, True),
-            ("lltfi_sid",     "lltfi-sid",     1.0, 5e-5, False, True),
-            ("exact_tmr",     "exact-tmr",     1.0, 5e-5, False, True),
-            ("approx_scalar", "approx-scalar", 1.0, 5e-5, False, True),
-            ("approx_simd",   "approx-simd",   1.0, 5e-5, False, True),
-            ("adaptive_low",  "adaptive",      1.0, 5e-5, False, False),
-            ("adaptive_high", "adaptive",      1.0, 5e-5, False, True),
-        ]
+        core_configs = policy_entries(cfg)
+        wts = cfg.get("defaults", {}).get("weights", {})
 
         rq1_pmu_all = []
         rq1_fi_all = []
@@ -518,6 +596,7 @@ def run_selected_research_questions(args):
             print(f"  -> Running policy [{tag}] (mode={mode}, arch={args.arch}, fi_type={args.fi_type})...")
             pmu_rows, fi_rows = compile_and_evaluate_policy(
                 ssa_ll, tag, mode, rank="semantic", budget=budget, delta=delta,
+                w1=wts.get("w1", 2.5), w2=wts.get("w2", 1.8), w3=wts.get("w3", 0.8),
                 fi_trials=args.trials, dump_golden=is_gold, run_fi=do_fi,
                 fi_target_type=args.fi_type, arch=args.arch
             )
@@ -572,8 +651,10 @@ def run_selected_research_questions(args):
     if run_all or "rq2" in rqs:
         print("=== [RQ2] Evaluating Selective Protection Ranking Baselines ===")
         rq2_rows = []
-        budgets = [0.25, 0.50, 0.75, 1.00]
-        rank_methods = ["semantic", "sdctune", "shoestring", "hotpath", "random"]
+        budgets = cfg["grids"]["rq2"]["budgets"]
+        rank_methods = cfg["grids"]["rq2"]["rank_methods"]
+        rq2_trials = int(cfg["grids"]["rq2"].get("trials", 300))
+        grid_delta = float(cfg.get("defaults", {}).get("delta", 5e-5))
 
         for rmethod in rank_methods:
             for bgt in budgets:
@@ -581,7 +662,7 @@ def run_selected_research_questions(args):
                 print(f"  -> Running selective ranking [{rmethod}] @ budget={int(bgt*100)}%...")
                 pmu_rows, fi_rows = compile_and_evaluate_policy(
                     ssa_ll, tag, mode="approx-simd", rank=rmethod, budget=bgt,
-                    delta=5e-5, fi_trials=300, dump_golden=False, run_fi=True
+                    delta=grid_delta, fi_trials=rq2_trials, dump_golden=False, run_fi=True
                 )
                 pmu_map = {r["benchmark"]: r for r in pmu_rows}
                 for fr in fi_rows:
@@ -610,13 +691,14 @@ def run_selected_research_questions(args):
     if run_all or "rq3" in rqs:
         print("=== [RQ3] Evaluating Voter Threshold (delta) Sensitivity Trade-off ===")
         rq3_rows = []
-        deltas = [1e-7, 1e-5, 5e-5, 1e-3, 5e-2, 5e-1]
+        deltas = [float(d) for d in cfg["grids"]["rq3"]["deltas"]]
+        rq3_trials = int(cfg["grids"]["rq3"].get("trials", 300))
         for dval in deltas:
             tag = f"delta_{dval:.0e}".replace("-", "m").replace("+", "p")
             print(f"  -> Running threshold sensitivity [delta={dval:.1e}]...")
             pmu_rows, fi_rows = compile_and_evaluate_policy(
                 ssa_ll, tag, mode="approx-simd", rank="semantic", budget=1.0,
-                delta=dval, fi_trials=300, dump_golden=False, run_fi=True
+                delta=dval, fi_trials=rq3_trials, dump_golden=False, run_fi=True
             )
             pmu_map = {r["benchmark"]: r for r in pmu_rows}
             for fr in fi_rows:
@@ -740,7 +822,7 @@ def run_selected_research_questions(args):
     # RQ8: Multi-Category Instruction Breakdown + RISC-V RVV Cross-Platform Eval
     # =========================================================================
     if run_all or "rq8" in rqs:
-        run_rq8_instruction_category_and_riscv(ssa_ll)
+        run_rq8_instruction_category_and_riscv(ssa_ll, cfg)
 
     save_or_diff_snapshot(args.save_snapshot, args.diff_snapshot)
     print("=== Requested Evaluations Completed! ===")
@@ -756,8 +838,10 @@ def parse_args():
                         help="Target architecture for compilation and execution")
     parser.add_argument("--fi-type", default="fp", choices=["fp", "int", "address", "branch", "all"],
                         help="Fault injection target instruction category")
-    parser.add_argument("--trials", type=int, default=600,
-                        help="Fault injection trials per benchmark for RQ1")
+    parser.add_argument("--config", default=None,
+                        help="YAML 配置文件路径（默认 experiments/config/default.yaml）")
+    parser.add_argument("--trials", type=int, default=None,
+                        help="每个负载的注入次数（默认取配置文件的 trials）")
     parser.add_argument("--save-snapshot", default=None,
                         help="Save resulting CSVs into results/snapshots/<NAME>")
     parser.add_argument("--diff-snapshot", default=None,
@@ -767,10 +851,10 @@ def parse_args():
                              "打印汇总表且不覆盖 results/*.csv")
     parser.add_argument("--full", dest="smoke", action="store_false",
                         help="全量模式：按 --rq/--trials 跑完整 campaign 并写入 results/*.csv")
-    parser.add_argument("--smoke-trials", type=int, default=60,
-                        help="Smoke 模式每个负载的注入次数（默认 60）")
-    parser.add_argument("--smoke-policies", default="native,exact_tmr,approx_simd",
-                        help="Smoke 模式评估的策略列表")
+    parser.add_argument("--smoke-trials", type=int, default=None,
+                        help="Smoke 模式每个负载的注入次数（默认取配置文件 smoke.trials）")
+    parser.add_argument("--smoke-policies", default=None,
+                        help="Smoke 模式评估的策略列表（默认取配置文件 smoke.policies）")
     args = parser.parse_args()
     if args.smoke is None:
         # 默认 smoke：全量要显式 --full（全量约 8 分钟，smoke 约 10 秒）

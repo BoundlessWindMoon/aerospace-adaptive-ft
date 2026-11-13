@@ -1,0 +1,58 @@
+# 评测模块默认配置
+#
+# 加载顺序：内置默认值 <- 本文件 <- 命令行参数
+# 用 --config <path> 指定其他文件；缺省读 experiments/config/default.yaml，
+# 文件不存在时直接用内置默认值。
+
+# 每个负载的故障注入次数（正式结论用 1000；smoke 用 smoke.trials）
+trials: 1000
+
+# 结局分类与健壮性参数（通过环境变量传给 eval_suite）
+thresholds:
+  sdc_rel_err: 0.01          # 浮点负载判为 SDC 的相对误差；整数负载恒为按位精确
+  masked_rel_err: 1.0e-12    # 判为完全掩盖的相对误差
+  trial_watchdog_ms: 100     # 单次试验子进程的挂死上限
+  step_budget_factor: 50     # 动态指令预算 = 无故障剖析步数 x 本系数
+
+# smoke 模式（默认模式）
+smoke:
+  trials: 60
+  policies: [native, exact_tmr, approx_simd]
+
+# RQ1 参与对比的策略
+#   tag    : CSV 里的策略名
+#   mode   : 传给 Pass 的 -atft-mode
+#   golden : 是否用它产生黄金参考（只能有一个，通常是 native）
+#   fi     : 是否对它做故障注入
+#   budget / delta : 可选，覆盖该策略的保护预算与表决阈值
+policies:
+  - {tag: native,        mode: native,        golden: true,  fi: true}
+  - {tag: pure_approx,   mode: pure-approx,   fi: false}
+  - {tag: eddi,          mode: eddi,          fi: true}
+  - {tag: swift,         mode: swift,         fi: true}
+  - {tag: lltfi_sid,     mode: lltfi-sid,     fi: true}
+  - {tag: exact_tmr,     mode: exact-tmr,     fi: true}
+  - {tag: approx_scalar, mode: approx-scalar, fi: true}
+  - {tag: approx_simd,   mode: approx-simd,   fi: true}
+  - {tag: adaptive_low,  mode: adaptive,      fi: false}
+  - {tag: adaptive_high, mode: adaptive,      fi: true}
+
+# 各实验的参数网格
+grids:
+  rq2:                       # 选择性保护：预算 x 关键性排序算法
+    budgets: [0.25, 0.50, 0.75, 1.00]
+    rank_methods: [semantic, sdctune, shoestring, hotpath, random]
+    trials: 300
+  rq3:                       # 表决阈值 delta 敏感性
+    deltas: [1.0e-7, 1.0e-5, 5.0e-5, 1.0e-3, 5.0e-2, 5.0e-1]
+    trials: 300
+  rq8:                       # 指令类别注错与 RISC-V 交叉验证
+    categories: [fp, int, address, branch]
+    policies: [native, swift, lltfi_sid, exact_tmr, approx_simd]
+    trials: 120
+
+# 默认的保护预算与表决阈值（策略未单独指定时使用）
+defaults:
+  budget: 1.0
+  delta: 5.0e-5
+  weights: {w1: 2.5, w2: 1.8, w3: 0.8}
