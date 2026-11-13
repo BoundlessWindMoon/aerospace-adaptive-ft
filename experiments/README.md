@@ -18,7 +18,8 @@ python3 experiments/generate_html_report.py         # 生成 results/eval_dashbo
 | `--rq rq1,rq5` | 选择实验，`all` 为全部 RQ1–RQ8 |
 | `--policy native,swift,approx_simd` | 选择参与对比的策略 |
 | `--trials 1000` | 每个负载的注入次数 |
-| `--fi-type fp\|int\|address\|branch\|all` | 注错的指令类别 |
+| `--fi-type balanced` | 注错类别：`balanced`（默认，七类等额）或逗号分隔的类别名 |
+| `--trials-per-category N` | 每个注错类别的注入次数（默认取配置） |
 | `--smoke-policies` / `--smoke-trials` | smoke 模式的策略与注入次数 |
 | `--config path.yaml` | 指定配置文件（默认 `experiments/config/default.yaml`） |
 | `--save-snapshot NAME` / `--diff-snapshot NAME` | 存档与对比 `results/snapshots/NAME` |
@@ -80,6 +81,48 @@ python3 experiments/benchmark_harness.py --full --rq rq3 --config my.yaml
 ## 加一种策略
 
 在 `AdaptiveFTPass.cpp` 的 `run()` 里加一个 `AtftMode == "<名字>"` 分支，再在 `benchmark_harness.py` 的 `core_configs` 里加一行。裁判层不动。
+
+## 故障点分类与预算分配
+
+七个**互斥**类别，分类只看指令自身的种类与结果类型，不看使用者——这样容错变换
+给指令挂上内联表决之后，它仍属于同一类别，不会出现"保护越多、可注入点越少"。
+
+| 类别 | LLVM IR 层 | RV64GCV 落点 |
+| :-- | :-- | :-- |
+| `fp64` | double 算术/一元运算 | `fadd.d` `fmul.d` |
+| `fp32` | float 与 `<2 x float>` 算术 | `fadd.s` `vfadd.vv` |
+| `int_arith` | i16/i32/i64 整数算术与逻辑 | `add` `mul` `sll` `and` |
+| `cast` | trunc/zext/sext/fptrunc/fptosi/sitofp… | `fcvt.*` `sext.w` `slli+srai` |
+| `load` | load 指令的结果值 | `lw` `ld` `flw` `fld` 的目的寄存器 |
+| `addr` | GEP 的可变下标（扰动限制在 ±3 个元素） | `sw` `lw` 的地址寄存器 |
+| `cmp_branch` | 驱动 br/select/switch 的 icmp/fcmp | `slt` `feq.d` + `beq/bne` |
+
+对应 LLFI/PINFI (DSN'14) 的 arithmetic/cast/cmp/load 与 SASSIFI (ISPASS'17) 的
+IOV/IOA 两套分类。
+
+**预算按类别等额分配**，不按动态频率比例——与 SASSIFI (`NUM_INJECTIONS` per
+IGID per BFM)、NVBitFI、LLFI/PINFI（每类别 1000 次）一致。自然频率在聚合阶段
+作为第二口径出现（SASSIFI 的 analysis-time weighting）。
+
+## 聚合口径
+
+`experiments/aggregate.py` 是唯一实现，smoke 与正式报告共用。
+
+| 量 | 聚合方式 | 依据 |
+| :-- | :-- | :-- |
+| 指令倍率等比值 | **几何平均** | SWIFT/SWIFT-R 图题 "GeoMean is across all benchmarks" |
+| SDC / DUE 等率值 | **算术平均 + 95% CI** | SWIFT/SWIFT-R 的 "Average"；CI 为本工作增量 |
+| 负载权重 | 套件内等权 → **套件间等权** | Relyzer (ASPLOS'12) 每 suite 等量取样的精神 |
+| 类别权重 | 七类等权（主口径）+ 频率加权（副口径） | SASSIFI |
+
+主口径只覆盖**基线程序本身存在的**故障类别：保护方案引入的新故障点（例如近似
+副本带来的 fp32 运算）单列在 `extra_categories`，不混进主口径，否则不同策略的
+类别集合不一致、失去可比性。
+
+```bash
+python3 experiments/aggregate.py --policy-detail approx_simd
+python3 experiments/aggregate.py --json results/rq1_aggregate.json
+```
 
 ## 结局分类
 

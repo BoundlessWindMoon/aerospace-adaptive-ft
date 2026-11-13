@@ -92,58 +92,134 @@ std::set<Function *> computeInjectionClosure(Module &M) {
   return closure;
 }
 
-bool isFPDataInst(Instruction *I) {
-  if (!I || isa<PHINode>(I)) return false;
-  if (I->getMetadata("atft.voter.internal") != nullptr) return false;
-  if (I->isBinaryOp() || I->isUnaryOp() || isa<LoadInst>(I)) {
-    Type *ty = I->getType();
-    if (ty->isDoubleTy() || ty->isFloatTy()) return true;
-    if (auto *vecTy = dyn_cast<FixedVectorType>(ty)) {
-      if (vecTy->getElementType()->isFloatTy() && vecTy->getNumElements() == 2) return true;
-    }
+// ============================================================================
+// 故障点分类：七个**互斥**类别
+//
+// 分类只看指令自身的种类与结果类型，**不看它的使用者**。早期版本用"流入
+// 比较/GEP 则排除"来避免类别重叠，副作用是容错变换给被保护指令挂上内联
+// 表决（ICmp/Select）之后，那条指令就变成不可注入 —— 保护越多、注入点越少、
+// 可靠性被系统性虚高。按指令种类分类从根上消除了这个攻击面。
+//
+// 与文献的对应关系：
+//   LLFI/PINFI (DSN'14) 的 arithmetic / cast / cmp / load 四类
+//   SASSIFI (ISPASS'17) 的 IOV（指令输出值）与 IOA（输出寄存器索引与 store 地址）
+// 在 RV64GCV 上的落点：
+//   FP64 -> fadd.d/fmul.d/fld      FP32 -> fadd.s/vfadd.vv/flw
+//   INT  -> add/mul/sll/and        CAST -> fcvt.*/sext.w/slli+srai
+//   LOAD -> lw/ld/flw/fld 目的寄存器   ADDR -> sw/sd/lw 的地址寄存器
+//   CMP  -> slt/feq.d + beq/bne 的条件
+// ============================================================================
+enum FiCategory {
+  FIC_NONE = 0,
+  FIC_FP64,
+  FIC_FP32,
+  FIC_INT_ARITH,
+  FIC_CAST,
+  FIC_LOAD,
+  FIC_ADDR,
+  FIC_CMP_BRANCH,
+  FIC_COUNT
+};
+
+static const char *FI_CATEGORY_NAMES[FIC_COUNT] = {
+  "none", "fp64", "fp32", "int_arith", "cast", "load", "addr", "cmp_branch"
+};
+
+// 可被注入的标量/向量类型：决定用哪个 hook
+static bool isHookableTy(Type *T) {
+  if (T->isDoubleTy() || T->isFloatTy()) return true;
+  if (T->isIntegerTy(16) || T->isIntegerTy(32) || T->isIntegerTy(64)) return true;
+  if (auto *vecTy = dyn_cast<FixedVectorType>(T)) {
+    return vecTy->getElementType()->isFloatTy() && vecTy->getNumElements() == 2;
   }
   return false;
 }
 
-bool isIntDataInst(Instruction *I) {
-  if (!I || isa<PHINode>(I)) return false;
-  if (I->getMetadata("atft.voter.internal") != nullptr) return false;
-  if (I->isBinaryOp()) {
-    Type *ty = I->getType();
-    if (ty->isIntegerTy(32) || ty->isIntegerTy(16)) {
-      // 跳过被用于 GEP 地址偏移或循环条件/PHI 的整数指令（那些归属 address 或 branch 类别）。
-      // 但必须忽略容错变换自己插入的使用者：整数 TMR 会给每条被保护的指令挂上
-      // ICmpEQ/Select 内联表决，若把它们算作"流入比较"，被保护的指令就全部
-      // 变成不可注入 —— 保护越多、注入点越少，可靠性会被系统性地虚高。
-      for (User *U : I->users()) {
-        if (auto *UI = dyn_cast<Instruction>(U)) {
-          if (UI->getMetadata("atft.voter.internal") != nullptr) continue;
-        }
-        if (isa<PHINode>(U) || isa<ICmpInst>(U) || isa<GetElementPtrInst>(U) ||
-            isa<SExtInst>(U) || isa<ZExtInst>(U))
-          return false;
-      }
+static bool isCastOp(Instruction *I) {
+  switch (I->getOpcode()) {
+    case Instruction::Trunc:
+    case Instruction::ZExt:
+    case Instruction::SExt:
+    case Instruction::FPTrunc:
+    case Instruction::FPExt:
+    case Instruction::FPToSI:
+    case Instruction::FPToUI:
+    case Instruction::SIToFP:
+    case Instruction::UIToFP:
       return true;
-    }
+    default:
+      return false;
+  }
+}
+
+// 比较结果是否真正驱动控制流或选择
+static bool cmpDrivesControlFlow(Instruction *I) {
+  for (User *U : I->users()) {
+    if (isa<BranchInst>(U) || isa<SelectInst>(U) || isa<SwitchInst>(U)) return true;
   }
   return false;
 }
 
-bool isAddressIndexInst(Instruction *I) {
-  return isa<GetElementPtrInst>(I);
+// 地址类注入点：带可变下标的 GEP。读地址与写地址都算 —— 子进程隔离之后，
+// 写地址被改坏只会杀死该次试验的子进程并记为 DUE，不再污染父进程的堆。
+static bool isAddrSite(Instruction *I) {
+  auto *gep = dyn_cast<GetElementPtrInst>(I);
+  if (!gep || gep->getNumOperands() < 2) return false;
+  Value *idx = gep->getOperand(gep->getNumOperands() - 1);
+  if (isa<ConstantInt>(idx)) return false;
+  return idx->getType()->isIntegerTy(32) || idx->getType()->isIntegerTy(64);
 }
 
-bool isBranchCondInst(Instruction *I) {
-  if (!I) return false;
-  if (I->getMetadata("atft.voter.internal") != nullptr) return false;
-  // 注入数据依赖的浮点条件分支与选择谓词 (FCmpInst)，模拟分支方向翻转，
-  // 严格避开整型循环退出计数器 (ICmpInst)，防止被测进程陷入无界死循环。
-  if (isa<FCmpInst>(I)) {
-    for (User *U : I->users()) {
-      if (isa<BranchInst>(U) || isa<SelectInst>(U)) return true;
+// 唯一的分类入口：按指令种类定优先级，保证互斥
+FiCategory classifyFaultSite(Instruction *I) {
+  if (!I || isa<PHINode>(I)) return FIC_NONE;
+  if (I->getMetadata("atft.voter.internal") != nullptr) return FIC_NONE;
+
+  if (isAddrSite(I))                              return FIC_ADDR;
+  if (isa<LoadInst>(I))
+    return isHookableTy(I->getType()) ? FIC_LOAD : FIC_NONE;
+  if (isCastOp(I))
+    return isHookableTy(I->getType()) ? FIC_CAST : FIC_NONE;
+  if (isa<ICmpInst>(I) || isa<FCmpInst>(I))
+    return cmpDrivesControlFlow(I) ? FIC_CMP_BRANCH : FIC_NONE;
+
+  if (I->isBinaryOp() || I->isUnaryOp()) {
+    Type *ty = I->getType();
+    if (ty->isDoubleTy()) return FIC_FP64;
+    if (ty->isFloatTy())  return FIC_FP32;
+    if (auto *vecTy = dyn_cast<FixedVectorType>(ty)) {
+      if (vecTy->getElementType()->isFloatTy() && vecTy->getNumElements() == 2)
+        return FIC_FP32;
+    }
+    if (ty->isIntegerTy(16) || ty->isIntegerTy(32) || ty->isIntegerTy(64))
+      return FIC_INT_ARITH;
+  }
+  return FIC_NONE;
+}
+
+// 把命令行给的类别名解析成选择集合。保留旧名字作别名，避免老配置失效。
+static void parseCategorySelection(StringRef spec, bool *enabled) {
+  for (int c = 0; c < FIC_COUNT; c++) enabled[c] = false;
+  if (spec == "all") {
+    for (int c = FIC_FP64; c < FIC_COUNT; c++) enabled[c] = true;
+    return;
+  }
+  SmallVector<StringRef, 8> parts;
+  spec.split(parts, ',', -1, false);
+  for (StringRef raw : parts) {
+    StringRef p = raw.trim();
+    if (p == "fp") { enabled[FIC_FP64] = true; enabled[FIC_FP32] = true; continue; }
+    if (p == "int")     { enabled[FIC_INT_ARITH] = true; continue; }
+    if (p == "address") { enabled[FIC_ADDR] = true; continue; }
+    if (p == "branch")  { enabled[FIC_CMP_BRANCH] = true; continue; }
+    bool matched = false;
+    for (int c = FIC_FP64; c < FIC_COUNT; c++) {
+      if (p == FI_CATEGORY_NAMES[c]) { enabled[c] = true; matched = true; break; }
+    }
+    if (!matched) {
+      errs() << "[standalone-fi] 未知的注错类别: " << p << "\n";
     }
   }
-  return false;
 }
 
 class StandaloneFaultInjectorPass : public PassInfoMixin<StandaloneFaultInjectorPass> {
@@ -152,139 +228,114 @@ public:
     LLVMContext &Ctx = M.getContext();
     Type *F64Ty = Type::getDoubleTy(Ctx);
     Type *F32Ty = Type::getFloatTy(Ctx);
-    Type *I32Ty = Type::getInt32Ty(Ctx);
     Type *I16Ty = Type::getInt16Ty(Ctx);
+    Type *I32Ty = Type::getInt32Ty(Ctx);
+    Type *I64Ty = Type::getInt64Ty(Ctx);
     VectorType *V2F32Ty = FixedVectorType::get(F32Ty, 2);
 
     FunctionCallee HookF64 = M.getOrInsertFunction("__harness_fi_hook_f64", F64Ty, F64Ty, I32Ty);
     FunctionCallee HookF32 = M.getOrInsertFunction("__harness_fi_hook_f32", F32Ty, F32Ty, I32Ty);
-    FunctionCallee HookI32 = M.getOrInsertFunction("__harness_fi_hook_i32", I32Ty, I32Ty, I32Ty);
     FunctionCallee HookI16 = M.getOrInsertFunction("__harness_fi_hook_i16", I16Ty, I16Ty, I32Ty);
+    FunctionCallee HookI32 = M.getOrInsertFunction("__harness_fi_hook_i32", I32Ty, I32Ty, I32Ty);
+    FunctionCallee HookI64 = M.getOrInsertFunction("__harness_fi_hook_i64", I64Ty, I64Ty, I32Ty);
 
-    bool injFP   = (FiTargetType == "fp"      || FiTargetType == "all");
-    bool injInt  = (FiTargetType == "int"     || FiTargetType == "all");
-    bool injAddr = (FiTargetType == "address" || FiTargetType == "all");
-    bool injBr   = (FiTargetType == "branch"  || FiTargetType == "all");
+    bool enabled[FIC_COUNT];
+    parseCategorySelection(FiTargetType, enabled);
 
     int32_t staticSiteId = 1;
+    unsigned siteCount[FIC_COUNT] = {0};
 
     std::set<Function *> injectionScope = computeInjectionClosure(M);
 
+    // 先收集再改写：注入会插入新指令，边遍历边改写会把新指令也当成候选
+    std::vector<std::pair<Instruction *, FiCategory>> sites;
     for (Function &F : M) {
       if (F.isDeclaration()) continue;
       if (!injectionScope.count(&F)) continue;
-
-      std::vector<Instruction *> fpTargets;
-      std::vector<Instruction *> intTargets;
-      std::vector<GetElementPtrInst *> addrTargets;
-      std::vector<Instruction *> brTargets;
-
       for (BasicBlock &BB : F) {
         for (Instruction &I : BB) {
-          if (injFP && isFPDataInst(&I)) fpTargets.push_back(&I);
-          if (injInt && isIntDataInst(&I)) intTargets.push_back(&I);
-          if (injAddr && isAddressIndexInst(&I)) addrTargets.push_back(cast<GetElementPtrInst>(&I));
-          if (injBr && isBranchCondInst(&I)) brTargets.push_back(&I);
+          FiCategory c = classifyFaultSite(&I);
+          if (c == FIC_NONE) continue;
+          siteCount[c]++;
+          if (!enabled[c]) continue;
+          sites.push_back({&I, c});
         }
       }
+    }
 
-      // 1. 浮点算术/访存指令注入
-      for (Instruction *inst : fpTargets) {
-        Instruction *nextNode = inst->getNextNode();
-        if (!nextNode) continue;
-        IRBuilder<> IRB(nextNode);
-        Type *ty = inst->getType();
+    for (auto &entry : sites) {
+      Instruction *inst = entry.first;
+      FiCategory cat = entry.second;
 
-        if (ty->isDoubleTy()) {
-          Value *hooked = IRB.CreateCall(
-              HookF64, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.f64");
-          inst->replaceUsesWithIf(hooked, [&](Use &U) {
-            return U.getUser() != hooked;
-          });
-        } else if (ty->isFloatTy()) {
-          Value *hooked = IRB.CreateCall(
-              HookF32, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.f32");
-          inst->replaceUsesWithIf(hooked, [&](Use &U) {
-            return U.getUser() != hooked;
-          });
-        } else if (ty == V2F32Ty) {
-          Value *bitcastI64 = IRB.CreateBitCast(inst, F64Ty, "v2f32.as.f64");
-          Value *hookedF64 = IRB.CreateCall(
-              HookF64, {bitcastI64, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.v2f32.f64");
-          Value *hookedVec = IRB.CreateBitCast(hookedF64, V2F32Ty, "fi.v2f32");
-          inst->replaceUsesWithIf(hookedVec, [&](Use &U) {
-            return U.getUser() != bitcastI64;
-          });
-        }
-      }
-
-      // 2. 整型算术指令注入 (i32 / i16)
-      for (Instruction *inst : intTargets) {
-        Instruction *nextNode = inst->getNextNode();
-        if (!nextNode) continue;
-        IRBuilder<> IRB(nextNode);
-        Type *ty = inst->getType();
-        if (ty->isIntegerTy(32)) {
-          Value *hooked = IRB.CreateCall(
-              HookI32, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i32");
-          inst->replaceUsesWithIf(hooked, [&](Use &U) {
-            return U.getUser() != hooked;
-          });
-        } else if (ty->isIntegerTy(16)) {
-          Value *hooked = IRB.CreateCall(
-              HookI16, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i16");
-          inst->replaceUsesWithIf(hooked, [&](Use &U) {
-            return U.getUser() != hooked;
-          });
-        }
-      }
-
-      // 3. 内存地址下标偏移 (GEP Index) 注入：仅对 LoadInst 使用的读地址注入偏移扰动，
-      //    模拟读取相邻错误元素导致的静默数据污染或越界陷阱，避免破坏栈帧/堆元数据。
-      for (GetElementPtrInst *gep : addrTargets) {
-        if (gep->getNumOperands() < 2) continue;
-        bool hasLoadUser = false;
-        bool hasStoreUser = false;
-        for (User *U : gep->users()) {
-          if (isa<LoadInst>(U)) hasLoadUser = true;
-          if (isa<StoreInst>(U)) hasStoreUser = true;
-        }
-        if (!hasLoadUser || hasStoreUser) continue;
-        unsigned lastIdx = gep->getNumOperands() - 1;
-        Value *idxVal = gep->getOperand(lastIdx);
-        if (!idxVal->getType()->isIntegerTy(64) && !idxVal->getType()->isIntegerTy(32)) continue;
-        if (isa<ConstantInt>(idxVal)) continue;
-
-        IRBuilder<> IRB(gep);
-        Value *idx32 = idxVal->getType()->isIntegerTy(64)
-                           ? IRB.CreateTrunc(idxVal, I32Ty, "gep.idx32")
-                           : idxVal;
+      // ---- 地址类：扰动 GEP 的可变下标，幅度限制在 ±3 个元素 ----
+      if (cat == FIC_ADDR) {
+        unsigned lastIdx = inst->getNumOperands() - 1;
+        Value *idxVal = inst->getOperand(lastIdx);
+        IRBuilder<> IRB(inst);
+        bool is64 = idxVal->getType()->isIntegerTy(64);
+        Value *idx32 = is64 ? IRB.CreateTrunc(idxVal, I32Ty, "gep.idx32") : idxVal;
         Value *hooked32 = IRB.CreateCall(
             HookI32, {idx32, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.addr");
         Value *diff = IRB.CreateXor(idx32, hooked32);
         Value *boundedDiff = IRB.CreateAnd(diff, ConstantInt::get(I32Ty, 0x3));
         Value *safeIdx32 = IRB.CreateXor(idx32, boundedDiff);
-        Value *finalIdx = idxVal->getType()->isIntegerTy(64)
-                              ? IRB.CreateSExt(safeIdx32, idxVal->getType())
-                              : safeIdx32;
-        gep->setOperand(lastIdx, finalIdx);
+        Value *finalIdx = is64 ? IRB.CreateSExt(safeIdx32, idxVal->getType()) : safeIdx32;
+        inst->setOperand(lastIdx, finalIdx);
+        continue;
       }
 
-      // 4. 分支控制流条件 (ICmp / FCmp) 注入 (翻转 i1 布尔条件以模拟控制流方向偏转)
-      for (Instruction *cmpInst : brTargets) {
-        Instruction *nextNode = cmpInst->getNextNode();
+      // ---- 比较类：按注入与否翻转 i1 条件 ----
+      if (cat == FIC_CMP_BRANCH) {
+        Instruction *nextNode = inst->getNextNode();
         if (!nextNode) continue;
         IRBuilder<> IRB(nextNode);
-        Value *zext32 = IRB.CreateZExt(cmpInst, I32Ty, "br.i32");
+        Value *zext32 = IRB.CreateZExt(inst, I32Ty, "br.i32");
         Value *hooked32 = IRB.CreateCall(
             HookI32, {zext32, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.br");
         Value *diff = IRB.CreateXor(zext32, hooked32);
         Value *wasInjected = IRB.CreateICmpNE(diff, ConstantInt::get(I32Ty, 0), "fi.was_inj");
-        Value *flippedCond = IRB.CreateXor(cmpInst, wasInjected, "fi.cond");
-        cmpInst->replaceUsesWithIf(flippedCond, [&](Use &U) {
+        Value *flippedCond = IRB.CreateXor(inst, wasInjected, "fi.cond");
+        inst->replaceUsesWithIf(flippedCond, [&](Use &U) {
           return U.getUser() != zext32 && U.getUser() != flippedCond;
         });
+        continue;
       }
+
+      // ---- 其余类别：按结果类型选 hook，替换该值的全部使用者 ----
+      Instruction *nextNode = inst->getNextNode();
+      if (!nextNode) continue;
+      IRBuilder<> IRB(nextNode);
+      Type *ty = inst->getType();
+      Value *hooked = nullptr;
+
+      if (ty->isDoubleTy()) {
+        hooked = IRB.CreateCall(HookF64, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.f64");
+      } else if (ty->isFloatTy()) {
+        hooked = IRB.CreateCall(HookF32, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.f32");
+      } else if (ty->isIntegerTy(16)) {
+        hooked = IRB.CreateCall(HookI16, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i16");
+      } else if (ty->isIntegerTy(32)) {
+        hooked = IRB.CreateCall(HookI32, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i32");
+      } else if (ty->isIntegerTy(64)) {
+        hooked = IRB.CreateCall(HookI64, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i64");
+      } else if (ty == V2F32Ty) {
+        // <2 x float> 近似副本：按 64 位整体翻转一个比特，等价于打中其中一路
+        Value *asF64 = IRB.CreateBitCast(inst, F64Ty, "v2f32.as.f64");
+        Value *hookedF64 = IRB.CreateCall(
+            HookF64, {asF64, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.v2f32.f64");
+        Value *hookedVec = IRB.CreateBitCast(hookedF64, V2F32Ty, "fi.v2f32");
+        inst->replaceUsesWithIf(hookedVec, [&](Use &U) { return U.getUser() != asF64; });
+        continue;
+      }
+
+      if (!hooked) continue;
+      Value *hookedVal = hooked;
+      inst->replaceUsesWithIf(hookedVal, [&](Use &U) { return U.getUser() != hookedVal; });
+    }
+
+    // 静态注入点统计：供上层做"注入点守恒"检查，防止通过减少插桩点刷低 SDC
+    for (int c = FIC_FP64; c < FIC_COUNT; c++) {
+      errs() << "FI_STATIC_SITES," << FI_CATEGORY_NAMES[c] << "," << siteCount[c] << "\n";
     }
 
     return PreservedAnalyses::none();

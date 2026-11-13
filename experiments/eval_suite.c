@@ -1115,9 +1115,26 @@ static int run_scale_sweep_pmu(const char *policy_name) {
     return 0;
 }
 
+// 导出基准注册表，供 Python 侧聚合脚本读取（避免套件归属在两处各写一遍）
+static int list_benchmarks(void) {
+    printf("name,suite,kind,tags\n");
+    for (int b = 0; b < NUM_BENCHES; b++) {
+        printf("%s,%s,%s,%s%s%s\n",
+               BENCHES[b].name, BENCHES[b].suite,
+               BENCHES[b].kind == BK_INT ? "int" : "fp",
+               (BENCHES[b].tags & BTAG_REPR) ? "repr" : "",
+               ((BENCHES[b].tags & BTAG_REPR) && (BENCHES[b].tags & BTAG_AEROSPACE)) ? "|" : "",
+               (BENCHES[b].tags & BTAG_AEROSPACE) ? "aerospace" : "");
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         return 1;
+    }
+    if (strcmp(argv[1], "--list-benchmarks") == 0) {
+        return list_benchmarks();
     }
     eval_config_from_env();
     if (strcmp(argv[1], "--dump-golden") == 0 && argc >= 3) {

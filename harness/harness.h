@@ -48,6 +48,7 @@ void     harness_fi_arm_mbu_or_burst(const uint64_t *target_steps, const uint32_
 double   __harness_fi_hook_f64(double val, int32_t static_site_id);
 float    __harness_fi_hook_f32(float val, int32_t static_site_id);
 int32_t  __harness_fi_hook_i32(int32_t val, int32_t static_site_id);
+int64_t  __harness_fi_hook_i64(int64_t val, int32_t static_site_id);
 int16_t  __harness_fi_hook_i16(int16_t val, int32_t static_site_id);
 
 // 标准 QoR 误差评估指标 (MRE, Relative L2, Max Abs Error, PSNR)

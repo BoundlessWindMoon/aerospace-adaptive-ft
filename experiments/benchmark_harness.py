@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -108,13 +109,16 @@ DEFAULT_CONFIG_PATH = ROOT_DIR / "experiments" / "config" / "default.yaml"
 
 BUILTIN_CONFIG = {
     "trials": 1000,
+    "fault_categories": ["fp64", "fp32", "int_arith", "cast", "load", "addr", "cmp_branch"],
+    "trials_per_category": 500,
     "thresholds": {
         "sdc_rel_err": 0.01,
         "masked_rel_err": 1.0e-12,
         "trial_watchdog_ms": 100,
         "step_budget_factor": 50,
     },
-    "smoke": {"trials": 60, "policies": ["native", "exact_tmr", "approx_simd"]},
+    "smoke": {"trials": 60, "policies": ["native", "exact_tmr", "approx_simd"],
+              "categories": ["fp64", "int_arith", "cmp_branch"]},
     "policies": [
         {"tag": "native", "mode": "native", "golden": True, "fi": True},
         {"tag": "exact_tmr", "mode": "exact-tmr", "fi": True},
@@ -166,6 +170,20 @@ def apply_threshold_env(cfg):
     os.environ["ATFT_STEP_BUDGET_FACTOR"] = str(th.get("step_budget_factor", 50))
 
 
+def fault_categories(cfg, args):
+    """注错类别列表：命令行优先，其次配置文件，最后内置默认。"""
+    if args.fi_type and args.fi_type != "balanced":
+        return [c.strip() for c in args.fi_type.split(",") if c.strip()]
+    return list(cfg.get("fault_categories", BUILTIN_CONFIG["fault_categories"]))
+
+
+def category_trials(cfg, args):
+    """每个类别的注入次数。等额分配是 SASSIFI/NVBitFI/LLFI 的共同做法。"""
+    if args.trials_per_category is not None:
+        return int(args.trials_per_category)
+    return int(cfg.get("trials_per_category", BUILTIN_CONFIG["trials_per_category"]))
+
+
 def policy_entries(cfg):
     """YAML 的 policies 展开为 (tag, mode, budget, delta, is_golden, do_fi)。"""
     dflt = cfg.get("defaults", {})
@@ -187,7 +205,8 @@ def policy_entries(cfg):
 DEFAULT_CMD_TIMEOUT_S = 900
 
 
-def run_cmd(cmd, cwd=ROOT_DIR, allow_nonzero=False, timeout_s=DEFAULT_CMD_TIMEOUT_S):
+def run_cmd(cmd, cwd=ROOT_DIR, allow_nonzero=False, timeout_s=DEFAULT_CMD_TIMEOUT_S,
+            want_stderr=False):
     try:
         res = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, timeout=timeout_s)
@@ -196,11 +215,11 @@ def run_cmd(cmd, cwd=ROOT_DIR, allow_nonzero=False, timeout_s=DEFAULT_CMD_TIMEOU
         msg = f"[Timeout {timeout_s}s] {' '.join(map(str, cmd))}"
         if allow_nonzero:
             print("  !! " + msg)
-            return partial
+            return (partial, "") if want_stderr else partial
         raise RuntimeError(msg) from None
     if res.returncode != 0 and not allow_nonzero:
         raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(map(str, cmd))}\n{res.stderr}")
-    return res.stdout
+    return (res.stdout, res.stderr) if want_stderr else res.stdout
 
 
 def build_infrastructure(arch="x86_64"):
@@ -227,13 +246,26 @@ def build_infrastructure(arch="x86_64"):
         OPT, "-passes=always-inline,sroa,mem2reg,loop-simplify",
         "-S", str(raw_ll), "-o", str(ssa_ll)
     ])
+
+    # 导出基准注册表（套件归属、浮点/整数、标签）：聚合脚本的唯一真相来源
+    if arch == "x86_64":
+        meta_bin = BUILD_DIR / "bin_meta"
+        run_cmd([
+            CLANG, "-O1", "experiments/eval_suite.c", str(ssa_ll),
+            str(LIB_ATFT_RT), str(LIB_HARNESS_RT),
+            *inc_flags(HARNESS_INCLUDE_DIRS), "-lm", "-o", str(meta_bin)
+        ])
+        meta = run_cmd([str(meta_bin), "--list-benchmarks"])
+        (BUILD_DIR / "benchmark_meta.csv").write_text(meta)
+
     return ssa_ll
 
 
 def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
                                 delta=5e-5, w1=2.5, w2=1.8, w3=0.8,
                                 fi_trials=600, dump_golden=False, run_fi=True,
-                                fi_target_type="fp", arch="x86_64"):
+                                fi_target_type="fp64", arch="x86_64",
+                                static_sites_out=None):
     sut_ll = BUILD_DIR / f"sut_{tag}.ll"
     sut_bin = BUILD_DIR / f"bin_{tag}_{arch}"
 
@@ -295,12 +327,17 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
     if run_fi and fi_trials > 0:
         sut_fi_ll = BUILD_DIR / f"sut_{tag}_fi_{fi_target_type}.ll"
         sut_fi_bin = BUILD_DIR / f"bin_{tag}_fi_{fi_target_type}_{arch}"
-        run_cmd([
+        _, fi_stderr = run_cmd([
             OPT, f"-load-pass-plugin={PASS_FI_SO}",
             "-passes=standalone-fi,verify",
             f"-fi-target-type={fi_target_type}",
             "-S", str(sut_ll), "-o", str(sut_fi_ll)
-        ])
+        ], want_stderr=True)
+        if static_sites_out is not None:
+            for line in fi_stderr.splitlines():
+                if line.startswith("FI_STATIC_SITES,"):
+                    _, cat, cnt = line.split(",")
+                    static_sites_out[cat] = int(cnt)
         if arch == "riscv64":
             fi_cc_cmd = [
                 CLANG, f"--target={RISCV_TRIPLE}", "-march=rv64gc",
@@ -358,7 +395,8 @@ def run_rq8_instruction_category_and_riscv(ssa_ll, cfg):
     tag_to_mode = {p["tag"]: p["mode"] for p in cfg.get("policies", [])}
     cat_policies = [(t, tag_to_mode.get(t, t.replace("_", "-")))
                     for t in cfg["grids"]["rq8"]["policies"]]
-    categories = list(cfg["grids"]["rq8"]["categories"])
+    categories = list(cfg["grids"]["rq8"].get("categories",
+                      cfg.get("fault_categories", BUILTIN_CONFIG["fault_categories"])))
     cat_summary_rows = []
 
     for cat in categories:
@@ -412,7 +450,7 @@ def run_rq8_instruction_category_and_riscv(ssa_ll, cfg):
             delta=float(cfg.get("defaults", {}).get("delta", 5e-5)),
             fi_trials=(int(cfg["grids"]["rq8"].get("trials", 120)) if do_rv_fi else 0),
             dump_golden=(pol_tag == "native"),
-            run_fi=do_rv_fi, fi_target_type="fp", arch="riscv64"
+            run_fi=do_rv_fi, fi_target_type="fp64", arch="riscv64"
         )
         sut_rv_ll = BUILD_DIR / f"sut_{rv_tag}.ll"
 
@@ -525,27 +563,34 @@ def save_or_diff_snapshot(save_name=None, diff_name=None):
 
 
 def print_smoke_summary(pmu_rows, fi_rows):
-    native = {r["benchmark"]: r["hw_insts"] for r in pmu_rows if r["policy"] == "native"}
-    fi_map = {(r["policy"], r["benchmark"]): r for r in fi_rows}
-    pols = []
-    for r in pmu_rows:
-        if r["policy"] not in pols:
-            pols.append(r["policy"])
-    print("\n=== [Smoke] 每策略汇总（指令倍率为全部负载均值） ===")
-    print(f"{'policy':14s} {'instRatio':>9s} {'maxRelErr':>11s} {'SDC%':>7s} {'±CI':>6s} {'DUE%':>6s}")
-    for pol in pols:
-        rs = [r for r in pmu_rows if r["policy"] == pol]
-        ratio = sum(r["hw_insts"] / max(1, native.get(r["benchmark"], 1)) for r in rs) / len(rs)
-        max_err = max(r["rel_l2_err"] for r in rs)
-        frs = [fi_map[(pol, r["benchmark"])] for r in rs if (pol, r["benchmark"]) in fi_map]
-        if frs:
-            sdc = sum(x["sdc_pct"] for x in frs) / len(frs)
-            ci = sum(x["sdc_ci95_halfwidth"] for x in frs) / len(frs)
-            due = sum(x["due_pct"] for x in frs) / len(frs)
-            print(f"{pol:14s} {ratio:9.2f} {max_err:11.3e} {sdc:7.2f} {ci:6.2f} {due:6.2f}")
-        else:
-            print(f"{pol:14s} {ratio:9.2f} {max_err:11.3e} {'-':>7s} {'-':>6s} {'-':>6s}")
-    print("=== [Smoke] 未写入 results/*.csv（smoke 模式不覆盖正式数据） ===\n")
+    """smoke 汇总：走和正式口径完全相同的聚合实现，避免两套数字。"""
+    try:
+        import aggregate as agg_mod
+    except ImportError:
+        sys.path.insert(0, str(ROOT_DIR / "experiments"))
+        import aggregate as agg_mod
+
+    try:
+        meta = agg_mod.load_meta()
+    except RuntimeError as e:
+        print(f"[Smoke] 跳过聚合：{e}")
+        return
+
+    pmu = [{k: (str(v) if not isinstance(v, str) else v) for k, v in r.items()}
+           for r in pmu_rows]
+    fi = [{k: (str(v) if not isinstance(v, str) else v) for k, v in r.items()}
+          for r in fi_rows]
+    if not fi:
+        print("[Smoke] 无注错数据，跳过聚合")
+        return
+
+    agg = agg_mod.aggregate(fi, pmu, meta)
+    print("\n=== [Smoke] 七类等权聚合（套件内等权 -> 套件间等权；开销为几何平均）===")
+    print(agg_mod.format_table(agg, "equal_category"))
+    first = next(iter(agg))
+    print()
+    print(agg_mod.format_category_table(agg, first))
+    print("=== [Smoke] 未写入 results/*.csv（smoke 模式不覆盖正式数据）===\n")
 
 
 def run_selected_research_questions(args):
@@ -556,8 +601,14 @@ def run_selected_research_questions(args):
     if args.smoke:
         smoke_cfg = cfg.get("smoke", {})
         args.rq = "rq1"
+        if args.fi_type == "balanced" and smoke_cfg.get("categories"):
+            # smoke 只跑代表性类别（各风险档一个），保证秒级反馈
+            args.fi_type = ",".join(smoke_cfg["categories"])
         args.trials = args.smoke_trials if args.smoke_trials is not None \
             else int(smoke_cfg.get("trials", 60))
+        if args.trials_per_category is None:
+            # smoke 的每类别次数与 trials 一致，否则会退回配置里的正式次数
+            args.trials_per_category = args.trials
         if args.policy == "all":
             args.policy = args.smoke_policies or ",".join(
                 smoke_cfg.get("policies", ["native", "exact_tmr", "approx_simd"]))
@@ -590,21 +641,41 @@ def run_selected_research_questions(args):
         rq1_pmu_all = []
         rq1_fi_all = []
 
+        # 注错预算按类别**等额**分配（SASSIFI/NVBitFI/LLFI 惯例）：
+        # 每个类别固定 trials_per_category 次，而不是按动态频率比例。
+        # 自然频率在聚合阶段再作为可选加权口径（SASSIFI 的 analysis-time weighting）。
+        categories = fault_categories(cfg, args)
+        per_cat_trials = category_trials(cfg, args)
+        static_sites = {}
+
         for tag, mode, budget, delta, is_gold, do_fi in core_configs:
             if selected_policies and tag not in selected_policies and tag != "native":
                 continue
-            print(f"  -> Running policy [{tag}] (mode={mode}, arch={args.arch}, fi_type={args.fi_type})...")
-            pmu_rows, fi_rows = compile_and_evaluate_policy(
-                ssa_ll, tag, mode, rank="semantic", budget=budget, delta=delta,
-                w1=wts.get("w1", 2.5), w2=wts.get("w2", 1.8), w3=wts.get("w3", 0.8),
-                fi_trials=args.trials, dump_golden=is_gold, run_fi=do_fi,
-                fi_target_type=args.fi_type, arch=args.arch
-            )
-            if tag == "native":
-                for r in pmu_rows:
-                    native_inst_map[r["benchmark"]] = r["hw_insts"]
-            rq1_pmu_all.extend(pmu_rows)
-            rq1_fi_all.extend(fi_rows)
+            first_for_policy = True
+            for cat in categories:
+                label = f"{tag}/{cat}" if do_fi else tag
+                print(f"  -> Running policy [{label}] (mode={mode}, arch={args.arch}, "
+                      f"trials/cat={per_cat_trials})...")
+                sites = {}
+                pmu_rows, fi_rows = compile_and_evaluate_policy(
+                    ssa_ll, tag, mode, rank="semantic", budget=budget, delta=delta,
+                    w1=wts.get("w1", 2.5), w2=wts.get("w2", 1.8), w3=wts.get("w3", 0.8),
+                    fi_trials=per_cat_trials, dump_golden=(is_gold and first_for_policy),
+                    run_fi=do_fi, fi_target_type=cat, arch=args.arch,
+                    static_sites_out=sites
+                )
+                if sites:
+                    static_sites[tag] = sites
+                if first_for_policy:
+                    # PMU 与策略无关于注错类别，只取一次，避免 7 倍重复测量
+                    if tag == "native":
+                        for r in pmu_rows:
+                            native_inst_map[r["benchmark"]] = r["hw_insts"]
+                    rq1_pmu_all.extend(pmu_rows)
+                    first_for_policy = False
+                rq1_fi_all.extend(fi_rows)
+                if not do_fi:
+                    break   # 不注错的策略只需跑一遍 PMU
 
         pmu_lookup = {(r["policy"], r["benchmark"]): r for r in rq1_pmu_all}
         for fr in rq1_fi_all:
@@ -620,30 +691,29 @@ def run_selected_research_questions(args):
         if args.smoke:
             print_smoke_summary(rq1_pmu_all, rq1_fi_all)
 
-        # fp campaign 写入主 CSV（看板默认口径）；其他注错类别写入带后缀的 CSV，
-        # 避免"跑了但没落盘"导致结论与数据不一致
-        if not selected_policies and args.arch == "x86_64" and args.fi_type != "fp":
-            suffix = args.fi_type
-            with open(RES_DIR / f"rq1_pmu_performance_qor_{suffix}.csv", "w", newline="") as f:
+        # balanced（默认全类别等额）写主 CSV；定向跑单个类别时写带后缀的 CSV，
+        # 避免覆盖正式数据，也避免"跑了但没落盘"
+        if not selected_policies and args.arch == "x86_64":
+            suffix = "" if args.fi_type == "balanced" else "_" + args.fi_type.replace(",", "-")
+            pmu_path = RES_DIR / f"rq1_pmu_performance_qor{suffix}.csv"
+            fi_path = RES_DIR / f"rq1_fault_injection_outcomes{suffix}.csv"
+            with open(pmu_path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=list(rq1_pmu_all[0].keys()))
                 writer.writeheader()
                 writer.writerows(rq1_pmu_all)
-            with open(RES_DIR / f"rq1_fault_injection_outcomes_{suffix}.csv", "w", newline="") as f:
+            with open(fi_path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=list(rq1_fi_all[0].keys()))
                 writer.writeheader()
                 writer.writerows(rq1_fi_all)
-            print(f"  -> Wrote rq1_fault_injection_outcomes_{suffix}.csv ({len(rq1_fi_all)} rows)")
-
-        if not selected_policies and args.arch == "x86_64" and args.fi_type == "fp":
-            with open(RES_DIR / "rq1_pmu_performance_qor.csv", "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=list(rq1_pmu_all[0].keys()))
-                writer.writeheader()
-                writer.writerows(rq1_pmu_all)
-
-            with open(RES_DIR / "rq1_fault_injection_outcomes.csv", "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=list(rq1_fi_all[0].keys()))
-                writer.writeheader()
-                writer.writerows(rq1_fi_all)
+            if static_sites:
+                with open(RES_DIR / f"rq1_static_sites{suffix}.csv", "w", newline="") as f:
+                    cats = sorted({c for d in static_sites.values() for c in d})
+                    w = csv.writer(f)
+                    w.writerow(["policy"] + cats)
+                    for pol, d in static_sites.items():
+                        w.writerow([pol] + [d.get(c, 0) for c in cats])
+            print(f"  -> Wrote {fi_path.name} ({len(rq1_fi_all)} rows, "
+                  f"{len(categories)} categories)")
 
     # =========================================================================
     # RQ2: Selective Protection Ranking Comparison across Protection Budgets
@@ -836,8 +906,11 @@ def parse_args():
                         help="Comma-separated policies for RQ1 (e.g., native,swift,approx_simd)")
     parser.add_argument("--arch", default="x86_64", choices=["x86_64", "riscv64"],
                         help="Target architecture for compilation and execution")
-    parser.add_argument("--fi-type", default="fp", choices=["fp", "int", "address", "branch", "all"],
-                        help="Fault injection target instruction category")
+    parser.add_argument("--fi-type", default="balanced",
+                        help="注错类别：balanced（默认，按配置跑全部类别并等额分配预算）"
+                             "，或逗号分隔的类别名 fp64/fp32/int_arith/cast/load/addr/cmp_branch")
+    parser.add_argument("--trials-per-category", type=int, default=None,
+                        help="每个注错类别的注入次数（默认取配置 trials_per_category）")
     parser.add_argument("--config", default=None,
                         help="YAML 配置文件路径（默认 experiments/config/default.yaml）")
     parser.add_argument("--trials", type=int, default=None,

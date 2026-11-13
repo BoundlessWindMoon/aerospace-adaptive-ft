@@ -4,7 +4,18 @@
 # 用 --config <path> 指定其他文件；缺省读 experiments/config/default.yaml，
 # 文件不存在时直接用内置默认值。
 
-# 每个负载的故障注入次数（正式结论用 1000；smoke 用 smoke.trials）
+# 注错类别：七类互斥故障点，对应 LLVM IR 层的指令种类
+#   fp64/fp32 算术、int_arith 整数算术、cast 位宽与类型转换、
+#   load 访存结果值、addr 地址下标、cmp_branch 比较与分支条件
+# 在 RV64GCV 上分别落到 fadd.d / fadd.s|vfadd.vv / add|mul|sll /
+#   fcvt|sext.w / lw|fld 目的寄存器 / sw|lw 地址寄存器 / slt|beq
+fault_categories: [fp64, fp32, int_arith, cast, load, addr, cmp_branch]
+
+# 预算按类别**等额**分配（SASSIFI/NVBitFI/LLFI 惯例），不按动态频率比例；
+# 自然频率在聚合阶段作为可选加权口径。每类别 500 次 -> 95% 置信下约 ±4.4%
+trials_per_category: 500
+
+# 单类别定向跑时每个负载的注入次数
 trials: 1000
 
 # 结局分类与健壮性参数（通过环境变量传给 eval_suite）
@@ -18,6 +29,9 @@ thresholds:
 smoke:
   trials: 60
   policies: [native, exact_tmr, approx_simd]
+  # smoke 只跑三个代表性类别（浮点 / 整数 / 控制流各一个），保证秒级反馈；
+  # 正式结论必须用 --full 跑全部 fault_categories
+  categories: [fp64, int_arith, cmp_branch]
 
 # RQ1 参与对比的策略
 #   tag    : CSV 里的策略名
@@ -47,7 +61,7 @@ grids:
     deltas: [1.0e-7, 1.0e-5, 5.0e-5, 1.0e-3, 5.0e-2, 5.0e-1]
     trials: 300
   rq8:                       # 指令类别注错与 RISC-V 交叉验证
-    categories: [fp, int, address, branch]
+    # categories 省略时沿用顶层 fault_categories，避免两处定义不一致
     policies: [native, swift, lltfi_sid, exact_tmr, approx_simd]
     trials: 120
 

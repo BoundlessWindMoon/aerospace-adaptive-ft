@@ -189,6 +189,20 @@ int32_t __harness_fi_hook_i32(int32_t val, int32_t static_site_id) {
     return val;
 }
 
+int64_t __harness_fi_hook_i64(int64_t val, int32_t static_site_id) {
+    (void)static_site_id;
+    g_fi_dyn_step++;
+    fi_check_budget();
+    for (int i = 0; i < g_fi_num_events; i++) {
+        if (g_fi_dyn_step == g_fi_steps[i]) {
+            uint64_t u = (uint64_t)val ^ make_mbu_mask64(g_fi_bits[i], g_fi_mbu_width);
+            g_fi_injected++;
+            val = (int64_t)u;
+        }
+    }
+    return val;
+}
+
 int16_t __harness_fi_hook_i16(int16_t val, int32_t static_site_id) {
     (void)static_site_id;
     g_fi_dyn_step++;
