@@ -4,3 +4,7 @@ third_party/
 *.o
 *.so
 *.a
+
+# Python caches
+__pycache__/
+*.pyc

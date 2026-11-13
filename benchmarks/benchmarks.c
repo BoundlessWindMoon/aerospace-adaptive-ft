@@ -1,12 +1,19 @@
 //===----------------------------------------------------------------------===//
-// Direct Compilation Wrapper for Unmodified Upstream Open-Source Benchmark Suites
+// Direct Compilation Wrapper for Unmodified Upstream Open-Source Benchmarks
 //
-// This translation unit directly #includes the unmodified source files from:
-//   1. PolyBench/C 4.2.1 (third_party/polybench-c/*)
-//   2. KissFFT v1.3.1    (third_party/kissfft/kiss_fft.c)
-//   3. PARSEC 3.0 Black-Scholes (third_party/llvm-loop-perforation/benchmarks/blackscholes/blackscholes.c)
-//   4. ACCEPT / Loop-Perforation Image Kernels (sobel.c & blur.c)
-//   5. CMSIS-DSP FIR & GNC Attitude Control Kernels
+// 本翻译单元通过 #include 直接编译 third_party/ 下**未经修改**的上游源文件；
+// 本文件自身不含任何自写计算内核，只做参数转接与符号重命名（避免 main /
+// init_array 等同名冲突）。各上游来源：
+//   1. PolyBench/C 4.2.1          third_party/polybench-c/
+//        FP64 : gemm, 2mm, atax, bicg, jacobi-2d, ludcmp, durbin, deriche
+//        INT32: floyd-warshall, nussinov
+//   2. KissFFT v1.3.1             third_party/kissfft/kiss_fft.c
+//   3. PARSEC Black-Scholes       third_party/llvm-loop-perforation/benchmarks/
+//                                 blackscholes/blackscholes.c（上游单文件移植版）
+//   4. Sobel 图像滤波             third_party/llvm-loop-perforation/benchmarks/
+//                                 sobel/sobel.c
+//   5. COAST 星载容错测试程序     third_party/coast/tests/crc16/crc16.c
+//                                 third_party/coast/tests/quicksort/quicksort.c
 //===----------------------------------------------------------------------===//
 
 #include "benchmarks.h"
@@ -16,14 +23,15 @@
 #include <string.h>
 
 // ============================================================================
-// 1. Directly Include Unmodified PolyBench/C 4.2.1 Source Files
+// 1. PolyBench/C 4.2.1 —— FP64 内核
 // ============================================================================
 #define MINI_DATASET
 #define POLYBENCH_USE_C99_PROTO
+#define DATA_TYPE_IS_DOUBLE
 #include "../third_party/polybench-c/utilities/polybench.c"
 #define static __attribute__((always_inline)) static
 
-// (a) PolyBench/C: gemm.c
+// (a) linear-algebra/blas/gemm
 #define init_array  pb_gemm_init_array
 #define print_array pb_gemm_print_array
 #define main        pb_gemm_unused_main
@@ -38,7 +46,7 @@
 #undef _PB_NJ
 #undef _PB_NK
 
-// (b) PolyBench/C: 2mm.c
+// (b) linear-algebra/kernels/2mm
 #define init_array  pb_2mm_init_array
 #define print_array pb_2mm_print_array
 #define main        pb_2mm_unused_main
@@ -55,7 +63,7 @@
 #undef _PB_NK
 #undef _PB_NL
 
-// (c) PolyBench/C: atax.c
+// (c) linear-algebra/kernels/atax
 #define init_array  pb_atax_init_array
 #define print_array pb_atax_print_array
 #define main        pb_atax_unused_main
@@ -68,7 +76,7 @@
 #undef _PB_M
 #undef _PB_N
 
-// (d) PolyBench/C: bicg.c
+// (d) linear-algebra/kernels/bicg
 #define init_array  pb_bicg_init_array
 #define print_array pb_bicg_print_array
 #define main        pb_bicg_unused_main
@@ -81,7 +89,7 @@
 #undef _PB_M
 #undef _PB_N
 
-// (e) PolyBench/C: jacobi-2d.c
+// (e) stencils/jacobi-2d
 #define init_array  pb_jacobi2d_init_array
 #define print_array pb_jacobi2d_print_array
 #define main        pb_jacobi2d_unused_main
@@ -94,16 +102,88 @@
 #undef _PB_TSTEPS
 #undef _PB_N
 
+// (f) linear-algebra/solvers/ludcmp —— LU 分解 + 前后代入（替代原自写 PID）
+#define init_array  pb_ludcmp_init_array
+#define print_array pb_ludcmp_print_array
+#define main        pb_ludcmp_unused_main
+#include "../third_party/polybench-c/linear-algebra/solvers/ludcmp/ludcmp.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+// (g) linear-algebra/solvers/durbin —— Levinson-Durbin 线性预测（替代原自写 EKF）
+#define init_array  pb_durbin_init_array
+#define print_array pb_durbin_print_array
+#define main        pb_durbin_unused_main
+#include "../third_party/polybench-c/linear-algebra/solvers/durbin/durbin.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+// (h) medley/deriche —— Deriche 递归图像滤波（替代原自写 5x5 高斯卷积）
+#define init_array  pb_deriche_init_array
+#define print_array pb_deriche_print_array
+#define main        pb_deriche_unused_main
+#include "../third_party/polybench-c/medley/deriche/deriche.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef W
+#undef H
+#undef _PB_W
+#undef _PB_H
+
 // ============================================================================
-// 2. Directly Include Unmodified KissFFT Source File (third_party/kissfft/kiss_fft.c)
+// 2. PolyBench/C 4.2.1 —— INT32 内核（不规则控制流 / 整数数据通路）
+//    切换 DATA_TYPE 到 int，需先清掉 FP64 一组宏定义
 // ============================================================================
+#undef DATA_TYPE_IS_DOUBLE
+#undef DATA_TYPE
+#undef DATA_PRINTF_MODIFIER
+#undef SCALAR_VAL
+#undef SQRT_FUN
+#undef EXP_FUN
+#undef POW_FUN
+#define DATA_TYPE_IS_INT
+
+// (i) medley/floyd-warshall —— 全源最短路，整数 min/加法 + 三重循环依赖
+#define init_array  pb_fw_init_array
+#define print_array pb_fw_print_array
+#define main        pb_fw_unused_main
+#include "../third_party/polybench-c/medley/floyd-warshall/floyd-warshall.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+// (j) medley/nussinov —— RNA 折叠动态规划，分支密集 + 三角形迭代空间
+#define init_array  pb_nussinov_init_array
+#define print_array pb_nussinov_print_array
+#define main        pb_nussinov_unused_main
+#include "../third_party/polybench-c/medley/nussinov/nussinov.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+#undef match
+#undef max_score
+
 #undef static
+
+// ============================================================================
+// 3. KissFFT v1.3.1 原版源文件（third_party/kissfft/kiss_fft.c）
+// ============================================================================
 #define kiss_fft_scalar double
 #include "../third_party/kissfft/kiss_fft.c"
 
 // ============================================================================
-// 3. Directly Include Unmodified PARSEC 3.0 Black-Scholes Source File
-//    (third_party/llvm-loop-perforation/benchmarks/blackscholes/blackscholes.c)
+// 4. PARSEC Black-Scholes（llvm-loop-perforation 上游单文件移植版）
 // ============================================================================
 #define float double
 double __attribute__((always_inline)) CNDF(double InputX);
@@ -114,7 +194,42 @@ double __attribute__((always_inline)) BlkSchlsEqEuroNoDiv(double sptprice, doubl
 #undef float
 
 // ============================================================================
-// Entry Wrappers Calling the Upstream Kernels
+// 5. Sobel 图像滤波（llvm-loop-perforation 上游 benchmarks/sobel/sobel.c）
+//    上游内核通过 mypgm.h 中的全局图像缓冲 image1/image2 传参，并在计算过程中
+//    向 stdout 打印进度；评测 harness 以 stdout 传递 CSV，故此处仅用宏把上游的
+//    printf 重定向到空实现，**计算代码未作任何改动**。
+// ============================================================================
+static int atft_sobel_mute_printf(const char *fmt, ...) { (void)fmt; return 0; }
+#define printf atft_sobel_mute_printf
+#define main   sobel_unused_main
+#include "../third_party/llvm-loop-perforation/benchmarks/sobel/sobel.c"
+#undef main
+#undef printf
+
+// ============================================================================
+// 6. COAST 星载容错测试程序（BYU/LANL，IEEE TNS'19 中子束实测负载）
+// ============================================================================
+#define main crc16_unused_main
+#include "../third_party/coast/tests/crc16/crc16.c"
+#undef main
+
+#define main   quicksort_unused_main
+#define printf atft_sobel_mute_printf
+#include "../third_party/coast/tests/quicksort/quicksort.c"
+#undef printf
+#undef main
+
+// ============================================================================
+// 7. OBPMark 1.1 影像校正与定标（ESA + BSC 官方星载处理基准）
+//    上游 ports/cpu/processing.c 原封不动编译。上游的 include/device.h 会经
+//    util_prints.h -> benchmark.h 引入 <string> 等 C++ 头并声明重载 init()，
+//    无法用 C 编译；因此用 benchmarks/obpmark_shim/device.h 作最小替身，
+//    只复刻其"顺序 C 版本"分支的数据类型，计算内核源码未作任何改动。
+// ============================================================================
+#include "../third_party/obpmark/src/1.1-image/src/ports/cpu/processing.c"
+
+// ============================================================================
+// Entry Wrappers —— 仅做参数转接，直接调用上游内核
 // ============================================================================
 
 __attribute__((noinline))
@@ -141,28 +256,48 @@ void bench_pb_2mm(int ni, int nj, int nk, int nl, double alpha, double beta,
 __attribute__((noinline))
 void bench_pb_atax(int m, int n, const double *A, const double *x,
                    double *y, double *tmp) {
-    kernel_atax(m, n,
-                (double (*)[n])A,
-                (double *)x,
-                (double *)y,
-                (double *)tmp);
+    kernel_atax(m, n, (double (*)[n])A, (double *)x, (double *)y, (double *)tmp);
 }
 
 __attribute__((noinline))
 void bench_pb_bicg(int m, int n, const double *A, double *s, double *q,
                    const double *p, const double *r) {
-    kernel_bicg(m, n,
-                (double (*)[m])A,
-                s, q,
-                (double *)p,
-                (double *)r);
+    kernel_bicg(m, n, (double (*)[m])A, s, q, (double *)p, (double *)r);
 }
 
 __attribute__((noinline))
 void bench_pb_jacobi2d(int tsteps, int n, double *A, double *B) {
-    kernel_jacobi_2d(tsteps, n,
-                     (double (*)[n])A,
-                     (double (*)[n])B);
+    kernel_jacobi_2d(tsteps, n, (double (*)[n])A, (double (*)[n])B);
+}
+
+__attribute__((noinline))
+void bench_pb_ludcmp(int n, double *A, double *b, double *x, double *y) {
+    kernel_ludcmp(n, (double (*)[n])A, b, x, y);
+}
+
+__attribute__((noinline))
+void bench_pb_durbin(int n, const double *r, double *y) {
+    kernel_durbin(n, (double *)r, y);
+}
+
+__attribute__((noinline))
+void bench_pb_deriche(int w, int h, double alpha, const double *imgIn,
+                      double *imgOut, double *y1, double *y2) {
+    kernel_deriche(w, h, alpha,
+                   (double (*)[h])imgIn,
+                   (double (*)[h])imgOut,
+                   (double (*)[h])y1,
+                   (double (*)[h])y2);
+}
+
+__attribute__((noinline))
+void bench_pb_floyd_warshall(int n, int32_t *path) {
+    kernel_floyd_warshall(n, (int (*)[n])path);
+}
+
+__attribute__((noinline))
+void bench_pb_nussinov(int n, const char *seq, int32_t *table) {
+    kernel_nussinov(n, (char *)seq, (int (*)[n])table);
 }
 
 __attribute__((noinline))
@@ -171,7 +306,7 @@ void bench_parsec_blackscholes(int n_options, const double *sptprice_in,
                                const double *volatility_in, const double *otime_in,
                                double *prices_out) {
     for (int i = 0; i < n_options; i++) {
-        // Directly calls upstream PARSEC BlkSchlsEqEuroNoDiv() and CNDF() from blackscholes.c
+        // 直接调用上游 blackscholes.c 的 BlkSchlsEqEuroNoDiv() / CNDF()
         prices_out[i] = BlkSchlsEqEuroNoDiv(
             sptprice_in[i], strike_in[i], rate_in[i],
             volatility_in[i], otime_in[i], (i & 1), 0.0);
@@ -181,7 +316,7 @@ void bench_parsec_blackscholes(int n_options, const double *sptprice_in,
 __attribute__((noinline))
 void bench_dsp_kissfft(int n, const double *in_re, const double *in_im,
                        double *out_re, double *out_im) {
-    // Directly calls upstream kiss_fft_alloc() / kf_work() / kf_bfly4() from third_party/kissfft/kiss_fft.c
+    // 直接调用上游 kiss_fft_alloc() / kf_work() / kf_bfly4()
     static struct kiss_fft_state *cached_cfg = NULL;
     static int cached_n = 0;
     if (!cached_cfg || cached_n != n) {
@@ -203,113 +338,66 @@ void bench_dsp_kissfft(int n, const double *in_re, const double *in_im,
 }
 
 __attribute__((noinline))
-void bench_axc_sobel(int h, int w, const double *img_in, double *img_out) {
-    static const double weight[3][3] = {
-        { -1.0,  0.0,  1.0 },
-        { -2.0,  0.0,  2.0 },
-        { -1.0,  0.0,  1.0 }
-    };
-    for (int y = 1; y < h - 1; y++) {
-        for (int x = 1; x < w - 1; x++) {
-            double pixel_value = 0.0;
-            for (int j = -1; j <= 1; j++) {
-                for (int i = -1; i <= 1; i++) {
-                    pixel_value += weight[j + 1][i + 1] * img_in[(y + j) * w + (x + i)];
-                }
-            }
-            img_out[y * w + x] = pixel_value;
-        }
+void bench_axc_sobel(int h, int w, const unsigned char *img_in,
+                     unsigned char *img_out) {
+    // 上游 sobel.c 通过 mypgm.h 的全局缓冲传参
+    x_size1 = w;
+    y_size1 = h;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            image1[y][x] = img_in[y * w + x];
+
+    sobel_filtering();
+
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            img_out[y * w + x] = image2[y][x];
+}
+
+// OBPMark 1.1 第一阶段：对应上游 prepare_image_frame()
+//   [I] 偏置校正 f_offset -> [II] 坏像元替换 f_mask_replace
+__attribute__((noinline))
+void bench_obpmark_image_prep(int w, int h, uint16_t *frame,
+                              uint16_t *offsets, uint8_t *bad_pixels) {
+    frame16_t f  = { frame,   (unsigned int)w, (unsigned int)h };
+    frame16_t off = { offsets, (unsigned int)w, (unsigned int)h };
+    frame8_t  bad = { bad_pixels, (unsigned int)w, (unsigned int)h };
+    f_offset(&f, &off);
+    f_mask_replace(&f, &bad);
+}
+
+// OBPMark 1.1 第二阶段：对应上游 proc_image_frame()
+//   [III] 辐射擦洗 f_scrub -> [IV] 增益校正 f_gain
+//   -> [V] 2x2 空间合并 f_2x2_bin -> [VI] 多帧累加 f_coadd
+__attribute__((noinline))
+void bench_obpmark_image_proc(int w, int h, int num_frames, int frame_i,
+                              uint16_t *frame, uint16_t *all_frames,
+                              uint16_t *gains,
+                              uint32_t *binned_frame, uint32_t *image_output) {
+    frame16_t f = { frame, (unsigned int)w, (unsigned int)h };
+    frame16_t fs[8];
+    int nf = num_frames > 8 ? 8 : num_frames;
+    for (int i = 0; i < nf; i++) {
+        fs[i].f = all_frames + (size_t)i * (size_t)w * (size_t)h;
+        fs[i].w = (unsigned int)w;
+        fs[i].h = (unsigned int)h;
     }
+    frame16_t g  = { gains, (unsigned int)w, (unsigned int)h };
+    frame32_t bf = { binned_frame, (unsigned int)(w / 2), (unsigned int)(h / 2) };
+    frame32_t out = { image_output, (unsigned int)(w / 2), (unsigned int)(h / 2) };
+
+    f_scrub(&f, fs, (unsigned int)frame_i);
+    f_gain(&f, &g);
+    f_2x2_bin(&f, &bf);
+    f_coadd(&out, &bf);
 }
 
 __attribute__((noinline))
-void bench_axc_gaussian(int h, int w, const double *img_in, double *img_out) {
-    const int radius = 2;
-    for (int i = radius; i < h - radius; i++) {
-        for (int j = radius; j < w - radius; j++) {
-            double blur_acc = 0.0;
-            for (int ii = i - radius; ii <= i + radius; ii++) {
-                for (int jj = j - radius; jj <= j + radius; jj++) {
-                    blur_acc += img_in[ii * w + jj];
-                }
-            }
-            img_out[i * w + j] = blur_acc * (1.0 / 25.0);
-        }
-    }
+uint16_t bench_coast_crc16(const unsigned char *data, unsigned char length) {
+    return (uint16_t)crc16(data, length);
 }
 
 __attribute__((noinline))
-void bench_dsp_fir(int n_samples, int n_taps, const double *signal,
-                   const double *coeffs, double *output) {
-    for (int i = 0; i < n_samples; i++) {
-        double acc = 0.0;
-        for (int k = 0; k < n_taps; k++) {
-            int idx = i - k;
-            if (idx >= 0) {
-                double prod = signal[idx] * coeffs[k];
-                acc = acc + prod;
-            }
-        }
-        output[i] = acc;
-    }
-}
-
-__attribute__((noinline))
-void bench_gnc_pid(int steps, const double *setpoints, const double *measurements,
-                   double kp, double ki, double kd, double dt, double *control_out) {
-    double integral = 0.0;
-    double prev_err = 0.0;
-    for (int t = 0; t < steps; t++) {
-        double err = setpoints[t] - measurements[t];
-        integral = integral + err * dt;
-        double deriv = (err - prev_err) / dt;
-        double u = kp * err + ki * integral + kd * deriv;
-        prev_err = err;
-        control_out[t] = u;
-    }
-}
-
-__attribute__((noinline))
-void bench_gnc_ekf(int steps, const double *gyro_rates, const double *accel_angles,
-                   double dt, double *state_est_out) {
-    double angle = 0.0;
-    double bias = 0.002;
-    double p00 = 1.0, p01 = 0.0, p10 = 0.0, p11 = 1.0;
-    const double q_angle = 0.001, q_bias = 0.003, r_measure = 0.03;
-
-    for (int t = 0; t < steps; t++) {
-        double rate = gyro_rates[t] - bias;
-        angle = angle + dt * rate;
-
-        p00 = p00 + dt * (dt * p11 - p01 - p10 + q_angle);
-        p01 = p01 - dt * p11;
-        p10 = p10 - dt * p11;
-        p11 = p11 + q_bias * dt;
-
-        double innov = accel_angles[t] - angle;
-        double s = p00 + r_measure;
-        double k0 = p00 / s;
-        double k1 = p10 / s;
-
-        angle = angle + k0 * innov;
-        bias  = bias  + k1 * innov;
-
-        double p00_temp = p00;
-        double p01_temp = p01;
-        p00 = p00 - k0 * p00_temp;
-        p01 = p01 - k0 * p01_temp;
-        p10 = p10 - k1 * p00_temp;
-        p11 = p11 - k1 * p01_temp;
-
-        state_est_out[t] = angle;
-    }
-}
-
-__attribute__((noinline))
-double bench_noncritical_telemetry_checksum(int n, const double *buf) {
-    double s = 0.0;
-    if (n > 0) {
-        s = buf[0] + buf[n - 1];
-    }
-    return s * 0.5;
+void bench_coast_quicksort(int32_t *arr, int n) {
+    quick_sort((int *)arr, n);
 }

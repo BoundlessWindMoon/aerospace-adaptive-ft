@@ -9,25 +9,55 @@ extern "C" {
 #endif
 
 // ============================================================================
-// 标准开源基准测试套件接口 (12 Benchmarks across 4 Standard Domains)
-//   Suite A: PolyBench/C 4.2.1 (Pouchet & Yuki, OSU/Inria)
-//     1. pb_gemm      (linear-algebra/blas/gemm)
-//     2. pb_2mm       (linear-algebra/kernels/2mm)
-//     3. pb_atax      (linear-algebra/kernels/atax)
-//     4. pb_bicg      (linear-algebra/kernels/bicg)
-//     5. pb_jacobi2d  (stencils/jacobi-2d)
-//   Suite B: PARSEC & ACCEPT Approximate Computing Benchmark Suite
-//     6. parsec_blackscholes (PARSEC 3.0 / Intel Black-Scholes PDE pricing)
-//     7. axc_sobel           (ACCEPT / loop-perforation Sobel gradient filter)
-//     8. axc_gaussian        (ACCEPT / 5x5 Gaussian image convolution)
-//   Suite C: Digital Signal Processing (KissFFT & CMSIS-DSP)
-//     9. dsp_kissfft         (KissFFT mixed-radix spectral transform)
-//    10. dsp_fir             (Time-domain FIR filter kernel)
-//   Suite D: GNC Attitude & Flight Control (Guidance, Navigation, and Control)
-//    11. gnc_pid             (Closed-loop PID attitude controller)
-//    12. gnc_ekf             (2-state Extended Kalman Filter with covariance update)
+// 标准开源基准测试套件接口 (17 Benchmarks, 5 Upstream Suites, 0 Self-Written)
+//
+//   本头文件中的每一个 bench_* 包装函数都只负责参数转接，真正的计算内核
+//   全部来自 third_party/ 下未经修改的上游源文件（见 benchmarks.c 的 #include）。
+//
+//   Suite A: PolyBench/C 4.2.1 (Pouchet & Yuki, OSU/Inria) —— 10 个内核
+//     [FP64 规整线性代数]
+//       1. pb_gemm            (linear-algebra/blas/gemm)
+//       2. pb_2mm             (linear-algebra/kernels/2mm)
+//       3. pb_atax            (linear-algebra/kernels/atax)
+//       4. pb_bicg            (linear-algebra/kernels/bicg)
+//     [FP64 Stencil]
+//       5. pb_jacobi2d        (stencils/jacobi-2d)
+//     [FP64 线性方程求解 / 线性预测——替代原自写 PID/EKF 控制内核]
+//       6. pb_ludcmp          (linear-algebra/solvers/ludcmp)
+//       7. pb_durbin          (linear-algebra/solvers/durbin, Levinson-Durbin)
+//     [FP64 图像递归滤波——替代原自写高斯卷积]
+//       8. pb_deriche         (medley/deriche, Deriche 边缘/平滑滤波)
+//     [INT32 不规则控制流与数据依赖]
+//       9. pb_floyd_warshall  (medley/floyd-warshall, 全源最短路)
+//      10. pb_nussinov        (medley/nussinov, RNA 折叠动态规划)
+//
+//   Suite B: PARSEC Black-Scholes (经 llvm-loop-perforation 移植的单文件版本)
+//      11. parsec_blackscholes (超越函数密集的期权定价 PDE)
+//
+//   Suite C: KissFFT v1.3.1 (Mark Borgerding)
+//      12. dsp_kissfft        (混合基 FFT，kiss_fft.c 原版蝶形核)
+//
+//   Suite D: llvm-loop-perforation 图像基准 (Cornell CS6120)
+//      13. axc_sobel          (benchmarks/sobel/sobel.c 原版 Sobel 滤波)
+//
+//   Suite E: COAST 星载容错测试程序 (BYU / LANL, IEEE TNS'19 实测负载)
+//      14. coast_crc16        (tests/crc16/crc16.c, CCITT CRC-16 整数位运算)
+//      15. coast_quicksort    (tests/quicksort/quicksort.c, LANL 递归快排)
+//
+//   Suite F: OBPMark v0.3 (ESA + Barcelona Supercomputing Center) —— 空天域负载
+//      16. obpmark_image_prep (1.1 影像校正与定标：偏置校正 + 坏像元替换)
+//      17. obpmark_image_proc (1.1 影像校正与定标：辐射擦洗 + 增益校正
+//                              + 2x2 空间合并 + 多帧累加)
+//      这是 ESA 官方发布的星载数据处理基准，直接对应卫星成像仪在轨的校正流水线。
+//      引用：D. Steenari 等，OBPMark (On-Board Processing Benchmarks)，ESA + BSC，
+//            OBDP2021；许可：ESA Public License (ESA-PL) Strong Copyleft v2.3
+//
+//   QoR 判据分两类：
+//     - FP64 负载：相对 L2 误差 / PSNR，可容忍近似分支的固有误差；
+//     - INT32 / uint16 负载（9/10/14/15/16/17）：按位精确匹配，任何非零偏差即判为 SDC。
 // ============================================================================
 
+// ---- Suite A: PolyBench/C 4.2.1, FP64 ----
 void bench_pb_gemm(int ni, int nj, int nk, double alpha, double beta,
                    const double *A, const double *B, double *C);
 
@@ -43,28 +73,47 @@ void bench_pb_bicg(int m, int n, const double *A, double *s, double *q,
 
 void bench_pb_jacobi2d(int tsteps, int n, double *A, double *B);
 
+void bench_pb_ludcmp(int n, double *A, double *b, double *x, double *y);
+
+void bench_pb_durbin(int n, const double *r, double *y);
+
+void bench_pb_deriche(int w, int h, double alpha, const double *imgIn,
+                      double *imgOut, double *y1, double *y2);
+
+// ---- Suite A: PolyBench/C 4.2.1, INT32 (不规则控制流) ----
+void bench_pb_floyd_warshall(int n, int32_t *path);
+
+void bench_pb_nussinov(int n, const char *seq, int32_t *table);
+
+// ---- Suite B: PARSEC Black-Scholes ----
 void bench_parsec_blackscholes(int n_options, const double *sptprice,
                                const double *strike, const double *rate,
                                const double *volatility, const double *otime,
                                double *prices_out);
 
-void bench_axc_sobel(int h, int w, const double *img_in, double *img_out);
-
-void bench_axc_gaussian(int h, int w, const double *img_in, double *img_out);
-
+// ---- Suite C: KissFFT ----
 void bench_dsp_kissfft(int n, const double *in_re, const double *in_im,
                        double *out_re, double *out_im);
 
-void bench_dsp_fir(int n_samples, int n_taps, const double *signal,
-                   const double *coeffs, double *output);
+// ---- Suite D: llvm-loop-perforation Sobel (上游 uint8 图像接口) ----
+void bench_axc_sobel(int h, int w, const unsigned char *img_in,
+                     unsigned char *img_out);
 
-void bench_gnc_pid(int steps, const double *setpoints, const double *measurements,
-                   double kp, double ki, double kd, double dt, double *control_out);
+// ---- Suite F: OBPMark 1.1 影像校正与定标 (ESA + BSC, 空天域负载) ----
+//   上游：third_party/obpmark/src/1.1-image/src/ports/cpu/processing.c
+//   两个入口对应上游 prepare_image_frame / proc_image_frame 的两阶段划分
+void bench_obpmark_image_prep(int w, int h, uint16_t *frame,
+                              uint16_t *offsets, uint8_t *bad_pixels);
 
-void bench_gnc_ekf(int steps, const double *gyro_rates, const double *accel_angles,
-                   double dt, double *state_est_out);
+void bench_obpmark_image_proc(int w, int h, int num_frames, int frame_i,
+                              uint16_t *frame, uint16_t *all_frames,
+                              uint16_t *gains,
+                              uint32_t *binned_frame, uint32_t *image_output);
 
-double bench_noncritical_telemetry_checksum(int n, const double *buf);
+// ---- Suite E: COAST 星载测试程序, INT32 ----
+uint16_t bench_coast_crc16(const unsigned char *data, unsigned char length);
+
+void bench_coast_quicksort(int32_t *arr, int n);
 
 #ifdef __cplusplus
 }
