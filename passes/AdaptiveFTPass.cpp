@@ -5,7 +5,7 @@
 //     1. native        : 无冗余保护基线
 //     2. eddi          : EDDI (Oh et al., IEEE TR 2002) — 全指令与访存双模复制 + Store/Branch 前比对 (检错触发 DUE)
 //     3. swift         : SWIFT (Reis et al., CGO 2005)  — 寄存器计算链双模复制 (Load 移出复制圈) + 同步点比对
-//     4. coast-tmr     : COAST-TMR (BYU, IEEE TNS 2019) — 全精度软件三模冗余 + 多数表决纠错
+//     4. coast-tmr     : COAST-TMR (Bohman et al., BYU, IEEE TNS 2019) [按原文语义复现] — 全精度软件三模冗余 + 多数表决纠错
 //     5. approx-scalar : 混合近似 TMR 标量版 (1x FP64 精确 + 2x FP32 标量近似 + 动态阈值投票)
 //     6. approx-simd   : 混合近似 TMR 向量版 (1x FP64 精确 + <2 x float> SIMD 向量近似 + 内联快速阈值投票)
 //     7. adaptive      : 编译期语义关键性分级 + 运行时多版本 (LOW/HIGH) 动态自适应切换
@@ -15,12 +15,13 @@
 //     1. random        : 随机指令选择基线
 //     2. hotpath       : HotPath (Lu et al.) — 基于执行频率/热循环深度优先保护
 //     3. shoestring    : Shoestring (Feng et al., ASPLOS 2010) — 基于静态数据流扇出树与高脆弱性汇点距离
-//     4. sdctune       : SDCTune (Lu et al., HPDC 2014) — 基于静态 SDC 传播特征 (浮点/乘除误差放大/地址依赖)
+//     4. sdctune       : SDCTune (Lu et al., CASES 2014) — 基于静态 SDC 传播特征 (浮点/乘除误差放大/地址依赖)
 //     5. semantic      : 本课题方法 — 融合输出紧密度、循环深度、跨块活跃度与循环递归状态反馈 PHI 环路
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -143,7 +144,7 @@ bool isTargetMathCall(Instruction *I) {
 }
 
 // ============================================================================
-// 模块 1: 关键性排序算法实现 (含 HotPath, Shoestring [ASPLOS'10], SDCTune [HPDC'14], Semantic)
+// 模块 1: 关键性排序算法实现 (含 HotPath, Shoestring [ASPLOS'10], SDCTune [CASES'14], Semantic)
 // ============================================================================
 std::map<const Instruction *, double>
 computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &rankMethod) {
@@ -234,7 +235,7 @@ computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &r
         // Shoestring (Feng et al., ASPLOS'10): 仅保护高扇出 (Fan-out >= 2) 的消费者树，忽略单扇出归约与超越函数
         s = (fanOut >= 2) ? (10.0 * (double)fanOut) : (0.5 * closeness);
       } else if (rankMethod == "sdctune") {
-        // SDCTune (Lu et al., HPDC'14): 仅根据算子类型放大因子 (FDiv/FMul > FAdd) 排序，忽略控制流深度与扇出树
+        // SDCTune (Lu et al., CASES'14): 仅根据算子类型放大因子 (FDiv/FMul > FAdd) 排序，忽略控制流深度与扇出树
         s = 4.0 * opAmp + 0.2 * closeness;
       } else if (rankMethod == "random") {
         uint64_t h = (uint64_t)idx * 11400714819323198485ULL;
@@ -768,6 +769,173 @@ void transformFunctionExactTMR(Function &F, LoopInfo &LI,
 }
 
 // ============================================================================
+// 模块 2C: 整数数据通路精确 TMR (对应开题报告 3.4.4 中"近似不适用"的代码段)
+//
+//   近似变换（FP64->FP32、多项式近似、i32->i16 压缩）对**流入比较/分支/地址计算**
+//   的整数运算链在语义上不可用：一旦截断位宽，比较结果与控制流就会改变。
+//   因此对这类整数数据通路只能采用精确三模复制 + 按位一致性表决。
+//   与 FP64 通路保持一致的设计：复制链不改写原数据流（只在 Store 汇点表决），
+//   内联表决结果由零开销 InlineAsm 保活，保证变换是语义保持的。
+// ============================================================================
+static bool isSupportedIntTy(Type *T) {
+  return T->isIntegerTy(8) || T->isIntegerTy(16) || T->isIntegerTy(32);
+}
+
+// 判断一条指令能否被整数通路三模复制。覆盖 load / phi / 二元运算 / 位宽转换 /
+// select / icmp —— select 与 icmp 必须覆盖，否则 min/max 这类用条件选择表达的
+// 内核（floyd-warshall、nussinov、quicksort、OBPMark 像元流水线）副本链会在
+// select 处断掉，Store 汇点拿不到三路值，整数负载实际上得不到任何保护。
+static bool isReplicableIntInst(Instruction *I) {
+  if (I->getMetadata("atft.voter.internal") != nullptr) return false;
+  if (I->getMetadata("atft.int16.approx") != nullptr) return false;
+  if (isa<LoadInst>(I) || isa<PHINode>(I))
+    return isSupportedIntTy(I->getType());
+  if (I->isBinaryOp())
+    return isSupportedIntTy(I->getType());
+  if (isa<TruncInst>(I) || isa<ZExtInst>(I) || isa<SExtInst>(I))
+    return isSupportedIntTy(I->getType()) &&
+           isSupportedIntTy(I->getOperand(0)->getType());
+  if (isa<SelectInst>(I))
+    return isSupportedIntTy(I->getType());
+  if (auto *IC = dyn_cast<ICmpInst>(I))
+    return isSupportedIntTy(IC->getOperand(0)->getType());
+  return false;
+}
+
+void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
+                                  const std::string &rankMethod, double budget) {
+  auto instScores = computeInstructionCriticalityMap(F, LI, rankMethod);
+
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+
+  FunctionCallee VoterExactI32Fn = M->getOrInsertFunction(
+      "atft_voter_exact_i32", I32Ty, I32Ty, I32Ty, I32Ty);
+
+  auto markInternal = [&](Value *V) -> Value * {
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+    }
+    return V;
+  };
+
+  std::vector<PHINode *> phiNodes;
+  std::vector<LoadInst *> loadInsts;
+  std::vector<Instruction *> computeOrdered;
+  std::vector<StoreInst *> storeInsts;
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (isSupportedIntTy(SI->getValueOperand()->getType())) storeInsts.push_back(SI);
+        continue;
+      }
+      if (!isReplicableIntInst(&I)) continue;
+      if (auto *PN = dyn_cast<PHINode>(&I))      phiNodes.push_back(PN);
+      else if (auto *LD = dyn_cast<LoadInst>(&I)) loadInsts.push_back(LD);
+      else                                        computeOrdered.push_back(&I);
+    }
+  }
+
+  std::set<Instruction *> selectedSet =
+      selectInstructionsByBudget(computeOrdered, instScores, budget);
+  if (selectedSet.empty()) return;
+
+  std::map<Value *, Value *> replica1Map;
+  std::map<Value *, Value *> replica2Map;
+
+  for (LoadInst *LD : loadInsts) {
+    IRBuilder<> IRB(LD->getNextNode());
+    Value *ptr = LD->getPointerOperand();
+    InlineAsm *ptrBar = InlineAsm::get(
+        FunctionType::get(ptr->getType(), {ptr->getType()}, false), "", "=r,0", true);
+    Value *p1 = markInternal(IRB.CreateCall(ptrBar, {ptr}));
+    Value *p2 = markInternal(IRB.CreateCall(ptrBar, {ptr}));
+    replica1Map[LD] = markInternal(IRB.CreateLoad(LD->getType(), p1, LD->getName() + ".ld.itmr1"));
+    replica2Map[LD] = markInternal(IRB.CreateLoad(LD->getType(), p2, LD->getName() + ".ld.itmr2"));
+  }
+
+  for (PHINode *PN : phiNodes) {
+    IRBuilder<> IRB(PN);
+    PHINode *phi1 = IRB.CreatePHI(PN->getType(), PN->getNumIncomingValues(), PN->getName() + ".itmr1");
+    PHINode *phi2 = IRB.CreatePHI(PN->getType(), PN->getNumIncomingValues(), PN->getName() + ".itmr2");
+    markInternal(phi1);
+    markInternal(phi2);
+    replica1Map[PN] = phi1;
+    replica2Map[PN] = phi2;
+  }
+
+  // 统一按"克隆 + 换操作数"的方式复制，二元运算 / 位宽转换 / select / icmp 同一套路径
+  for (Instruction *inst : computeOrdered) {
+    if (!selectedSet.count(inst)) continue;
+    Instruction *nextNode = inst->getNextNode();
+    if (!nextNode) continue;
+    IRBuilder<> IRB(nextNode);
+
+    Instruction *rep1 = inst->clone();
+    Instruction *rep2 = inst->clone();
+    for (unsigned k = 0; k < inst->getNumOperands(); ++k) {
+      Value *op = inst->getOperand(k);
+      if (isa<BasicBlock>(op)) continue;
+      Value *r1 = replica1Map.count(op) ? replica1Map[op] : op;
+      Value *r2 = replica2Map.count(op) ? replica2Map[op] : op;
+      if (r1 == op && !isa<Constant>(op)) r1 = insertZeroCostCSEBarrier(IRB, op);
+      if (r2 == op && !isa<Constant>(op)) r2 = insertZeroCostCSEBarrier(IRB, op);
+      rep1->setOperand(k, r1);
+      rep2->setOperand(k, r2);
+    }
+    IRB.Insert(rep1, inst->getName() + ".itmr1");
+    IRB.Insert(rep2, inst->getName() + ".itmr2");
+    markInternal(rep1);
+    markInternal(rep2);
+    replica1Map[inst] = rep1;
+    replica2Map[inst] = rep2;
+
+    // 按位一致性内联表决（i1 结果不参与，避免无意义开销）
+    if (isSupportedIntTy(inst->getType())) {
+      Value *cmp12 = markInternal(IRB.CreateICmpEQ(inst, rep1, "itmr.c12"));
+      Value *cmp23 = markInternal(IRB.CreateICmpEQ(rep1, rep2, "itmr.c23"));
+      Value *sel23 = markInternal(IRB.CreateSelect(cmp23, rep1, inst, "itmr.s23"));
+      Value *voted = markInternal(IRB.CreateSelect(cmp12, inst, sel23, "itmr.inline.vote"));
+      Type *vt = inst->getType();
+      InlineAsm *keepVote = InlineAsm::get(
+          FunctionType::get(vt, {vt}, false), "", "=r,0", true);
+      markInternal(IRB.CreateCall(keepVote, {voted}));
+    }
+  }
+
+  for (PHINode *PN : phiNodes) {
+    PHINode *phi1 = cast<PHINode>(replica1Map[PN]);
+    PHINode *phi2 = cast<PHINode>(replica2Map[PN]);
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
+      Value *inVal = PN->getIncomingValue(i);
+      BasicBlock *inBB = PN->getIncomingBlock(i);
+      phi1->addIncoming(replica1Map.count(inVal) ? replica1Map[inVal] : inVal, inBB);
+      phi2->addIncoming(replica2Map.count(inVal) ? replica2Map[inVal] : inVal, inBB);
+    }
+  }
+
+  // Store 汇点三路表决：窄于 32 位的值先零扩展再表决，表决后截回原宽度，
+  // 以复用运行时唯一的 i32 表决器（它同时负责统计检出次数）
+  for (StoreInst *SI : storeInsts) {
+    Value *val = SI->getValueOperand();
+    if (!replica1Map.count(val) || !replica2Map.count(val)) continue;
+    IRBuilder<> IRB(SI);
+    Type *vt = val->getType();
+    Value *a = val, *b = replica1Map[val], *c = replica2Map[val];
+    if (vt != I32Ty) {
+      a = markInternal(IRB.CreateZExt(a, I32Ty));
+      b = markInternal(IRB.CreateZExt(b, I32Ty));
+      c = markInternal(IRB.CreateZExt(c, I32Ty));
+    }
+    Value *voted = markInternal(IRB.CreateCall(VoterExactI32Fn, {a, b, c}, "itmr.sync"));
+    if (vt != I32Ty) voted = markInternal(IRB.CreateTrunc(voted, vt));
+    SI->setOperand(0, voted);
+  }
+}
+
+// ============================================================================
 // 模块 3A: 中间计算结果位宽压缩变换 (对应开题报告 3.4.2.1: 32-bit -> 16-bit 整数运算链压缩)
 //   - 识别非循环控制/非 GEP 下标的 32-bit 整数数据运算链 (Add/Sub/Mul/Shl/AShr/And/Or/Xor)
 //   - 将其截断为 <2 x i16> 窄位宽双路近似副本并行计算，并在恢复点符号扩展 (SExt) 回 i32 做一致性表决
@@ -794,6 +962,17 @@ void transformFunctionInt32ToInt16Compression(Function &F, CritLevel critLevel, 
     for (Instruction &I : BB) {
       if (isa<PHINode>(&I) || I.getMetadata("atft.voter.internal") != nullptr) continue;
       if (I.isBinaryOp() && I.getType()->isIntegerTy(32)) {
+        // 位宽压缩的**可靠性前提**：参与运算的值必须可证明落在 int16 范围内，
+        // 否则 trunc 会静默改变结果（实测在 OBPMark 1.1 的 uint16 像元累加上
+        // 把相对误差放大到 1.2e5）。开题报告 3.4.2.1 要求的"识别数值范围
+        // 受限的变量"正是这一步：用 ComputeNumSignBits 判定有效位宽
+        // （>=17 个符号位 <=> 16 位有符号可表示），不满足就不压缩。
+        const DataLayout &DL = F.getParent()->getDataLayout();
+        if (ComputeNumSignBits(&I, DL) < 17 ||
+            ComputeNumSignBits(I.getOperand(0), DL) < 17 ||
+            ComputeNumSignBits(I.getOperand(1), DL) < 17) {
+          continue;
+        }
         bool isLoopOrAddr = false;
         for (User *U : I.users()) {
           if (isa<PHINode>(U) || isa<ICmpInst>(U) || isa<GetElementPtrInst>(U) ||
@@ -831,6 +1010,9 @@ void transformFunctionInt32ToInt16Compression(Function &F, CritLevel critLevel, 
     Instruction *nextNode = inst->getNextNode();
     if (!nextNode) continue;
     IRBuilder<> IRB(nextNode);
+
+    // 标记该 i32 运算已由位宽压缩近似覆盖，后续整数精确 TMR 不再重复保护
+    inst->setMetadata("atft.int16.approx", MDNode::get(Ctx, {}));
 
     Value *op0 = inst->getOperand(0);
     Value *op1 = inst->getOperand(1);
@@ -968,7 +1150,15 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
   }
 
   std::set<Instruction *> selectedSet = selectInstructionsByBudget(computeOrdered, instScores, budget);
-  if (selectedSet.empty()) return;
+  if (selectedSet.empty()) {
+    // 该函数没有可近似的 FP64 计算（典型如纯整数内核 floyd-warshall / nussinov /
+    // crc16 / quicksort）：近似变换不适用，直接走整数数据通路的精确 TMR
+    if (!pureApproxOutput) {
+      transformFunctionInt32ToInt16Compression(F, critLevel, useSIMD);
+      transformFunctionExactIntTMR(F, LI, rankMethod, budget);
+    }
+    return;
+  }
 
   std::map<Value *, Value *> simdApproxMap;
 
@@ -1272,6 +1462,9 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
   // 对包含 32-bit 整数数据运算链的函数同步应用 32-bit -> 16-bit 中间计算结果压缩 (对应开题报告 3.4.2.1)
   if (!pureApproxOutput) {
     transformFunctionInt32ToInt16Compression(F, critLevel, useSIMD);
+    // 流入比较/分支/地址计算的整数链无法安全近似（截断位宽会改变控制流），
+    // 对这部分回退到整数精确 TMR，保证整数负载同样受保护
+    transformFunctionExactIntTMR(F, LI, rankMethod, budget);
   }
 }
 
@@ -1352,15 +1545,50 @@ public:
     auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
     std::vector<Function *> targetFuncs;
-    std::vector<Function *> helperFuncs;
+
+    // ------------------------------------------------------------------
+    // 保护范围 = 从被测内核入口 bench_* 出发的**调用图闭包**
+    //
+    // 早期版本只遍历 bench_* 本身，依赖上游 kernel_* 被 always_inline 内联进
+    // 入口函数才能被保护；凡是非 static 的上游函数（如 sobel.c 的
+    // sobel_filtering、crc16.c 的 crc16、quicksort.c 的递归 quick_sort）
+    // 都会被漏保护，且该前提会被编译器的内联决策随时打破（参见 nZDC, DAC'16
+    // 与 ASP-DAC'26 关于"编译器优化削弱 IR 层冗余"的结论）。
+    // 改为调用图闭包后，保护范围由程序结构而非内联启发式决定。
+    // ------------------------------------------------------------------
+    auto isOutOfScope = [](StringRef n) {
+      return n.startswith("atft_") || n.startswith("harness_") ||
+             n.startswith("llvm.") || n.startswith("polybench_") ||
+             n.endswith(".atft_low") || n.endswith(".atft_high") ||
+             n.endswith("_unused_main") || n == "main";
+    };
+
+    std::set<Function *> inClosure;
+    std::vector<Function *> worklist;
     for (Function &F : M) {
       if (F.isDeclaration()) continue;
-      StringRef name = F.getName();
-      if (name.startswith("bench_") && !name.endswith(".atft_low") && !name.endswith(".atft_high")) {
-        targetFuncs.push_back(&F);
-      } else if (name.startswith("kf_bfly")) {
-        helperFuncs.push_back(&F);
+      if (F.getName().startswith("bench_") && !isOutOfScope(F.getName())) {
+        inClosure.insert(&F);
+        worklist.push_back(&F);
       }
+    }
+    while (!worklist.empty()) {
+      Function *cur = worklist.back();
+      worklist.pop_back();
+      for (BasicBlock &BB : *cur) {
+        for (Instruction &I : BB) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB) continue;
+          Function *callee = CB->getCalledFunction();
+          if (!callee || callee->isDeclaration()) continue;
+          if (callee->isIntrinsic() || isOutOfScope(callee->getName())) continue;
+          if (inClosure.insert(callee).second) worklist.push_back(callee);
+        }
+      }
+    }
+    // 按 Module 内顺序输出，保证变换顺序可复现
+    for (Function &F : M) {
+      if (inClosure.count(&F)) targetFuncs.push_back(&F);
     }
 
     std::vector<FuncCriticalityInfo> critReports;
@@ -1413,6 +1641,7 @@ public:
         transformFunctionLLTFI_SID(*F, LI, AtftRankMethod, AtftBudget);
       } else if (AtftMode == "exact-tmr") {
         transformFunctionExactTMR(*F, LI, AtftRankMethod, AtftBudget);
+        transformFunctionExactIntTMR(*F, LI, AtftRankMethod, AtftBudget);
       } else if (AtftMode == "approx-scalar") {
         transformFunctionApproxTMR(*F, LI, clevel, AtftDelta, false, AtftRankMethod, AtftBudget, false);
       } else if (AtftMode == "approx-simd") {
@@ -1424,25 +1653,8 @@ public:
       }
     }
 
-    // 对 KissFFT 原版源码中的内部蝶形算子 (kf_bfly2/3/4/5) 同步施加相同的容错变换
-    for (Function *HF : helperFuncs) {
-      auto &LI = FAM.getResult<LoopAnalysis>(*HF);
-      if (AtftMode == "eddi") {
-        transformFunctionEDDIOrSWIFT(*HF, LI, true, AtftRankMethod, AtftBudget);
-      } else if (AtftMode == "swift") {
-        transformFunctionEDDIOrSWIFT(*HF, LI, false, AtftRankMethod, AtftBudget);
-      } else if (AtftMode == "lltfi-sid") {
-        transformFunctionLLTFI_SID(*HF, LI, AtftRankMethod, AtftBudget);
-      } else if (AtftMode == "exact-tmr") {
-        transformFunctionExactTMR(*HF, LI, AtftRankMethod, AtftBudget);
-      } else if (AtftMode == "approx-scalar") {
-        transformFunctionApproxTMR(*HF, LI, CRIT_SUB_CRITICAL, AtftDelta, false, AtftRankMethod, AtftBudget, false);
-      } else if (AtftMode == "approx-simd" || AtftMode == "adaptive") {
-        transformFunctionApproxTMR(*HF, LI, CRIT_SUB_CRITICAL, AtftDelta, true, AtftRankMethod, AtftBudget, false);
-      } else if (AtftMode == "pure-approx") {
-        transformFunctionApproxTMR(*HF, LI, CRIT_SUB_CRITICAL, AtftDelta, true, AtftRankMethod, 1.0, true);
-      }
-    }
+    // 调用图闭包已覆盖 KissFFT 的内部蝶形算子 (kf_bfly2/3/4/5) 与 kf_work，
+    // 不再需要按函数名单独补一遍变换。
 
     return PreservedAnalyses::none();
   }

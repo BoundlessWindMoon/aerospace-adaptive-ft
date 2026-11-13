@@ -14,6 +14,8 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include <set>
+#include <vector>
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -33,9 +35,61 @@ static cl::opt<std::string> FiTargetType(
     cl::desc("Fault injection target instruction category: fp | int | address | branch | all"),
     cl::init("fp"));
 
-bool isTargetBenchmarkFunction(StringRef fname) {
-  return (fname.startswith("bench_") || fname.startswith("kf_bfly") ||
-          fname == "kf_work" || fname == "CNDF" || fname == "BlkSchlsEqEuroNoDiv");
+// 注错范围必须与策略层的保护范围一致：同样取"从 bench_* 入口出发的调用图闭包"。
+// 旧版本是一张硬编码函数名白名单 (bench_* / kf_bfly* / kf_work / CNDF /
+// BlkSchlsEqEuroNoDiv)，凡是不在名单里的上游函数（sobel.c 的 sobel_filtering、
+// crc16.c 的 crc16、quicksort.c 的 quick_sort）都拿不到任何注入点，
+// 其 SDC 率会被记成 0% —— 那是"没注入"，不是"没损坏"。
+bool isOutOfInjectionScope(StringRef n) {
+  return n.startswith("atft_") || n.startswith("harness_") ||
+         n.startswith("__harness_") || n.startswith("llvm.") ||
+         n.startswith("polybench_") || n.endswith("_unused_main") || n == "main";
+}
+
+// 若函数直接调用动态内存管理，则不作为注错目标：这类函数（如 KissFFT 的
+// kiss_fft_alloc）属于一次性初始化而非被测计算内核，往其整数通路注错只会
+// 破坏 harness 自身的堆状态（libc abort: free(): invalid pointer），
+// 使同一进程内后续试验不可信。属于已记录的效度边界。
+bool allocatesMemory(Function *F) {
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB) continue;
+      Function *callee = CB->getCalledFunction();
+      if (!callee) continue;
+      StringRef n = callee->getName();
+      if (n == "malloc" || n == "calloc" || n == "realloc" || n == "free") return true;
+    }
+  }
+  return false;
+}
+
+std::set<Function *> computeInjectionClosure(Module &M) {
+  std::set<Function *> closure;
+  std::vector<Function *> worklist;
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    if (F.getName().startswith("bench_") && !isOutOfInjectionScope(F.getName())) {
+      closure.insert(&F);
+      worklist.push_back(&F);
+    }
+  }
+  while (!worklist.empty()) {
+    Function *cur = worklist.back();
+    worklist.pop_back();
+    for (BasicBlock &BB : *cur) {
+      for (Instruction &I : BB) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB) continue;
+        Function *callee = CB->getCalledFunction();
+        if (!callee || callee->isDeclaration()) continue;
+        if (callee->isIntrinsic() || isOutOfInjectionScope(callee->getName())) continue;
+        if (allocatesMemory(callee)) continue;
+        if (closure.insert(callee).second) worklist.push_back(callee);
+      }
+    }
+  }
+  return closure;
 }
 
 bool isFPDataInst(Instruction *I) {
@@ -57,8 +111,14 @@ bool isIntDataInst(Instruction *I) {
   if (I->isBinaryOp()) {
     Type *ty = I->getType();
     if (ty->isIntegerTy(32) || ty->isIntegerTy(16)) {
-      // 跳过被用于 GEP 地址偏移或循环条件/PHI 的整数指令（那些归属 address 或 branch 类别）
+      // 跳过被用于 GEP 地址偏移或循环条件/PHI 的整数指令（那些归属 address 或 branch 类别）。
+      // 但必须忽略容错变换自己插入的使用者：整数 TMR 会给每条被保护的指令挂上
+      // ICmpEQ/Select 内联表决，若把它们算作"流入比较"，被保护的指令就全部
+      // 变成不可注入 —— 保护越多、注入点越少，可靠性会被系统性地虚高。
       for (User *U : I->users()) {
+        if (auto *UI = dyn_cast<Instruction>(U)) {
+          if (UI->getMetadata("atft.voter.internal") != nullptr) continue;
+        }
         if (isa<PHINode>(U) || isa<ICmpInst>(U) || isa<GetElementPtrInst>(U) ||
             isa<SExtInst>(U) || isa<ZExtInst>(U))
           return false;
@@ -108,10 +168,11 @@ public:
 
     int32_t staticSiteId = 1;
 
+    std::set<Function *> injectionScope = computeInjectionClosure(M);
+
     for (Function &F : M) {
       if (F.isDeclaration()) continue;
-      StringRef fname = F.getName();
-      if (!isTargetBenchmarkFunction(fname)) continue;
+      if (!injectionScope.count(&F)) continue;
 
       std::vector<Instruction *> fpTargets;
       std::vector<Instruction *> intTargets;
