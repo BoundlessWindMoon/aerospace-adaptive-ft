@@ -79,6 +79,34 @@ static cl::opt<std::string> AtftReportFile(
     cl::desc("Output CSV file path for criticality analysis report"),
     cl::init(""));
 
+// --- 中期优化开关：三项都默认关闭，不改动已冻结基线的任何行为 ---
+
+// D2 控制平面三模：复制驱动 br/select/switch 的比较并多数决
+static cl::opt<bool> AtftCmpTMR(
+    "atft-cmp-tmr",
+    cl::desc("Triplicate control-flow-driving compares and majority-vote them"),
+    cl::init(false));
+
+// D3 表决阈值改为运行期逐负载值：表决器读全局 g_atft_delta_abs（由剖析结果填），
+// 而不是把 -atft-delta 的编译期常数烧进去
+static cl::opt<bool> AtftDeltaRuntime(
+    "atft-delta-runtime",
+    cl::desc("Read the voting threshold from the runtime global instead of a compile-time constant"),
+    cl::init(false));
+
+// D3 剖析构建：在表决点插桩记录无故障执行下的最大相对偏差 |R-A|/(1+|A|)
+static cl::opt<bool> AtftDeltaProfile(
+    "atft-delta-profile",
+    cl::desc("Instrument voting sites to profile the fault-free |R-A| envelope"),
+    cl::init(false));
+
+// D3 副本一致性判据改为按位相等：两条近似副本是同一条 f32 链的复制，
+// 无故障时按 IEEE-754 必然逐位相同，原先的 1e-6 / 1e-5 松弛量没有来源
+static cl::opt<bool> AtftReplicaExact(
+    "atft-replica-exact",
+    cl::desc("Require bitwise-equal approximate replicas instead of a slack threshold"),
+    cl::init(false));
+
 enum CritLevel {
   CRIT_NON_CRITICAL = 0,
   CRIT_SUB_CRITICAL = 1,
@@ -417,6 +445,109 @@ Value *insertZeroCostCSEBarrier(IRBuilder<> &IRB, Value *val) {
   InlineAsm *noop = InlineAsm::get(
       FunctionType::get(ty, {ty}, false), "", "=r,0", false);
   return IRB.CreateCall(noop, {val});
+}
+
+// ============================================================================
+// 模块 1B: 控制平面三模冗余 (Control-Plane TMR)
+//
+// 问题：数据平面的表决点在 store 与算术链末端，而喂给 br/select/switch 的比较
+// 结果被分支**直接消费**，不进复制链。分支走错后三条副本在错误路径上一致地算
+// 错，表决器看到全票通过。根因是副本共享控制流，不是覆盖不到。
+//
+// 做法：对驱动控制流的 ICmp/FCmp 做三份独立求值（操作数经 CSE 屏障隔离），
+// 用按位多数决 (c1&c2)|(c1&c3)|(c2&c3) 取代原比较结果。代价是 2 条额外比较加
+// 4 条布尔运算，相对三份算术链低一个量级。
+//
+// 文献定位：
+//   - EDDI (Oh et al., IEEE TR 51(1), 2002) 在分支前比对复制的操作数，
+//     本课题的数据已证明这条路径可达：cmp_branch 类 SDC 57.23% -> 39.35%；
+//   - nZDC (Didehban & Shrivastava, DAC 2016) 的"校验点挪到使用之前"；
+//   - CFCSS (Oh et al., IEEE TR 51(1), 2002) 校验跳转合法性，抓跑飞，
+//     抓不到"合法但判断错"的分支，与本变换互补。
+// 与 EDDI 的差别：EDDI 全程复制所有指令（开销 2.55x），本变换只复制
+// **控制流条件本身**，数据平面仍由近似三模负责，两者正交可叠加。
+//
+// 注意：副本比较**不**打 atft.voter.internal 标记。打了标记就不再是注错点，
+// 保护越多注入点越少，可靠性会被系统性虚高（见 FaultInjectorPass 的分类注释）。
+// 三副本都可注错时，随机单比特落到任一副本都被多数决掩盖，这才是真实的 TMR。
+// ============================================================================
+void transformFunctionCmpTMR(Function &F, unsigned *outProtected) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+
+  auto drivesControlFlow = [](Instruction *I) {
+    for (User *U : I->users()) {
+      if (isa<BranchInst>(U) || isa<SelectInst>(U) || isa<SwitchInst>(U)) return true;
+    }
+    return false;
+  };
+
+  auto replicable = [](Value *V) {
+    Type *T = V->getType();
+    return T->isIntegerTy() || T->isFloatingPointTy() || T->isPointerTy();
+  };
+
+  std::vector<CmpInst *> targets;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      auto *CI = dyn_cast<CmpInst>(&I);
+      if (!CI) continue;
+      // 表决器自身的内部比较不再复制：它已经是恢复逻辑的一部分
+      if (CI->getMetadata("atft.voter.internal") != nullptr) continue;
+      if (!drivesControlFlow(CI)) continue;
+      if (!replicable(CI->getOperand(0)) || !replicable(CI->getOperand(1))) continue;
+      if (isa<Constant>(CI->getOperand(0)) && isa<Constant>(CI->getOperand(1))) continue;
+      targets.push_back(CI);
+    }
+  }
+
+  for (CmpInst *CI : targets) {
+    Instruction *insertPt = CI->getNextNode();
+    if (!insertPt) continue;
+    IRBuilder<> IRB(insertPt);
+
+    std::set<Value *> created;
+    auto isolate = [&](Value *v) -> Value * {
+      if (isa<Constant>(v)) return v;
+      Value *b = insertZeroCostCSEBarrier(IRB, v);
+      created.insert(b);
+      return b;
+    };
+
+    Value *rep[2];
+    for (int k = 0; k < 2; ++k) {
+      Value *a = isolate(CI->getOperand(0));
+      Value *b = isolate(CI->getOperand(1));
+      rep[k] = IRB.CreateCmp(CI->getPredicate(), a, b,
+                             CI->getName() + ".tmr" + std::to_string(k + 1));
+      created.insert(rep[k]);
+    }
+
+    // 位级多数决：(c1&c2) | (c1&c3) | (c2&c3)
+    // 多数决写成嵌套 select 而不是与或网络：
+    //   maj = c1 ? (c2 | c3) : (c2 & c3)
+    //       = select(c1, select(c2, true, c3), select(c2, c3, false))
+    // 三条比较副本因此都直接被 SelectInst 消费，裁判层
+    // (FaultInjectorPass::cmpDrivesControlFlow) 判定它们仍然驱动控制流，
+    // 三份副本全部保持可注错。若写成 and/or 网络，三条比较的使用者都变成位运算，
+    // 该类别的注入点会归零 —— 那是把注入点做没了，不是把故障防住了。
+    Value *orArm = IRB.CreateSelect(rep[0], ConstantInt::getTrue(Ctx), rep[1], "cmp.or.arm");
+    Value *andArm = IRB.CreateSelect(rep[0], rep[1], ConstantInt::getFalse(Ctx), "cmp.and.arm");
+    Value *maj = IRB.CreateSelect(CI, orArm, andArm, "cmp.majority");
+    created.insert(orArm);
+    created.insert(andArm);
+    created.insert(maj);
+    // 多数决网络本身属于表决逻辑，不作为注错点；三条比较副本保持可注错
+    for (Value *v : {orArm, andArm, maj}) {
+      if (auto *I = dyn_cast<Instruction>(v))
+        I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+    }
+
+    CI->replaceUsesWithIf(maj, [&](Use &U) {
+      return created.count(U.getUser()) == 0;
+    });
+    if (outProtected) (*outProtected)++;
+  }
 }
 
 // ============================================================================
@@ -1095,13 +1226,38 @@ Value *createInlineFastApproxVote(IRBuilder<> &IRB, Module *M,
 
   Value *absA1 = markVoterInternal(IRB.CreateCall(FabsF64, {a1_f64}));
   Value *scale = markVoterInternal(IRB.CreateFAdd(ConstantFP::get(F64Ty, 1.0), absA1));
-  Value *effDelta = markVoterInternal(IRB.CreateFMul(ConstantFP::get(F64Ty, delta), scale));
+
+  // D3 剖析：记录无故障执行下的 |R - A| / (1 + |A|) 包络，供离线定出逐负载阈值
+  if (AtftDeltaProfile) {
+    FunctionCallee ObserveFn = M->getOrInsertFunction(
+        "atft_delta_profile_observe", Type::getVoidTy(Ctx), F64Ty, F64Ty);
+    markVoterInternal(IRB.CreateCall(ObserveFn, {rExact, a1_f64}));
+  }
+
+  // D3 阈值来源：编译期常数 或 运行期逐负载值（全局 <= 0 时回落到常数）
+  Value *deltaBase = ConstantFP::get(F64Ty, delta);
+  if (AtftDeltaRuntime) {
+    GlobalVariable *GDelta = cast<GlobalVariable>(
+        M->getOrInsertGlobal("g_atft_delta_abs", F64Ty));
+    Value *loaded = markVoterInternal(IRB.CreateLoad(F64Ty, GDelta, "delta.rt"));
+    Value *valid = markVoterInternal(
+        IRB.CreateFCmpOGT(loaded, ConstantFP::get(F64Ty, 0.0), "delta.rt.ok"));
+    deltaBase = markVoterInternal(IRB.CreateSelect(valid, loaded, deltaBase, "delta.eff"));
+  }
+  Value *effDelta = markVoterInternal(IRB.CreateFMul(deltaBase, scale));
 
   Value *diffRA1 = markVoterInternal(IRB.CreateCall(FabsF64, {markVoterInternal(IRB.CreateFSub(rExact, a1_f64))}));
   Value *rIsOk = markVoterInternal(IRB.CreateFCmpOLE(diffRA1, effDelta, "r.ok"));
 
-  Value *diffA12 = markVoterInternal(IRB.CreateCall(FabsF32, {markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32))}));
-  Value *a12Agree = markVoterInternal(IRB.CreateFCmpOLE(diffA12, ConstantFP::get(F32Ty, 1e-5f), "a12.ok"));
+  // 两条近似副本是同一条 f32 链的复制，无故障时按位相同；AtftReplicaExact 下
+  // 直接要求相等，不再给 1e-5 的无来源松弛量
+  Value *a12Agree = nullptr;
+  if (AtftReplicaExact) {
+    a12Agree = markVoterInternal(IRB.CreateFCmpOEQ(a1_f32, a2_f32, "a12.ok"));
+  } else {
+    Value *diffA12 = markVoterInternal(IRB.CreateCall(FabsF32, {markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32))}));
+    a12Agree = markVoterInternal(IRB.CreateFCmpOLE(diffA12, ConstantFP::get(F32Ty, 1e-5f), "a12.ok"));
+  }
 
   Value *useApprox = markVoterInternal(IRB.CreateAnd(IRB.CreateNot(rIsOk), a12Agree));
   return markVoterInternal(IRB.CreateSelect(useApprox, a1_f64, rExact, "inline.approx.voted"));
@@ -1385,14 +1541,37 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
 
         Value *absA1 = markVoterInternal(IRB.CreateCall(FabsF64, {a1_f64}));
         Value *scale = markVoterInternal(IRB.CreateFAdd(ConstantFP::get(F64Ty, 1.0), absA1));
-        Value *effDelta = markVoterInternal(IRB.CreateFMul(ConstantFP::get(F64Ty, delta), scale));
+
+        // D3 剖析：记录无故障执行下 |R - A| / (1 + |A|) 的包络
+        if (AtftDeltaProfile) {
+          FunctionCallee ObserveFn = M->getOrInsertFunction(
+              "atft_delta_profile_observe", Type::getVoidTy(Ctx), F64Ty, F64Ty);
+          markVoterInternal(IRB.CreateCall(ObserveFn, {val, a1_f64}));
+        }
+
+        // D3 阈值来源：编译期常数 或 运行期逐负载值
+        Value *deltaBase = ConstantFP::get(F64Ty, delta);
+        if (AtftDeltaRuntime) {
+          GlobalVariable *GDelta = cast<GlobalVariable>(
+              M->getOrInsertGlobal("g_atft_delta_abs", F64Ty));
+          Value *loaded = markVoterInternal(IRB.CreateLoad(F64Ty, GDelta, "delta.rt"));
+          Value *valid = markVoterInternal(
+              IRB.CreateFCmpOGT(loaded, ConstantFP::get(F64Ty, 0.0), "delta.rt.ok"));
+          deltaBase = markVoterInternal(IRB.CreateSelect(valid, loaded, deltaBase, "delta.eff"));
+        }
+        Value *effDelta = markVoterInternal(IRB.CreateFMul(deltaBase, scale));
 
         Value *subRA1 = markVoterInternal(IRB.CreateFSub(val, a1_f64));
         Value *diffRA1 = markVoterInternal(IRB.CreateCall(FabsF64, {subRA1}));
         Value *rIsOk = markVoterInternal(IRB.CreateFCmpOLE(diffRA1, effDelta, "r.ok"));
-        Value *subA12 = markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32));
-        Value *diffA12 = markVoterInternal(IRB.CreateCall(FabsF32, {subA12}));
-        Value *a12Ok = markVoterInternal(IRB.CreateFCmpOLE(diffA12, ConstantFP::get(F32Ty, 1e-5f), "a12.ok"));
+        Value *a12Ok = nullptr;
+        if (AtftReplicaExact) {
+          a12Ok = markVoterInternal(IRB.CreateFCmpOEQ(a1_f32, a2_f32, "a12.ok"));
+        } else {
+          Value *subA12 = markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32));
+          Value *diffA12 = markVoterInternal(IRB.CreateCall(FabsF32, {subA12}));
+          a12Ok = markVoterInternal(IRB.CreateFCmpOLE(diffA12, ConstantFP::get(F32Ty, 1e-5f), "a12.ok"));
+        }
         Value *fastPass = markVoterInternal(IRB.CreateAnd(rIsOk, a12Ok, "fast.pass"));
 
         Instruction *splitBefore = SI;
@@ -1625,6 +1804,11 @@ public:
       for (Function *F : targetFuncs) {
         expandFMulAddIntrinsics(*F);
       }
+      if (AtftCmpTMR) {
+        unsigned nProtected = 0;
+        for (Function *F : targetFuncs) transformFunctionCmpTMR(*F, &nProtected);
+        errs() << "ATFT_CMP_TMR_SITES," << nProtected << "\n";
+      }
       return PreservedAnalyses::none();
     }
 
@@ -1655,6 +1839,20 @@ public:
 
     // 调用图闭包已覆盖 KissFFT 的内部蝶形算子 (kf_bfly2/3/4/5) 与 kf_work，
     // 不再需要按函数名单独补一遍变换。
+
+    // D2 控制平面三模：在数据平面变换之后再做，正交叠加。
+    // adaptive 模式下 LOW/HIGH 两个克隆体已经取代了原函数体，这里对克隆体生效。
+    if (AtftCmpTMR) {
+      unsigned nProtected = 0;
+      for (Function &F : M) {
+        if (F.isDeclaration()) continue;
+        StringRef n = F.getName();
+        if (inClosure.count(&F) || n.endswith(".atft_low") || n.endswith(".atft_high")) {
+          transformFunctionCmpTMR(F, &nProtected);
+        }
+      }
+      errs() << "ATFT_CMP_TMR_SITES," << nProtected << "\n";
+    }
 
     return PreservedAnalyses::none();
   }

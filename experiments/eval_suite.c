@@ -87,6 +87,56 @@ static void eval_config_from_env(void) {
 }
 
 // ============================================================================
+// 逐负载表决阈值表 (D3) 与注错随机种子
+//
+//   ATFT_DELTA_TABLE   : CSV 路径，每行 "benchmark,delta"。某负载缺行则该负载
+//                        回落到编译期常数（g_atft_delta_abs = -1）。
+//   ATFT_REPLICA_EXACT : 1 = 要求两条近似副本按位相等
+//   ATFT_FI_SEED       : 注错随机种子基数。默认与历史一致，改它即可做多种子
+//                        重复实验，用来回答"单种子结论的方差有多大"。
+// ============================================================================
+#define ATFT_MAX_DELTA_ROWS 64
+static struct { char name[64]; double delta; } g_delta_table[ATFT_MAX_DELTA_ROWS];
+static int g_delta_table_n = 0;
+static uint64_t g_fi_seed_base = 0x123456789abcdef0ULL;
+
+static void load_delta_table(void) {
+    const char *v = getenv("ATFT_REPLICA_EXACT");
+    if (v && *v && atoi(v) != 0) atft_set_replica_exact(1);
+    if ((v = getenv("ATFT_FI_SEED")) && *v) g_fi_seed_base = strtoull(v, NULL, 0);
+
+    const char *path = getenv("ATFT_DELTA_TABLE");
+    if (!path || !*path) return;
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "[delta] 打不开阈值表 %s\n", path);
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && g_delta_table_n < ATFT_MAX_DELTA_ROWS) {
+        char nm[64];
+        double d;
+        if (sscanf(line, "%63[^,],%lf", nm, &d) == 2 && d > 0.0) {
+            snprintf(g_delta_table[g_delta_table_n].name,
+                     sizeof(g_delta_table[g_delta_table_n].name), "%s", nm);
+            g_delta_table[g_delta_table_n].delta = d;
+            g_delta_table_n++;
+        }
+    }
+    fclose(fp);
+}
+
+static void apply_delta_for_bench(const char *name) {
+    for (int i = 0; i < g_delta_table_n; i++) {
+        if (strcmp(g_delta_table[i].name, name) == 0) {
+            atft_set_delta(g_delta_table[i].delta);
+            return;
+        }
+    }
+    atft_set_delta(-1.0);
+}
+
+// ============================================================================
 // 基准注册表（声明式）
 //
 // 新增一个负载 = 在 BENCHES[] 里加一行 + 在 reset/invoke/export 三个 switch 里
@@ -569,6 +619,7 @@ static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir,
 
     for (int b = 0; b < NUM_BENCHES; b++) {
         atft_init(10000.0, 4.0, 3, 4, 3);
+        apply_delta_for_bench(bench_name(b));
         if (strcmp(policy_name, "adaptive_high") == 0) {
             g_atft_state.current_mode = ATFT_MODE_HIGH;
         }
@@ -706,6 +757,7 @@ static void fi_run_campaign(suite_workspace_t *ws, int b, const char *policy_nam
     }
 
     atft_init(10000.0, 4.0, 3, 4, 3);
+    apply_delta_for_bench(bench_name(b));
     if (strstr(policy_name, "adaptive") != NULL) g_atft_state.current_mode = ATFT_MODE_HIGH;
     harness_fi_reset_profile();
     invoke_benchmark(ws, b);
@@ -755,6 +807,7 @@ static void fi_run_campaign(suite_workspace_t *ws, int b, const char *policy_nam
             setitimer(ITIMER_REAL, &cw, NULL);
 
             atft_init(10000.0, 4.0, 3, 4, 3);
+            apply_delta_for_bench(bench_name(b));
             if (strstr(policy_name, "adaptive") != NULL) g_atft_state.current_mode = ATFT_MODE_HIGH;
             uint64_t base_alarms = g_atft_state.detected_faults;
 
@@ -806,7 +859,7 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
 
     for (int b = 0; b < NUM_BENCHES; b++) {
         fi_stats_t st;
-        uint64_t seed = 0x123456789abcdef0ULL ^ ((uint64_t)(b + 1) << 32);
+        uint64_t seed = g_fi_seed_base ^ ((uint64_t)(b + 1) << 32);
         fi_run_campaign(&ws, b, policy_name, trials, seed,
                         pick_uniform_single_bit, NULL, &st);
 
@@ -1137,8 +1190,174 @@ static int run_scale_sweep_pmu(const char *policy_name) {
 }
 
 // 导出基准注册表，供 Python 侧聚合脚本读取（避免套件归属在两处各写一遍）
-static int list_benchmarks(void) {
-    printf("name,suite,kind,tags\n");
+// ----------------------------------------------------------------------------
+// D3: 无故障近似误差包络剖析
+//
+// 用 -atft-delta-profile 构建出的二进制跑一遍无故障执行，表决点会把
+// |R - A| / (1 + |A|) 的最大值累积到运行时。每个负载一行，供上层定出
+//   delta_f = max(alpha * E_f, kappa * u_fp32)
+// 这里只报原始包络 E_f，alpha / kappa 留给上层做敏感性消融。
+// ----------------------------------------------------------------------------
+static int run_delta_profile(void) {
+    suite_workspace_t ws;
+    alloc_and_init_workspace(&ws, 0);
+
+    printf("benchmark,env_max_rel_dev,observations\n");
+    for (int b = 0; b < NUM_BENCHES; b++) {
+        atft_init(10000.0, 4.0, 3, 4, 3);
+        atft_set_delta(-1.0);
+        atft_delta_profile_reset();
+        reset_mutable_buffers(&ws, b);
+        invoke_benchmark(&ws, b);
+        printf("%s,%.9e,%llu\n", bench_name(b), atft_delta_profile_max(),
+               (unsigned long long)g_atft_delta_obs_cnt);
+    }
+
+    free_workspace(&ws);
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// D6: 模式切换判决规则的蒙特卡洛评估
+//
+// 被评估的两套规则都来自 runtime/atft_runtime.c 的同一份实现（不在这里另写一
+// 遍），只是初始化方式不同：
+//   legacy : 连续 N 次短间隔 + 窗口累计阈值 + M 个平静窗口降档（五个拍定常数）
+//   sprt   : Wald 序贯概率比检验，alpha / beta 是指定的误报与漏检上界
+//
+// 到达过程按轨道剖面生成：平静段速率 lambda0、SAA 过境段 lambda1 = r*lambda0，
+// 过境驻留与轨道周期取 results/rq9_orbit_profile.csv 选中的那一行（b=20000 nT），
+// 速率比 r 取 temporal.saa_ratio 的扫描点。时间折算成退休指令数喂给检测器。
+//
+// 报的是三件事：平静段误报率、过境段检出率与检测延迟、过境后回到 LOW 的滞后。
+// 这三项合起来才是"切换规则好不好"的完整判据。
+// ----------------------------------------------------------------------------
+static double exp_sample(uint64_t *rng, double rate_per_min) {
+    double u = (double)(splitmix64(rng) >> 11) / 9007199254740992.0; // [0,1)
+    if (u <= 1e-18) u = 1e-18;
+    return -log(u) / rate_per_min;
+}
+
+static int run_switch_eval(void) {
+    const double ips = 1.0e9;        // 指令/分钟，仅用于把时间折算成指令计数
+    double dwell_min = 8.29;         // SAA 过境驻留（rq9_orbit_profile.csv，20000 nT）
+    double period_min = 96.58;       // 轨道周期
+    double events_in_dwell = 9.0;    // 过境窗口内的期望事件数（标称速率比下）
+    int transits = 2000;
+    const char *v;
+    if ((v = getenv("ATFT_SWITCH_TRANSITS")) && *v) transits = atoi(v);
+    if ((v = getenv("ATFT_SWITCH_DWELL_MIN")) && *v) dwell_min = atof(v);
+    if ((v = getenv("ATFT_SWITCH_EVENTS")) && *v) events_in_dwell = atof(v);
+
+    double ratios[8] = {4.0, 25.0, 100.0, 200.0, 450.0};
+    int n_ratios = 5;
+
+    printf("detector,param,rate_ratio,transits,false_alarm_pct,detect_pct,"
+           "mean_delay_min,mean_events_to_detect,mean_recovery_lag_min,"
+           "events_to_decide_theory\n");
+
+    for (int ri = 0; ri < n_ratios; ri++) {
+        double r = ratios[ri];
+        double lam1 = events_in_dwell / dwell_min;   // 过境段速率（事件/分钟）
+        double lam0 = lam1 / r;                      // 平静段速率
+        double calm_interval_inst = ips / lam0;      // 检测器看到的 T_calm（指令）
+        double calm_min = period_min - dwell_min;
+
+        // detector: 0..3 = legacy with window = dwell/{8,4,2,1}; 4..5 = sprt alpha=beta={0.01,0.05}
+        for (int d = 0; d < 6; d++) {
+            uint64_t rng = 0xA5A5C0FFEEULL + (uint64_t)(ri * 97 + d);
+            int fa = 0, detected = 0, recovered = 0;
+            double sum_delay = 0.0, sum_events = 0.0, sum_recov = 0.0;
+            double win_min = dwell_min / (double)(1 << (3 - (d < 4 ? d : 0)));
+            double alpha = (d == 4) ? 0.01 : 0.05;
+
+            for (int t = 0; t < transits; t++) {
+                if (d < 4) atft_init(calm_interval_inst, 4.0, 3, 4, 3);
+                else       atft_init_sprt(calm_interval_inst, r, alpha, alpha);
+
+                double next_win = win_min;
+                double clock = 0.0;
+                // --- 平静段 ---
+                double tnext = exp_sample(&rng, lam0);
+                int alarmed_in_calm = 0;
+                while (clock + tnext < calm_min) {
+                    clock += tnext;
+                    while (d < 4 && clock > next_win) { atft_step_window(); next_win += win_min; }
+                    atft_advance_insts((uint64_t)(tnext * ips));
+                    atft_report_ecc_event();
+                    if (atft_get_mode() == ATFT_MODE_HIGH) alarmed_in_calm = 1;
+                    tnext = exp_sample(&rng, lam0);
+                }
+                if (alarmed_in_calm) fa++;
+
+                // --- SAA 过境段 ---
+                double saa_t = 0.0;
+                int ev = 0, det = 0, det_events = 0;
+                double delay = 0.0;
+                // 过境段开始前先把残余的平静段时间走完
+                atft_advance_insts((uint64_t)((calm_min - clock) * ips));
+                clock = calm_min;
+                int mode_at_entry = (int)atft_get_mode();
+                tnext = exp_sample(&rng, lam1);
+                while (saa_t + tnext < dwell_min) {
+                    saa_t += tnext;
+                    while (d < 4 && (calm_min + saa_t) > next_win) { atft_step_window(); next_win += win_min; }
+                    atft_advance_insts((uint64_t)(tnext * ips));
+                    atft_report_ecc_event();
+                    ev++;
+                    if (!det && atft_get_mode() == ATFT_MODE_HIGH) {
+                        det = 1;
+                        delay = saa_t;
+                        det_events = ev;
+                    }
+                    tnext = exp_sample(&rng, lam1);
+                }
+                if (mode_at_entry == (int)ATFT_MODE_LOW && det) {
+                    detected++;
+                    sum_delay += delay;
+                    sum_events += det_events;
+                }
+
+                // --- 过境后平静段：量回到 LOW 的滞后 ---
+                if (atft_get_mode() == ATFT_MODE_HIGH) {
+                    double post = 0.0;
+                    tnext = exp_sample(&rng, lam0);
+                    while (post < calm_min) {
+                        post += tnext;
+                        while (d < 4 && (calm_min + dwell_min + post) > next_win) {
+                            atft_step_window(); next_win += win_min;
+                        }
+                        atft_advance_insts((uint64_t)(tnext * ips));
+                        atft_report_ecc_event();
+                        if (atft_get_mode() == ATFT_MODE_LOW) break;
+                        tnext = exp_sample(&rng, lam0);
+                    }
+                    if (atft_get_mode() == ATFT_MODE_LOW) {
+                        recovered++;
+                        sum_recov += post;
+                    }
+                }
+            }
+
+            double gain = log(r) - (r - 1.0) / r;
+            double n_theory = (d >= 4) ? (log((1.0 - alpha) / alpha) / gain) : 0.0;
+            char param[64];
+            if (d < 4) snprintf(param, sizeof(param), "window=%.2fmin", win_min);
+            else       snprintf(param, sizeof(param), "alpha=beta=%.2f", alpha);
+            printf("%s,%s,%.0f,%d,%.2f,%.2f,%.3f,%.2f,%.3f,%.2f\n",
+                   d < 4 ? "legacy" : "sprt", param, r, transits,
+                   100.0 * fa / transits,
+                   100.0 * detected / transits,
+                   detected ? sum_delay / detected : -1.0,
+                   detected ? sum_events / detected : -1.0,
+                   recovered ? sum_recov / recovered : -1.0,
+                   n_theory);
+        }
+    }
+    return 0;
+}
+
+static int list_benchmarks(void) {    printf("name,suite,kind,tags\n");
     for (int b = 0; b < NUM_BENCHES; b++) {
         printf("%s,%s,%s,%s%s%s\n",
                BENCHES[b].name, BENCHES[b].suite,
@@ -1158,6 +1377,13 @@ int main(int argc, char **argv) {
         return list_benchmarks();
     }
     eval_config_from_env();
+    load_delta_table();
+    if (strcmp(argv[1], "--delta-profile") == 0) {
+        return run_delta_profile();
+    }
+    if (strcmp(argv[1], "--switch-eval") == 0) {
+        return run_switch_eval();
+    }
     if (strcmp(argv[1], "--dump-golden") == 0 && argc >= 3) {
         return run_pmu_perf_and_qor("native", argv[2], 1);
     } else if (strcmp(argv[1], "--pmu-perf") == 0 && argc >= 4) {

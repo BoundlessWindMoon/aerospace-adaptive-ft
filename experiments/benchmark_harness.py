@@ -184,7 +184,12 @@ def category_trials(cfg, args):
 
 
 def policy_entries(cfg):
-    """YAML 的 policies 展开为 (tag, mode, budget, delta, is_golden, do_fi)。"""
+    """YAML 的 policies 展开为 (tag, mode, budget, delta, is_golden, do_fi, pass_flags, env)。
+
+    pass_flags / env 是中期优化开关的入口：前者透传给策略 Pass（如
+    -atft-cmp-tmr），后者透传给被测二进制的环境（如逐负载阈值表路径）。
+    两者缺省为空，所以已冻结策略的行为逐字节不变。
+    """
     dflt = cfg.get("defaults", {})
     out = []
     for p in cfg.get("policies", []):
@@ -194,6 +199,8 @@ def policy_entries(cfg):
             float(p.get("delta", dflt.get("delta", 5e-5))),
             bool(p.get("golden", False)),
             bool(p.get("fi", False)),
+            list(p.get("pass_flags", [])),
+            dict(p.get("env", {})),
         ))
     return out
 
@@ -264,9 +271,15 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
                                 delta=5e-5, w1=2.5, w2=1.8, w3=0.8,
                                 fi_trials=600, dump_golden=False, run_fi=True,
                                 fi_target_type="fp64", arch="x86_64",
-                                static_sites_out=None):
+                                static_sites_out=None, pass_flags=None,
+                                env_extra=None):
     sut_ll = BUILD_DIR / f"sut_{tag}.ll"
     sut_bin = BUILD_DIR / f"bin_{tag}_{arch}"
+
+    run_env = None
+    if env_extra:
+        run_env = dict(os.environ)
+        run_env.update({k: str(v) for k, v in env_extra.items()})
 
     opt_cmd = [
         OPT, f"-load-pass-plugin={PASS_POLICY_SO}",
@@ -276,6 +289,7 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
         f"-atft-budget={budget}",
         f"-atft-delta={delta}",
         f"-atft-w1={w1}", f"-atft-w2={w2}", f"-atft-w3={w3}",
+        *(pass_flags or []),
         "-S", str(ssa_ll), "-o", str(sut_ll)
     ]
     if tag == "native":
@@ -301,9 +315,9 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
     run_cmd(cc_cmd)
 
     if dump_golden:
-        run_cmd([*exec_prefix, str(sut_bin), "--dump-golden", str(GOLDEN_DIR)])
+        run_cmd([*exec_prefix, str(sut_bin), "--dump-golden", str(GOLDEN_DIR)], env=run_env)
 
-    pmu_out = run_cmd([*exec_prefix, str(sut_bin), "--pmu-perf", tag, str(GOLDEN_DIR)])
+    pmu_out = run_cmd([*exec_prefix, str(sut_bin), "--pmu-perf", tag, str(GOLDEN_DIR)], env=run_env)
     pmu_rows = []
     for line in pmu_out.strip().splitlines():
         if line.startswith("PMU_CSV,"):
@@ -352,7 +366,7 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
             ]
         run_cmd(fi_cc_cmd)
         fi_out = run_cmd([*exec_prefix, str(sut_fi_bin), "--fi-one", tag, str(GOLDEN_DIR), str(fi_trials)],
-                         allow_nonzero=True, timeout_s=300)
+                         allow_nonzero=True, timeout_s=300, env=run_env)
         for line in fi_out.strip().splitlines():
             if line.startswith("FI5_CSV,"):
                 parts = line.split(",")
@@ -672,7 +686,7 @@ def run_selected_research_questions(args):
         per_cat_trials = category_trials(cfg, args)
         static_sites = {}
 
-        for tag, mode, budget, delta, is_gold, do_fi in core_configs:
+        for tag, mode, budget, delta, is_gold, do_fi, pflags, penv in core_configs:
             if selected_policies and tag not in selected_policies and tag != "native":
                 continue
             first_for_policy = True
@@ -686,7 +700,7 @@ def run_selected_research_questions(args):
                     w1=wts.get("w1", 2.5), w2=wts.get("w2", 1.8), w3=wts.get("w3", 0.8),
                     fi_trials=per_cat_trials, dump_golden=(is_gold and first_for_policy),
                     run_fi=do_fi, fi_target_type=cat, arch=args.arch,
-                    static_sites_out=sites
+                    static_sites_out=sites, pass_flags=pflags, env_extra=penv
                 )
                 if sites:
                     static_sites[tag] = sites
@@ -717,8 +731,12 @@ def run_selected_research_questions(args):
 
         # balanced（默认全类别等额）写主 CSV；定向跑单个类别时写带后缀的 CSV，
         # 避免覆盖正式数据，也避免"跑了但没落盘"
-        if not selected_policies and args.arch == "x86_64":
-            suffix = "" if args.fi_type == "balanced" else "_" + args.fi_type.replace(",", "-")
+        out_suffix = getattr(args, "out_suffix", None)
+        if (not selected_policies or out_suffix) and args.arch == "x86_64":
+            if out_suffix:
+                suffix = "_" + out_suffix
+            else:
+                suffix = "" if args.fi_type == "balanced" else "_" + args.fi_type.replace(",", "-")
             pmu_path = RES_DIR / f"rq1_pmu_performance_qor{suffix}.csv"
             fi_path = RES_DIR / f"rq1_fault_injection_outcomes{suffix}.csv"
             with open(pmu_path, "w", newline="") as f:
@@ -957,6 +975,9 @@ def parse_args():
                              "，或逗号分隔的类别名 fp64/fp32/int_arith/cast/load/addr/cmp_branch")
     parser.add_argument("--trials-per-category", type=int, default=None,
                         help="每个注错类别的注入次数（默认取配置 trials_per_category）")
+    parser.add_argument("--out-suffix", default=None,
+                        help="把本次 RQ1 结果写成 rq1_*_<suffix>.csv，不覆盖已冻结的主 CSV；"
+                             "配合 --policy 做隔离的消融实验")
     parser.add_argument("--config", default=None,
                         help="YAML 配置文件路径（默认 experiments/config/default.yaml）")
     parser.add_argument("--trials", type=int, default=None,

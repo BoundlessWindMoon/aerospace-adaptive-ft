@@ -54,6 +54,14 @@ typedef struct {
     atft_prot_mode_t current_mode;      // 当前保护状态 (LOW / HIGH)
     uint64_t mode_switch_count;         // 模式切换次数
 
+    // SPRT 变点检测 (D6)：替掉 theta / N / 窗口阈值 / M / 降档水位五个拍定常数
+    int      sprt_enabled;              // 1 = 用序贯概率比检验判决模式切换
+    double   sprt_llr;                  // 当前累积对数似然比
+    double   sprt_log_r;                // ln(lambda1 / lambda0)
+    double   sprt_rate_ratio;           // r = lambda1 / lambda0（由在轨 SEU 速率模型给）
+    double   sprt_bound_a;              // 上边界 ln((1-beta)/alpha)，越过即升档
+    double   sprt_bound_b;              // 下边界 ln(beta/(1-alpha))，越过即降档
+
     // 故障注入配置 (对应开题报告 4.3.2 可靠性评估)
     int      fi_enabled;                // 是否开启故障注入
     double   fi_prob;                   // 每次算术链执行触发单比特翻转的概率
@@ -64,11 +72,41 @@ typedef struct {
 extern atft_runtime_state_t g_atft_state;
 
 // ============================================================================
+// 3B. 逐负载表决阈值 (D3)
+//
+// 阈值原先是编译期全局常数 5e-5，而各负载的固有近似误差跨四个数量级：阈值小于
+// 固有误差必然 100% 误报，远大于固有误差则大量漏检。改为运行期按负载给值：
+//   delta_f = max(alpha * E_f, kappa * u_f32)
+//     E_f    : 无故障剖析实测的 max |R - A| / (1 + |A|) 包络
+//     u_f32  : fp32 单位舍入 2^-24，精确链与 f32 近似副本的理论最小分歧量级
+//     alpha  : 包络安全系数；kappa: 地板系数。两者都做敏感性消融
+// g_atft_delta_abs <= 0 时表决器回落到编译期常数，冻结基线行为不变。
+// 思路对应 ApproxTuner (PPoPP'21) 的逐点误差剖面，但不做搜索、不需要校准集：
+// 一次无故障运行即可定出，所以能随负载泛化。
+// ============================================================================
+extern double g_atft_delta_abs;       // >0 时覆盖编译期阈值
+extern double g_atft_delta_obs_max;   // 剖析累计：最大相对偏差
+extern uint64_t g_atft_delta_obs_cnt; // 剖析累计：观测点数
+extern int    g_atft_replica_exact;   // 1 = 要求两条近似副本按位相等
+
+void   atft_delta_profile_observe(double r_exact, double a_approx);
+void   atft_delta_profile_reset(void);
+double atft_delta_profile_max(void);
+void   atft_set_delta(double delta_abs);
+void   atft_set_replica_exact(int on);
+
+// ============================================================================
 // 4. 运行时 API (供 LLVM Pass 插桩调用及基准测试驱动调用)
 // ============================================================================
 
 // 初始化与重置运行时状态
 void atft_init(double calm_interval, double theta, uint32_t n_short, uint32_t win_thresh, uint32_t m_calm);
+
+// SPRT 版初始化：alpha / beta 是指定的误报率与漏检率上界，rate_ratio 来自在轨
+// SEU 速率模型（SAA 内外速率比）。判决所需事件数 = ln((1-beta)/alpha) /
+// (ln r - (r-1)/r)，可在部署前算出，与过境窗口内的期望事件数直接比较。
+void atft_init_sprt(double calm_interval, double rate_ratio, double alpha, double beta);
+
 void atft_reset_stats(void);
 atft_prot_mode_t atft_get_mode(void);
 

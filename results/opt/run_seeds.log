@@ -1,0 +1,160 @@
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a4_k4.csv
+=== [2] 消融 campaign (seed#1) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/cmp_branch] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_base/fp64] flags=- trials=200
+  -> [opt_base/cmp_branch] flags=- trials=200
+  -> [opt_base/load] flags=- trials=200
+  -> [opt_cmptmr/fp64] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr/cmp_branch] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr/load] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr_delta/fp64] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_cmptmr_delta/cmp_branch] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_cmptmr_delta/load] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   37.44  1.41    1.46  0.24      0.00      2.6
+opt_base         6.75   27.35  1.17    1.51  0.25     11.06      0.5
+opt_cmptmr       8.30    8.54  0.92    1.49  0.25     11.36      1.2
+opt_cmptmr_delta   8.50    8.04  0.89    1.49  0.25     10.95      1.2
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           30.21  2.98    0.00      0.00   10   2000
+  cmp_branch     56.53  2.17    0.08      0.00   17   3400
+  load           25.59  2.10    4.29      0.00   16   3200
+
+[opt_base] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           10.50  2.15    0.00     13.46   10   2000
+  cmp_branch     56.43  2.17    0.08      0.77   17   3400
+  load           15.12  1.71    4.46     18.94   16   3200
+
+[opt_cmptmr] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           10.50  2.15    0.00     13.46   10   2000
+  cmp_branch      0.00  0.00    0.00      1.67   17   3400
+  load           15.12  1.71    4.46     18.94   16   3200
+
+[opt_cmptmr_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            9.17  2.06    0.00     13.27   10   2000
+  cmp_branch      0.00  0.00    0.00      0.00   17   3400
+  load           14.96  1.70    4.46     19.57   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a4_t200_s1.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a4_t200_s1.json
+=== [2] 消融 campaign (seed#2) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/cmp_branch] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_base/fp64] flags=- trials=200
+  -> [opt_base/cmp_branch] flags=- trials=200
+  -> [opt_base/load] flags=- trials=200
+  -> [opt_cmptmr/fp64] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr/cmp_branch] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr/load] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr_delta/fp64] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_cmptmr_delta/cmp_branch] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_cmptmr_delta/load] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   37.27  1.34    1.31  0.23      0.00      2.6
+opt_base         6.75   28.23  1.13    1.33  0.24     10.02      0.5
+opt_cmptmr       8.30    8.35  0.88    1.31  0.24     10.35      1.2
+opt_cmptmr_delta   8.50    7.96  0.86    1.31  0.24     10.10      1.3
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           27.94  2.80    0.00      0.00   10   2000
+  cmp_branch     59.65  2.11    0.08      0.00   17   3400
+  load           24.22  1.97    3.83      0.00   16   3200
+
+[opt_base] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            9.67  2.10    0.00     12.62   10   2000
+  cmp_branch     59.63  2.11    0.08      0.68   17   3400
+  load           15.38  1.60    3.92     16.77   16   3200
+
+[opt_cmptmr] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            9.67  2.10    0.00     12.62   10   2000
+  cmp_branch      0.00  0.00    0.00      1.67   17   3400
+  load           15.38  1.60    3.92     16.77   16   3200
+
+[opt_cmptmr_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.50  2.01    0.00     12.31   10   2000
+  cmp_branch      0.00  0.00    0.00      0.00   17   3400
+  load           15.38  1.60    3.92     17.99   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a4_t200_s2.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a4_t200_s2.json
+=== [2] 消融 campaign (seed#3) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/cmp_branch] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_base/fp64] flags=- trials=200
+  -> [opt_base/cmp_branch] flags=- trials=200
+  -> [opt_base/load] flags=- trials=200
+  -> [opt_cmptmr/fp64] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr/cmp_branch] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr/load] flags=-atft-cmp-tmr trials=200
+  -> [opt_cmptmr_delta/fp64] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_cmptmr_delta/cmp_branch] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_cmptmr_delta/load] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   37.54  1.40    1.32  0.23      0.00      2.6
+opt_base         6.75   28.24  1.14    1.35  0.24     10.64      0.5
+opt_cmptmr       8.30    8.59  0.89    1.35  0.24     11.02      1.2
+opt_cmptmr_delta   8.50    8.37  0.88    1.35  0.24     10.85      1.2
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           28.29  2.98    0.00      0.00   10   2000
+  cmp_branch     58.95  2.16    0.00      0.00   17   3400
+  load           25.37  2.02    3.96      0.00   16   3200
+
+[opt_base] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           10.83  2.16    0.00     13.54   10   2000
+  cmp_branch     58.94  2.16    0.00      0.51   17   3400
+  load           14.95  1.54    4.04     17.86   16   3200
+
+[opt_cmptmr] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           10.83  2.16    0.00     13.54   10   2000
+  cmp_branch      0.00  0.00    0.00      1.67   17   3400
+  load           14.95  1.54    4.04     17.86   16   3200
+
+[opt_cmptmr_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           10.17  2.13    0.00     13.42   10   2000
+  cmp_branch      0.00  0.00    0.00      0.00   17   3400
+  load           14.95  1.54    4.04     19.12   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a4_t200_s3.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a4_t200_s3.json

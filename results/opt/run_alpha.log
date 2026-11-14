@@ -1,0 +1,210 @@
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a1_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_delta/fp64] flags=-atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_delta/load] flags=-atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   27.19  1.80    1.73  0.33      0.00      3.5
+opt_delta        6.92   11.58  1.28    1.77  0.34     15.42      1.1
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.42  2.98    0.00      0.00   10   2000
+  load           24.97  2.04    3.46      0.00   16   3200
+
+[opt_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.17  1.99    0.00     12.60   10   2000
+  load           15.00  1.60    3.54     18.24   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a1_t200.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a1_t200.json
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a2_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_delta/fp64] flags=-atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_delta/load] flags=-atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   27.19  1.80    1.73  0.33      0.00      3.5
+opt_delta        6.92   11.58  1.28    1.77  0.34     15.38      1.1
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.42  2.98    0.00      0.00   10   2000
+  load           24.97  2.04    3.46      0.00   16   3200
+
+[opt_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.17  1.99    0.00     12.54   10   2000
+  load           15.00  1.60    3.54     18.22   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a2_t200.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a2_t200.json
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a8_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_delta/fp64] flags=-atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_delta/load] flags=-atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   27.19  1.80    1.73  0.33      0.00      3.5
+opt_delta        6.92   11.58  1.28    1.77  0.34     14.93      1.1
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.42  2.98    0.00      0.00   10   2000
+  load           24.97  2.04    3.46      0.00   16   3200
+
+[opt_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.17  1.99    0.00     11.75   10   2000
+  load           15.00  1.60    3.54     18.11   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a8_t200.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a8_t200.json
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a16_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_delta/fp64] flags=-atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_delta/load] flags=-atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   27.19  1.80    1.73  0.33      0.00      3.5
+opt_delta        6.92   11.58  1.28    1.77  0.34     14.73      1.1
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.42  2.98    0.00      0.00   10   2000
+  load           24.97  2.04    3.46      0.00   16   3200
+
+[opt_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.17  1.99    0.00     11.40   10   2000
+  load           15.00  1.60    3.54     18.06   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a16_t200.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a16_t200.json
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a64_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [opt_delta/fp64] flags=-atft-delta-runtime -atft-replica-exact trials=200
+  -> [opt_delta/load] flags=-atft-delta-runtime -atft-replica-exact trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   27.19  1.80    1.73  0.33      0.00      3.5
+opt_delta        6.92   11.58  1.28    1.77  0.34     14.24      1.1
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.42  2.98    0.00      0.00   10   2000
+  load           24.97  2.04    3.46      0.00   16   3200
+
+[opt_delta] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.17  1.99    0.00     10.54   10   2000
+  load           15.00  1.60    3.54     17.93   16   3200
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a64_t200.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a64_t200.json

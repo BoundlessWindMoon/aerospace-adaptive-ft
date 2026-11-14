@@ -1,0 +1,17 @@
+pb_gemm,9.008450224e-07
+pb_2mm,1.470988147e-06
+pb_atax,8.421701672e-07
+pb_bicg,8.291572072e-07
+pb_jacobi2d,5.446009971e-07
+pb_ludcmp,3.155379164e-06
+pb_durbin,9.365592248e-07
+pb_deriche,1.690140772e-03
+pb_floyd_warshall,2.384185791e-07
+pb_nussinov,2.384185791e-07
+parsec_blackscholes,1.831768022e-03
+dsp_kissfft,6.278053823e-04
+axc_sobel,2.384185791e-07
+coast_crc16,2.384185791e-07
+coast_quicksort,2.384185791e-07
+obpmark_image_prep,2.384185791e-07
+obpmark_image_proc,2.384185791e-07

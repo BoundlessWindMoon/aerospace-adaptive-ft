@@ -33,6 +33,45 @@ atft_runtime_state_t g_atft_state = {
 
 static uint64_t g_rng_state = 0x853c49e6748fea9bULL;
 
+// ============================================================================
+// 逐负载表决阈值与无故障包络剖析 (D3)
+// ============================================================================
+double   g_atft_delta_abs = -1.0;
+double   g_atft_delta_obs_max = 0.0;
+uint64_t g_atft_delta_obs_cnt = 0;
+int      g_atft_replica_exact = 0;
+
+// fp32 单位舍入 2^-24：精确 fp64 链与 f32 近似副本之间可能出现的最小相对分歧
+#define ATFT_U_FP32 5.9604644775390625e-08
+// 地板系数：阈值不低于 kappa 倍单位舍入，避免剖析样本未覆盖到的末位抖动误报
+#define ATFT_DELTA_FLOOR_KAPPA 4.0
+
+void atft_set_replica_exact(int on) {
+    g_atft_replica_exact = on ? 1 : 0;
+}
+
+void atft_set_delta(double delta_abs) {
+    g_atft_delta_abs = delta_abs;
+}
+
+// 观测量与表决器使用的判据同形：|R - A| / (1 + |A|)。同形才能把剖析值直接当
+// 阈值用，不需要再引入换算系数。
+void atft_delta_profile_observe(double r_exact, double a_approx) {
+    if (!isfinite(r_exact) || !isfinite(a_approx)) return;
+    double rel = fabs(r_exact - a_approx) / (1.0 + fabs(a_approx));
+    if (rel > g_atft_delta_obs_max) g_atft_delta_obs_max = rel;
+    g_atft_delta_obs_cnt++;
+}
+
+void atft_delta_profile_reset(void) {
+    g_atft_delta_obs_max = 0.0;
+    g_atft_delta_obs_cnt = 0;
+}
+
+double atft_delta_profile_max(void) {
+    return g_atft_delta_obs_max;
+}
+
 static inline uint64_t xorshift64(void) {
     uint64_t x = g_rng_state;
     x ^= x << 13;
@@ -57,8 +96,20 @@ void atft_init(double calm_interval, double theta, uint32_t n_short, uint32_t wi
     g_atft_state.fi_target_branch = -1;
 }
 
-void atft_reset_stats(void) {
-    g_atft_state.total_votes = 0;
+void atft_init_sprt(double calm_interval, double rate_ratio, double alpha, double beta) {
+    atft_init(calm_interval, 4.0, 3, 4, 3);
+    if (!(rate_ratio > 1.0)) rate_ratio = 2.0;
+    if (!(alpha > 0.0 && alpha < 1.0)) alpha = 0.01;
+    if (!(beta > 0.0 && beta < 1.0)) beta = 0.01;
+    g_atft_state.sprt_enabled = 1;
+    g_atft_state.sprt_rate_ratio = rate_ratio;
+    g_atft_state.sprt_log_r = log(rate_ratio);
+    g_atft_state.sprt_bound_a = log((1.0 - beta) / alpha);
+    g_atft_state.sprt_bound_b = log(beta / (1.0 - alpha));
+    g_atft_state.sprt_llr = 0.0;
+}
+
+void atft_reset_stats(void) {    g_atft_state.total_votes = 0;
     g_atft_state.fault_free_votes = 0;
     g_atft_state.detected_faults = 0;
     g_atft_state.exact_branch_faults = 0;
@@ -84,6 +135,41 @@ void atft_report_ecc_event(void) {
     uint64_t delta_inst = g_atft_state.retired_inst_counter - g_atft_state.last_ecc_inst_stamp;
     g_atft_state.last_ecc_inst_stamp = g_atft_state.retired_inst_counter;
 
+    // ---- SPRT 判决（D6）：观测量不变，换判定规则 ----
+    //
+    // 到达间隔与窗口计数是同一泊松过程的两个充分统计量，用两个独立阈值并列判决
+    // 既冗余、也对误报率与检测延迟毫无保证。改为 Wald 序贯概率比检验：
+    //   H0: 速率 lambda0 = 1 / T_calm      H1: lambda1 = r * lambda0
+    //   每观测到一个间隔 t，对数似然比累加 ln r - (r - 1) * t / T_calm
+    //   累加值 >= ln((1-beta)/alpha) 判 H1 (升档)，<= ln(beta/(1-alpha)) 判 H0 (降档)
+    // 两侧边界即 Wald 边界，alpha / beta 是**指定**的误报率与漏检率，
+    // 不再是拍定的 theta / N / 窗口阈值 / M / 降档水位五个常数。
+    // 反射式截断（clamp 到两侧边界）使它成为重复 SPRT，等价于 CUSUM 的
+    // 对数似然形式，天然带滞回，无需另设降档计数器。
+    // 参考：Wald, Sequential Analysis, 1947；Page, Biometrika 41(1), 1954；
+    //       Poisson 速率在线变点检测的 Gamma 共轭闭式后验。
+    if (g_atft_state.sprt_enabled) {
+        double t_norm = (double)delta_inst / g_atft_state.calm_avg_interval;
+        g_atft_state.sprt_llr += g_atft_state.sprt_log_r
+                               - (g_atft_state.sprt_rate_ratio - 1.0) * t_norm;
+        if (g_atft_state.sprt_llr > g_atft_state.sprt_bound_a)
+            g_atft_state.sprt_llr = g_atft_state.sprt_bound_a;
+        if (g_atft_state.sprt_llr < g_atft_state.sprt_bound_b)
+            g_atft_state.sprt_llr = g_atft_state.sprt_bound_b;
+
+        g_atft_state.window_ecc_count++;
+        if (g_atft_state.current_mode == ATFT_MODE_LOW &&
+            g_atft_state.sprt_llr >= g_atft_state.sprt_bound_a) {
+            g_atft_state.current_mode = ATFT_MODE_HIGH;
+            g_atft_state.mode_switch_count++;
+        } else if (g_atft_state.current_mode == ATFT_MODE_HIGH &&
+                   g_atft_state.sprt_llr <= g_atft_state.sprt_bound_b) {
+            g_atft_state.current_mode = ATFT_MODE_LOW;
+            g_atft_state.mode_switch_count++;
+        }
+        return;
+    }
+
     // 指标 A: 连续两次 ECC 事件间隔 T_ECC < \bar{T} / \theta
     double short_limit = g_atft_state.calm_avg_interval / g_atft_state.theta_ratio;
     if ((double)delta_inst < short_limit) {
@@ -107,6 +193,11 @@ void atft_report_ecc_event(void) {
 }
 
 void atft_step_window(void) {
+    // SPRT 模式下降档由对数似然比越过下边界触发，不需要窗口计数与 M 个平静窗口
+    if (g_atft_state.sprt_enabled) {
+        g_atft_state.window_ecc_count = 0;
+        return;
+    }
     // 当系统处于 HIGH 且连续观察到 M 个窗口低于降级阈值时，切换回 LOW 状态
     uint32_t low_water_mark = (g_atft_state.metric_b_threshold > 2) ? (g_atft_state.metric_b_threshold / 2) : 1;
     if (g_atft_state.current_mode == ATFT_MODE_HIGH) {
@@ -218,16 +309,29 @@ double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
                                     double delta, int32_t crit_level) {
     g_atft_state.total_votes++;
 
+    // D3: 逐负载阈值优先于编译期常数；地板量取 fp32 单位舍入的 kappa 倍，
+    // 不再用 2e-6 这个无来源的硬下限
+    double base_delta = delta;
+    double floor_delta = 2e-6;
+    if (g_atft_delta_abs > 0.0) {
+        base_delta = g_atft_delta_abs;
+        floor_delta = ATFT_U_FP32 * ATFT_DELTA_FLOOR_KAPPA;
+    }
+
     double ref_scale = fabs(a1_approx);
     if (fabs(a2_approx) < ref_scale) ref_scale = fabs(a2_approx);
-    double eff_delta = delta * (1.0 + ref_scale);
-    if (eff_delta < 2e-6) eff_delta = 2e-6;
+    double eff_delta = base_delta * (1.0 + ref_scale);
+    if (eff_delta < floor_delta) eff_delta = floor_delta;
+
+    // 副本一致性判据：两条近似副本是同一条 f32 链的复制，无故障时逐位相同
+    double agree_fast = g_atft_replica_exact ? 0.0 : (1e-6 * (1.0 + ref_scale));
+    double agree_cold = g_atft_replica_exact ? 0.0 : (1e-5 * (1.0 + ref_scale));
 
     double diff_r_a1 = fabs(r_exact - a1_approx);
     double diff_a1_a2 = fabs(a1_approx - a2_approx);
 
     // Fast-path: 无软错误直接返回 r_exact
-    if (__builtin_expect((diff_r_a1 <= eff_delta) && (diff_a1_a2 <= 1e-6 * (1.0 + ref_scale)), 1)) {
+    if (__builtin_expect((diff_r_a1 <= eff_delta) && (diff_a1_a2 <= agree_fast), 1)) {
         g_atft_state.fault_free_votes++;
         return r_exact;
     }
@@ -236,7 +340,7 @@ double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
     double diff_r_a2 = fabs(r_exact - a2_approx);
     int r_a1_ok = (diff_r_a1 <= eff_delta) && isfinite(r_exact) && isfinite(a1_approx);
     int r_a2_ok = (diff_r_a2 <= eff_delta) && isfinite(r_exact) && isfinite(a2_approx);
-    int a1_a2_ok = (diff_a1_a2 <= 1e-5 * (1.0 + ref_scale)) && isfinite(a1_approx) && isfinite(a2_approx);
+    int a1_a2_ok = (diff_a1_a2 <= agree_cold) && isfinite(a1_approx) && isfinite(a2_approx);
 
     g_atft_state.detected_faults++;
     atft_report_ecc_event();
@@ -265,8 +369,8 @@ double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
     // 情况 2: 某一条近似链路发生软错误 (含变为 NaN/Inf 或大幅偏离)，主路 R 完好:
     if (isfinite(r_exact)) {
         if (isfinite(a1_approx)) {
-            double d1_lim = delta * (1.0 + fabs(a1_approx));
-            if (d1_lim < 2e-6) d1_lim = 2e-6;
+            double d1_lim = base_delta * (1.0 + fabs(a1_approx));
+            if (d1_lim < floor_delta) d1_lim = floor_delta;
             if (fabs(r_exact - a1_approx) <= d1_lim) {
                 g_atft_state.approx_branch_faults++;
                 g_atft_state.recovered_by_reexec++;
@@ -274,8 +378,8 @@ double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
             }
         }
         if (isfinite(a2_approx)) {
-            double d2_lim = delta * (1.0 + fabs(a2_approx));
-            if (d2_lim < 2e-6) d2_lim = 2e-6;
+            double d2_lim = base_delta * (1.0 + fabs(a2_approx));
+            if (d2_lim < floor_delta) d2_lim = floor_delta;
             if (fabs(r_exact - a2_approx) <= d2_lim) {
                 g_atft_state.approx_branch_faults++;
                 g_atft_state.recovered_by_reexec++;
