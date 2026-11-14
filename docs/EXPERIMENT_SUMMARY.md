@@ -113,7 +113,11 @@ SDC、DUE、检出并恢复三项附 95% 置信区间。
 - fp64 与 load 有收益
 - int_arith 与 cast 无收益，
 - addr 无收益
-- cmp_branch 收益
+- cmp_branch 无收益，失效率却最高
+
+> 本表口径是逐负载等权（`rq8_inst_category_breakdown.csv`，fp64 只覆盖 10 个负载）。
+> `docs/METHOD.md` 的同名表用套件等权（`rq1_aggregate.json` 的 `by_category`），
+> 同一量数值不同，例如 fp64 无保护 16.08 对 28.98。引用时必须标口径。
 
 | 方法 | fp64 | int_arith | cast | load | addr | cmp_branch |
 |---|---|---|---|---|---|---|
