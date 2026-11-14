@@ -104,6 +104,12 @@ def ablation_matrix(delta_table, seed=None):
         ("opt_all",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire"], mk(denv)),
         ("opt_bnd",            "approx-simd",  base + dflags + ["-atft-int-tmr-boundary"], mk(denv)),
         ("opt_bnd_only",       "approx-simd",  ["-atft-int-tmr-boundary"], mk({})),
+        # D4 整数三模覆盖面扩到 i64（i32->i64 的下标扩展占 cast 注入点的 88%）
+        ("opt_i64",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
+                                                                "-atft-int-tmr-i64"], mk(denv)),
+        ("opt_i64_split",      "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
+                                                                "-atft-int-tmr-i64",
+                                                                "-atft-int-budget=1.0"], mk(denv)),
         # D10 按通路分预算：浮点近似通路跟随 --budget，整数通路恒为全量
         ("opt_split",          "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-budget=1.0"], mk(denv)),

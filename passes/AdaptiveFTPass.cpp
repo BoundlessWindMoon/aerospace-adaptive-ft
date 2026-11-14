@@ -109,6 +109,16 @@ static cl::opt<bool> AtftIntTMRBoundary(
     cl::desc("Vote only where a replicated integer value leaves the replicated subgraph (implies -atft-int-tmr-wire)"),
     cl::init(false));
 
+// D4 把整数三模的覆盖面扩到 i64：实测 501 个 cast 注入点里 443 个（88%）是
+// i32 -> i64 的 sext/zext —— 正是喂给 GEP 的下标扩展。isSupportedIntTy 原先不含
+// i64，这条链从来没被复制过，所以 cast 类的 DUE 一直停在 ~54%（坏下标直接段错误）。
+// 扩面后表决给出的是**精确多数值**而不是钳位值，不会把 DUE 换成 SDC，
+// 也不需要从剖析学范围（对照 nZDC/SWIFT 的"使用前校验"，这里是"使用前纠正"）。
+static cl::opt<bool> AtftIntTMRI64(
+    "atft-int-tmr-i64",
+    cl::desc("Extend integer TMR coverage to i64 values (index extensions feeding GEPs)"),
+    cl::init(false));
+
 // D10 按通路分预算：整数通路与浮点近似通路的"单位开销收益"差一个量级，
 // 用同一个 -atft-budget 同时压两条通路必然在其中一条上做错决策。
 // < 0 表示沿用全局预算，保持原行为。
@@ -932,6 +942,7 @@ void transformFunctionExactTMR(Function &F, LoopInfo &LI,
 //   内联表决结果由零开销 InlineAsm 保活，保证变换是语义保持的。
 // ============================================================================
 static bool isSupportedIntTy(Type *T) {
+  if (AtftIntTMRI64 && T->isIntegerTy(64)) return true;
   return T->isIntegerTy(8) || T->isIntegerTy(16) || T->isIntegerTy(32);
 }
 
@@ -1123,6 +1134,15 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     IRBuilder<> IRB(SI);
     Type *vt = val->getType();
     Value *a = val, *b = replica1Map[val], *c = replica2Map[val];
+    if (vt->isIntegerTy(64)) {
+      // i64 比 i32 表决器宽，零扩展再截回会丢高 32 位，这里直接内联多数决
+      Value *c12 = markInternal(IRB.CreateICmpEQ(a, b, "i64.c12"));
+      Value *c23 = markInternal(IRB.CreateICmpEQ(b, c, "i64.c23"));
+      Value *s23 = markInternal(IRB.CreateSelect(c23, b, a, "i64.s23"));
+      Value *maj = markInternal(IRB.CreateSelect(c12, a, s23, "i64.vote"));
+      SI->setOperand(0, maj);
+      continue;
+    }
     if (vt != I32Ty) {
       a = markInternal(IRB.CreateZExt(a, I32Ty));
       b = markInternal(IRB.CreateZExt(b, I32Ty));
