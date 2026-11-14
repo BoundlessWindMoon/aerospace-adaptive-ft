@@ -5,16 +5,9 @@
 编译期为每段代码生成多个保护版本，运行期按观测到的错误率选版本；保护用一份精确
 加两份近似的三路表决实现。
 
-```
-S = (w1 × 3) × closeness × opAmp + w2 × depth + w3 × liveSpan
-closeness = 1 / (1 + 到 store/return 的 use-def 距离)
+![方法总体](figures/method_overview.png)
 
-eff_delta = max(δ × (1 + min(|a1|, |a2|)), 2e-6)
-快路径：|R − a1| ≤ eff_delta 且 |a1 − a2| ≤ 1e-6×(1+scale) → 无故障
-冷路径：两份近似一致但精确值偏离 → 判精确链故障，按关键性分级恢复
-        仅一份近似偏离 → 判副本故障，屏蔽
-        三路互不一致 → 不可恢复
-```
+图由 `docs/figures/method_overview.py` 生成。
 
 | 模块 | 判定点 | 当前取值 | 依据 |
 |---|---|---|---|
