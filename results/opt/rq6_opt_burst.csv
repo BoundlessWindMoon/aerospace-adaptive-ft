@@ -1,0 +1,37 @@
+policy,stress_type,stress_level,trials,survive_ok_pct,det_recovered_pct,sdc_pct,due_pct
+native,Spatial_MBU,SEU (1-bit),3200,87.28,0.00,12.72,0.00
+native,Spatial_MBU,DBU (2-bit Adjacent),3200,89.88,0.00,10.12,0.00
+native,Spatial_MBU,QBU (4-bit Burst),3200,86.19,0.00,13.81,0.00
+native,Temporal_Burst,k=1 Fault/Run,3200,85.25,0.00,14.75,0.00
+native,Temporal_Burst,k=2 Faults/Run,3200,74.19,0.00,25.81,0.00
+native,Temporal_Burst,k=3 Faults/Run,3200,65.44,0.00,34.56,0.00
+native,Temporal_Burst,k=4 Faults/Run,3200,58.28,0.00,41.72,0.00
+native,Temporal_Burst,k=6 Faults/Run,3200,44.28,0.00,55.72,0.00
+native,Temporal_Burst,k=8 Faults/Run,3200,34.50,0.00,65.50,0.00
+opt_i64,Spatial_MBU,SEU (1-bit),3200,100.00,31.59,0.00,0.00
+opt_i64,Spatial_MBU,DBU (2-bit Adjacent),3200,100.00,28.38,0.00,0.00
+opt_i64,Spatial_MBU,QBU (4-bit Burst),3200,99.97,31.31,0.03,0.00
+opt_i64,Temporal_Burst,k=1 Fault/Run,3200,100.00,31.72,0.00,0.00
+opt_i64,Temporal_Burst,k=2 Faults/Run,3200,99.97,49.69,0.03,0.00
+opt_i64,Temporal_Burst,k=3 Faults/Run,3200,100.00,60.28,0.00,0.00
+opt_i64,Temporal_Burst,k=4 Faults/Run,3200,100.00,65.44,0.00,0.00
+opt_i64,Temporal_Burst,k=6 Faults/Run,3200,100.00,70.91,0.00,0.00
+opt_i64,Temporal_Burst,k=8 Faults/Run,3200,100.00,73.81,0.00,0.00
+native_int,Spatial_MBU,SEU (1-bit),6400,37.28,0.00,24.03,38.69
+native_int,Spatial_MBU,DBU (2-bit Adjacent),6400,35.11,0.00,24.34,40.55
+native_int,Spatial_MBU,QBU (4-bit Burst),6400,33.12,0.00,24.02,42.86
+native_int,Temporal_Burst,k=1 Fault/Run,6400,37.72,0.00,23.12,39.16
+native_int,Temporal_Burst,k=2 Faults/Run,6400,16.23,0.00,27.41,56.36
+native_int,Temporal_Burst,k=3 Faults/Run,6400,7.36,0.00,26.88,65.77
+native_int,Temporal_Burst,k=4 Faults/Run,6400,3.08,0.00,26.23,70.69
+native_int,Temporal_Burst,k=6 Faults/Run,6400,1.02,0.00,24.58,74.41
+native_int,Temporal_Burst,k=8 Faults/Run,6400,0.45,0.00,23.64,75.91
+opt_i64_int,Spatial_MBU,SEU (1-bit),6400,100.00,0.00,0.00,0.00
+opt_i64_int,Spatial_MBU,DBU (2-bit Adjacent),6400,100.00,0.00,0.00,0.00
+opt_i64_int,Spatial_MBU,QBU (4-bit Burst),6400,100.00,0.00,0.00,0.00
+opt_i64_int,Temporal_Burst,k=1 Fault/Run,6400,100.00,0.00,0.00,0.00
+opt_i64_int,Temporal_Burst,k=2 Faults/Run,6400,99.92,0.00,0.08,0.00
+opt_i64_int,Temporal_Burst,k=3 Faults/Run,6400,99.88,0.00,0.09,0.03
+opt_i64_int,Temporal_Burst,k=4 Faults/Run,6400,99.78,0.00,0.20,0.02
+opt_i64_int,Temporal_Burst,k=6 Faults/Run,6400,99.22,0.00,0.67,0.11
+opt_i64_int,Temporal_Burst,k=8 Faults/Run,6400,98.86,0.00,1.03,0.11

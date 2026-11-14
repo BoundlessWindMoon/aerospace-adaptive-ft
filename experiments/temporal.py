@@ -353,18 +353,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--rq6", default=None, help="P(F|n) 的来源 CSV（缺省读冻结的 rq6）")
+    ap.add_argument("--pmu", default=None, help="执行时间与倍率的来源 CSV")
+    ap.add_argument("--out-prefix", default="rq9", help="产物文件名前缀，避免覆盖冻结结果")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     meta = load_meta()
     orbits = load_orbit_profiles()
-    curves = load_pfn(RES_DIR / "rq6_mbu_burst_stress.csv")
-    prof = exec_profile(RES_DIR / "rq1_pmu_performance_qor.csv", meta)
+    curves = load_pfn(args.rq6 or (RES_DIR / "rq6_mbu_burst_stress.csv"))
+    prof = exec_profile(args.pmu or (RES_DIR / "rq1_pmu_performance_qor.csv"), meta)
 
     mt = mttf_table(cfg, curves, prof, orbits)
     det = detection_table(cfg, orbits)
-    write_csv(RES_DIR / "rq9_temporal_mttf.csv", mt)
-    write_csv(RES_DIR / "rq9_detection_budget.csv", det)
+    write_csv(RES_DIR / f"{args.out_prefix}_temporal_mttf.csv", mt)
+    write_csv(RES_DIR / f"{args.out_prefix}_detection_budget.csv", det)
 
     if args.json:
         Path(args.json).write_text(json.dumps(

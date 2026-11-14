@@ -222,6 +222,15 @@ static void parseCategorySelection(StringRef spec, bool *enabled) {
   }
 }
 
+// 配对注入：只往原程序本来就有的故障点注入，跳过策略层引入的冗余副本
+// （副本带 atft.replica 标记）。这样各策略的故障空间逐点相同、动态计数也相同，
+// 同一随机种子抽到的是同一组逻辑故障，策略间比较变成配对比较。
+// 默认关闭，关闭时行为与冻结实验逐位一致。
+static cl::opt<bool> FiOriginOnly(
+    "fi-origin-only",
+    cl::desc("Inject only into original-program sites, skipping replicas marked atft.replica"),
+    cl::init(false));
+
 class StandaloneFaultInjectorPass : public PassInfoMixin<StandaloneFaultInjectorPass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
@@ -256,6 +265,7 @@ public:
         for (Instruction &I : BB) {
           FiCategory c = classifyFaultSite(&I);
           if (c == FIC_NONE) continue;
+          if (FiOriginOnly && I.getMetadata("atft.replica") != nullptr) continue;
           siteCount[c]++;
           if (!enabled[c]) continue;
           sites.push_back({&I, c});

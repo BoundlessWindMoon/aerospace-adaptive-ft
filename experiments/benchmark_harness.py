@@ -272,7 +272,7 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
                                 fi_trials=600, dump_golden=False, run_fi=True,
                                 fi_target_type="fp64", arch="x86_64",
                                 static_sites_out=None, pass_flags=None,
-                                env_extra=None):
+                                env_extra=None, fi_flags=None):
     sut_ll = BUILD_DIR / f"sut_{tag}.ll"
     sut_bin = BUILD_DIR / f"bin_{tag}_{arch}"
 
@@ -344,6 +344,7 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
             OPT, f"-load-pass-plugin={PASS_FI_SO}",
             "-passes=standalone-fi,verify",
             f"-fi-target-type={fi_target_type}",
+            *(fi_flags or []),
             "-S", str(sut_ll), "-o", str(sut_fi_ll)
         ], want_stderr=True)
         if static_sites_out is not None:

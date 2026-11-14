@@ -473,6 +473,15 @@ std::set<Instruction *> selectInstructionsByBudget(
   return selected;
 }
 
+// 给冗余副本打 atft.replica 标记。它**不**影响默认的注错分类（副本仍可注错），
+// 只给裁判层的 -fi-origin-only 模式用：配对比较时只往原程序本来就有的故障点注入，
+// 这样各策略的故障空间逐点相同，策略间差异不再混入"冗余硬件带来的新故障点"。
+void markReplica(Value *V) {
+  if (auto *I = dyn_cast<Instruction>(V)) {
+    I->setMetadata("atft.replica", MDNode::get(I->getContext(), {}));
+  }
+}
+
 Value *insertZeroCostCSEBarrier(IRBuilder<> &IRB, Value *val) {
   Type *ty = val->getType();
   InlineAsm *noop = InlineAsm::get(
@@ -553,6 +562,7 @@ void transformFunctionCmpTMR(Function &F, unsigned *outProtected) {
       Value *b = isolate(CI->getOperand(1));
       rep[k] = IRB.CreateCmp(CI->getPredicate(), a, b,
                              CI->getName() + ".tmr" + std::to_string(k + 1));
+      markReplica(rep[k]);
       created.insert(rep[k]);
     }
 
@@ -1023,6 +1033,8 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     // 冗余 load 在 D8 下保持可注错：三份 load 都是真实存在的硬件读，
     // 裁判层看不见它们就等于把故障空间固定在原件上
     if (!AtftIntTMRWire && !AtftIntTMRBoundary) { markInternal(l1); markInternal(l2); }
+    markReplica(l1);
+    markReplica(l2);
     replica1Map[LD] = l1;
     replica2Map[LD] = l2;
   }
@@ -1064,6 +1076,8 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     // 看起来"保护有效"其实是裁判看不见冗余硬件。与 fp64 精确三模
     // （188 -> 564 个点）保持同一口径。
     if (!AtftIntTMRWire && !AtftIntTMRBoundary) { markInternal(rep1); markInternal(rep2); }
+    markReplica(rep1);
+    markReplica(rep2);
     itmrInternalUsers.insert(rep1);
     itmrInternalUsers.insert(rep2);
     replica1Map[inst] = rep1;
@@ -1231,6 +1245,8 @@ void transformFunctionInt32ToInt16Compression(Function &F, CritLevel critLevel, 
     IRBuilder<> IRB(nextNode);
 
     // 标记该 i32 运算已由位宽压缩近似覆盖，后续整数精确 TMR 不再重复保护
+    // 注意：这里的 inst 是**原件**（被位宽压缩覆盖），不是副本，不能打 atft.replica，
+    // 否则配对注入模式会把它从原程序故障空间里误删
     inst->setMetadata("atft.int16.approx", MDNode::get(Ctx, {}));
 
     Value *op0 = inst->getOperand(0);
@@ -1248,6 +1264,7 @@ void transformFunctionInt32ToInt16Compression(Function &F, CritLevel critLevel, 
     Value *vRes = nullptr;
     if (useSIMD) {
       vRes = markInternal(IRB.CreateBinOp(opc, v0, v1, inst->getName() + ".v2i16"));
+      markReplica(vRes);
     } else {
       Value *a1_0 = markInternal(IRB.CreateExtractElement(v0, ConstantInt::get(I32Ty, 0)));
       Value *a2_0 = markInternal(IRB.CreateExtractElement(v0, ConstantInt::get(I32Ty, 1)));
@@ -1452,6 +1469,8 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       Value *p2 = IRB.CreateCall(ptrBar, {ptr});
       LoadInst *ld1 = IRB.CreateLoad(F64Ty, p1, LD->getName() + ".ld.a1");
       LoadInst *ld2 = IRB.CreateLoad(F64Ty, p2, LD->getName() + ".ld.a2");
+      markReplica(ld1);
+      markReplica(ld2);
       Value *f1 = markInternal(IRB.CreateFPTrunc(ld1, F32Ty, "ld1.f32"));
       Value *f2 = markInternal(IRB.CreateFPTrunc(ld2, F32Ty, "ld2.f32"));
       Value *uVec = UndefValue::get(V2F32Ty);
@@ -1545,13 +1564,18 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       auto binOp = cast<BinaryOperator>(inst)->getOpcode();
       if (useSIMD) {
         vRes = IRB.CreateBinOp(binOp, vOp0, vOp1, inst->getName() + ".simd_approx");
+        markReplica(vRes);
       } else {
         Value *a1_0 = markInternal(IRB.CreateExtractElement(vOp0, ConstantInt::get(I32Ty, 0)));
         Value *a2_0 = markInternal(IRB.CreateExtractElement(vOp0, ConstantInt::get(I32Ty, 1)));
         Value *a1_1 = markInternal(IRB.CreateExtractElement(vOp1, ConstantInt::get(I32Ty, 0)));
         Value *a2_1 = markInternal(IRB.CreateExtractElement(vOp1, ConstantInt::get(I32Ty, 1)));
-        Value *r_a1 = insertZeroCostCSEBarrier(IRB, IRB.CreateBinOp(binOp, a1_0, a1_1, "scalar.a1"));
-        Value *r_a2 = insertZeroCostCSEBarrier(IRB, IRB.CreateBinOp(binOp, a2_0, a2_1, "scalar.a2"));
+        Value *b_a1 = IRB.CreateBinOp(binOp, a1_0, a1_1, "scalar.a1");
+        Value *b_a2 = IRB.CreateBinOp(binOp, a2_0, a2_1, "scalar.a2");
+        markReplica(b_a1);
+        markReplica(b_a2);
+        Value *r_a1 = insertZeroCostCSEBarrier(IRB, b_a1);
+        Value *r_a2 = insertZeroCostCSEBarrier(IRB, b_a2);
         Value *uVec = UndefValue::get(V2F32Ty);
         Value *t0 = markInternal(IRB.CreateInsertElement(uVec, r_a1, ConstantInt::get(I32Ty, 0)));
         Value *t1 = markInternal(IRB.CreateInsertElement(t0, r_a2, ConstantInt::get(I32Ty, 1)));

@@ -116,7 +116,7 @@ def ablation_matrix(delta_table, seed=None):
     ]
 
 
-def run_campaign(ssa_ll, matrix, categories, trials, suffix, budget=1.0):
+def run_campaign(ssa_ll, matrix, categories, trials, suffix, budget=1.0, fi_flags=None):
     pmu_all, fi_all = [], []
     native_inst = {}
     for tag, mode, pflags, penv in matrix:
@@ -128,7 +128,7 @@ def run_campaign(ssa_ll, matrix, categories, trials, suffix, budget=1.0):
                 budget=(1.0 if tag == "native" else budget), delta=5e-5,
                 fi_trials=trials, dump_golden=False, run_fi=True,
                 fi_target_type=cat, arch="x86_64",
-                pass_flags=pflags, env_extra=penv)
+                pass_flags=pflags, env_extra=penv, fi_flags=fi_flags)
             if first:
                 if tag == "native":
                     for r in pmu_rows:
@@ -171,6 +171,8 @@ def main():
     ap.add_argument("--profile-only", action="store_true")
     ap.add_argument("--policies", default=None,
                     help="只跑这些 tag（逗号分隔），用于小范围的方差/敏感性实验")
+    ap.add_argument("--origin-only", action="store_true",
+                    help="配对注入：只往原程序本来就有的故障点注入，跳过冗余副本")
     ap.add_argument("--budget", type=float, default=1.0,
                     help="保护预算；压开销的 Pareto 前沿用它扫")
     ap.add_argument("--seed-start", type=int, default=0,
@@ -196,13 +198,15 @@ def main():
     for s in range(args.seed_start, args.seed_start + args.seeds):
         seed = None if s == 0 else ((0x123456789abcdef0 + 0x9e3779b97f4a7c15 * s) & ((1 << 64) - 1))
         suffix = (f"a{args.alpha:g}_t{args.trials}"
+                  + ("_paired" if args.origin_only else "")
                   + (f"_b{int(args.budget * 100)}" if args.budget < 0.999 else "")
                   + ("" if s == 0 else f"_s{s}"))
         print(f"=== [2] 消融 campaign (seed#{s}) ===")
         fi_rows, pmu_rows, fi_path, pmu_path = run_campaign(
             ssa_ll, [m for m in ablation_matrix(table, seed)
                      if want is None or m[0] in want or m[0] == "native"],
-            categories, args.trials, suffix, budget=args.budget)
+            categories, args.trials, suffix, budget=args.budget,
+            fi_flags=(["-fi-origin-only"] if args.origin_only else None))
         agg = aggregate([{k: str(v) for k, v in r.items()} for r in fi_rows],
                         [{k: str(v) for k, v in r.items()} for r in pmu_rows], meta)
         print("\n=== 等权聚合 ===")
