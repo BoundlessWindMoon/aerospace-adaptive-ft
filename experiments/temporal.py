@@ -218,7 +218,8 @@ def _row(env_tag, bits, pol, lam, t_exec, ratio, curves):
                                    else (f"{1.0 / pf:.6g}" if pf > 0 else "inf")),
         "poisson_tail_above_measured_n": f"{tail:.3g}",
         "_lam_sys": (pf_hi if zero else pf) / t_exec if t_exec > 0 else 0.0,
-        "_pf": pf_hi if zero else pf,
+        "_lam_sys_hi": pf_hi / t_exec if t_exec > 0 else 0.0,
+        "_pf_hi": pf_hi,
         "_zero": zero,
     }
 
@@ -234,6 +235,7 @@ def mttf_table(cfg, curves, prof, orbits):
         bits = float(bits)
         # 第 5 步的占时权重：每条轨道上 SAA 内 / 外两种条件，占时比来自该轨道剖面
         comp = {o: {p: 0.0 for p in pols} for o in orbits}
+        comp_hi = {o: {p: 0.0 for p in pols} for o in orbits}
         for env in envs:
             lam = env["sigma"] * bits / SEC_PER_DAY
             f = orbits[env["orbit"]]["saa_fraction"]
@@ -245,8 +247,9 @@ def mttf_table(cfg, curves, prof, orbits):
                          prof[pol]["t_exec_s"], prof[pol]["inst_ratio"],
                          (curves[0][pol], curves[1][pol], curves[2][pol]))
                 comp[env["orbit"]][pol] += w * r.pop("_lam_sys")
+                comp_hi[env["orbit"]][pol] += w * r.pop("_lam_sys_hi")
                 zero = r.pop("_zero")
-                r.pop("_pf")
+                r["_pf_hi"] = r.pop("_pf_hi")
                 r["_zero"] = zero
                 rows.append(r)
         for orb_tag, per_pol in comp.items():
@@ -268,28 +271,33 @@ def mttf_table(cfg, curves, prof, orbits):
                     "faults_per_exec_a": "n/a",
                     "zero_failure_sample": "yes" if zero else "",
                     "p_fail_per_exec": f"{'<' if zero else ''}{ls * t_exec:.6g}",
-                    "p_fail_ci95_lo": "", "p_fail_ci95_hi": "",
+                    "p_fail_ci95_lo": "",
+                    "p_fail_ci95_hi": f"{comp_hi[orb_tag][pol] * t_exec:.6g}",
                     "mttf_hours": f"{pre}{1.0 / ls / 3600.0:.6g}",
-                    "mttf_ci95_lo_hours": "", "mttf_ci95_hi_hours": "",
+                    "mttf_ci95_lo_hours": f"{1.0 / comp_hi[orb_tag][pol] / 3600.0:.6g}",
+                    "mttf_ci95_hi_hours": "",
                     "mwtf_execs_per_failure": f"{pre}{1.0 / (ls * t_exec):.6g}",
                     "poisson_tail_above_measured_n": "",
+                    "_pf_hi": comp_hi[orb_tag][pol] * t_exec,
                     "_zero": zero,
                 })
-    # 每任务失效数与相对 native 的 MWTF，按 (环境, 故障空间) 分组算
+    # 每任务失效数与相对 native 的 MWTF，按 (环境, 故障空间) 分组算。
+    # 策略间比较统一用**95% 下界**（即 P_F 的 Wilson 上界），否则会出现
+    # "零失效策略的下界" 对 "有失效策略的点估计" 这种不可比的组合。
     groups = {}
     for r in rows:
         groups.setdefault((r["environment"], r["fault_space_mib"]), []).append(r)
     for g in groups.values():
-        base = next((float(r["p_fail_per_exec"].lstrip("<>")) for r in g
-                     if r["policy"] == "native"), None)
+        base_hi = next((r["_pf_hi"] for r in g if r["policy"] == "native"), None)
         for r in g:
             zero = r.pop("_zero")
+            pf_hi = r.pop("_pf_hi")
             pf = float(r["p_fail_per_exec"].lstrip("<>"))
             t_exec = float(r["exec_time_s"])
             pre = "<" if zero else ""
             r["failures_per_mission"] = f"{pre}{pf / t_exec * mission_s:.6g}"
-            r["mwtf_vs_native"] = (f"{'>' if zero else ''}{base / pf:.4g}"
-                                   if base and pf > 0 else "n/a")
+            r["mwtf_lb95_vs_native"] = (f"{base_hi / pf_hi:.4g}"
+                                        if base_hi and pf_hi > 0 else "n/a")
     return rows
 
 

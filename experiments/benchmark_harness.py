@@ -128,8 +128,7 @@ BUILTIN_CONFIG = {
         "rq2": {"budgets": [0.25, 0.50, 0.75, 1.00],
                 "rank_methods": ["semantic", "sdctune", "shoestring", "hotpath", "random"]},
         "rq3": {"deltas": [1e-7, 1e-5, 5e-5, 1e-3, 5e-2, 5e-1]},
-        "rq8": {"categories": ["fp", "int", "address", "branch"],
-                "policies": ["native", "swift", "lltfi_sid", "exact_tmr", "approx_simd"]},
+        "rq8": {"policies": ["native", "swift", "lltfi_sid", "exact_tmr", "approx_simd"]},
     },
     "defaults": {"budget": 1.0, "delta": 5.0e-5, "weights": {"w1": 2.5, "w2": 1.8, "w3": 0.8}},
 }
@@ -387,16 +386,21 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
 def run_rq8_instruction_category_and_riscv(ssa_ll, cfg):
     """
     RQ8:
-      (A) Multi-Category Instruction Fault Injection Breakdown (FP vs Int vs Address vs Branch)
-          comparing Native, SWIFT (CGO'05), LLTFI-SID (reimplemented from LLTFI semantics), COAST-TMR (reimplemented from COAST, IEEE TNS'19), and Approx-SIMD.
-      (B) RISC-V (rv64gc / rv64gcv RVV 1.0) Cross-Compilation Codegen Analysis & QEMU Execution Verification.
+      (A) 逐故障类别的注错分解，对比 Native、SWIFT (CGO'05)、LLTFI-SID
+          (reimplemented from LLTFI semantics)、COAST-TMR (reimplemented from
+          COAST, IEEE TNS'19) 与 Approx-SIMD。类别缺省沿用顶层 fault_categories，
+          **不再内置一份自己的清单**——早期版本在内置默认值里写死了四类别时代的
+          ["fp","int","address","branch"]，deep_merge 会保留它，于是改成七类别后
+          RQ8 仍在跑旧的四类，而配置注释却声称"省略时沿用顶层"。
+      (B) RISC-V (rv64gc / rv64gcv RVV 1.0) 交叉编译代码生成分析与 QEMU 执行验证。
     """
-    print("=== [RQ8-A] Evaluating Multi-Category Instruction Fault Injection (fp / int / address / branch) ===")
     tag_to_mode = {p["tag"]: p["mode"] for p in cfg.get("policies", [])}
     cat_policies = [(t, tag_to_mode.get(t, t.replace("_", "-")))
                     for t in cfg["grids"]["rq8"]["policies"]]
     categories = list(cfg["grids"]["rq8"].get("categories",
                       cfg.get("fault_categories", BUILTIN_CONFIG["fault_categories"])))
+    print("=== [RQ8-A] Evaluating Multi-Category Instruction Fault Injection "
+          f"({' / '.join(categories)}) ===")
     cat_summary_rows = []
 
     for cat in categories:

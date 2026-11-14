@@ -67,12 +67,14 @@ grids:
     fi_category: fp64
     # k 的采样点：1/2/4/8 之间补 3 与 6，让 Ostler 求和的插值不跨太大间隔
     burst_counts: [1, 2, 3, 4, 6, 8]
-    # 每个负载的试验数。P(F|1) 约 2%，80 次/负载时全套只有 8 个失效事件，
-    # exact_tmr 与 approx_simd 的区间完全重叠；提到 400 后降到约 ±25% 相对宽度
-    trials_per_benchmark: 400
+    # 每个负载的试验数。P(F|1) 在三模方案下是 0/N，点估计没有信息，
+    # 能报的只有 Wilson 上界给出的 MTTF 下界，所以这个数直接决定结论强度：
+    # 400/负载 -> 上界 0.23%；4000/负载 -> 上界约 0.023%
+    trials_per_benchmark: 4000
     policies: [native, swift, exact_tmr, approx_simd]
   rq8:                       # 指令类别注错与 RISC-V 交叉验证
-    # categories 省略时沿用顶层 fault_categories，避免两处定义不一致
+    # 不设 categories：沿用顶层 fault_categories（七类）。内置默认值里也不再
+    # 保留一份旧清单，否则 deep_merge 会让它永远覆盖顶层
     policies: [native, swift, lltfi_sid, exact_tmr, approx_simd]
     trials: 120
 

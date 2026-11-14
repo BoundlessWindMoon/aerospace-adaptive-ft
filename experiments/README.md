@@ -44,7 +44,8 @@ policies:                    # RQ1 参与对比的策略
 grids:
   rq2: {budgets: [0.25, 0.5, 0.75, 1.0], rank_methods: [semantic, sdctune, shoestring, hotpath, random], trials: 300}
   rq3: {deltas: [1.0e-7, 1.0e-5, 5.0e-5, 1.0e-3, 5.0e-2, 5.0e-1], trials: 300}
-  rq8: {categories: [fp, int, address, branch], policies: [native, swift, exact_tmr, approx_simd], trials: 120}
+  rq6: {fi_category: fp64, burst_counts: [1, 2, 3, 4, 6, 8], trials_per_benchmark: 4000}
+  rq8: {policies: [native, swift, exact_tmr, approx_simd], trials: 120}   # categories 省略 -> 顶层七类
 defaults: {budget: 1.0, delta: 5.0e-5, weights: {w1: 2.5, w2: 1.8, w3: 0.8}}
 ```
 
