@@ -60,10 +60,99 @@ grids:
   rq3:                       # 表决阈值 delta 敏感性
     deltas: [1.0e-7, 1.0e-5, 5.0e-5, 1.0e-3, 5.0e-2, 5.0e-1]
     trials: 300
+  rq5:                       # IEEE-754 位域敏感性
+    # 用哪个类别的注入器二进制（必须是 fault_categories 里在用的名字）
+    fi_category: fp64
+  rq6:                       # 多比特与连发故障冲击，同时产出 RQ9 要的 P(F|n)
+    fi_category: fp64
+    # k 的采样点：1/2/4/8 之间补 3 与 6，让 Ostler 求和的插值不跨太大间隔
+    burst_counts: [1, 2, 3, 4, 6, 8]
+    # 每个负载的试验数。P(F|1) 约 2%，80 次/负载时全套只有 8 个失效事件，
+    # exact_tmr 与 approx_simd 的区间完全重叠；提到 400 后降到约 ±25% 相对宽度
+    trials_per_benchmark: 400
+    policies: [native, swift, exact_tmr, approx_simd]
   rq8:                       # 指令类别注错与 RISC-V 交叉验证
     # categories 省略时沿用顶层 fault_categories，避免两处定义不一致
     policies: [native, swift, lltfi_sid, exact_tmr, approx_simd]
     trials: 120
+
+# ===========================================================================
+# 时序层：故障到达过程与任务剖面
+#
+# 现有 campaign 产出的是**条件概率** P(结局 | 一个故障落在可注入点上)。
+# 本节提供把它换算成绝对速率的那一层参数，换算链见 experiments/temporal.py：
+#   sigma[upsets/bit/day] x B[bit] -> lambda[1/s] -> a = lambda*t_exec
+#   -> P_F = sum_n P(F|n) Poisson(n;a) -> MTTF / MEBF / 每任务失效数
+# 其中 P(F|n) 由 RQ6 的 Temporal_Burst 直接提供（k 的取值见 grids.rq6），不另做实验。
+# 求和链与复合 MTTF 的占时加权出处：Ostler et al., IEEE TNS 56(6):3519-3526, 2009
+# 本工作的 a 很小（<=4e-6），实际生效的是其单故障退化形式：
+#   Schirmeier, Borchert, Spinczyk, DSN 2015
+# ===========================================================================
+temporal:
+  # 故障空间大小（驻留比特数）。软件级注入器无法独立测定，按量级给上下界并
+  # 两档都报，结论若对它敏感必须声明。4 MiB / 16 MiB 取自 part_I §I.6 的建议。
+  fault_space_bits: [33554432, 134217728]
+
+  # 任务时长，用于「每任务期望失效数」
+  mission_days: 90
+
+  # SAA 内外速率比：器件相关，没有单一正确值，必须扫描。
+  # F49（97.5% 的 SEU 集中于 SAA）与 Flying Laptop 七年在轨数据
+  # （Adv. Space Res. 77(10):10520-10528, 2026，GCR 主导、与太阳活动反相关）
+  # 结论相反，所以这里只给扫描范围与一个标称值
+  saa_ratio:
+    nominal: 200
+    sweep: [25, 100, 200, 450]
+
+  # 控制器检测预算核算用：攒到第 k 个事件才判决
+  detection_events_k: [1, 2, 3, 4]
+
+  # 轨道几何剖面：由 experiments/orbit_rates.py 离线生成 results/rq9_orbit_profile.csv
+  # 每条轨道的周期 / SAA 占时 / 过境驻留都来自**同一次**传播，并与同一颗卫星
+  # 实测的轨道平均率配对，避免跨轨道混用参数
+  orbit_profiles:
+    epoch: "2020-01-01"
+    sample_days: 3.0
+    step_s: 10.0
+    # SAA 判据：IGRF 总场强低于阈值**且** L 壳在内带范围内。
+    # 只用 |B| 会把整条磁赤道低场带一起圈进来（与 SAA 地理范围一致率仅约 0.5）。
+    # 扫描多个阈值并报与 SAA 常规地理范围的一致率，用来证明判据圈对了区域
+    # 20000 nT 是扫描里唯一同时满足两个独立校验的档：
+    #   每次过境 8.3-9.6 min 落在 Underwood (ESA SP-439, 2000) 实测的 5-10 min 内，
+    #   且 97-99.9% 的判定样本落在 SAA 的常规地理范围内
+    b_threshold_nt: 20000
+    b_threshold_sweep_nt: [16000, 18000, 20000, 22000, 24000, 26000, 28000, 30000]
+    l_shell_max: 2.0
+    orbits:
+      - tag: sampex
+        apogee_km: 670
+        perigee_km: 520
+        inc_deg: 81.7
+        sigma_avg: 4.21e-6
+        source: "SAMPEX Hitachi 256k 实测 4.21e-6 upsets/bit-day（预测 3.832e-6）, Adolphsen et al., IEEE TNS 42(6):1964, 1995"
+      - tag: alsat1
+        apogee_km: 686
+        perigee_km: 686
+        inc_deg: 98.2
+        sigma_avg: 4.04e-7
+        source: "Alsat-1 在轨 700km SSO 实测 4.04e-7 SEU/bit/day（98.6% 单比特）, Bentoutou, Adv. Space Res. 48(7), 2011"
+
+  # 环境速率。全部由 orbit_profiles 的输出派生，不再手填散落的数：
+  #   orbit   = 取哪条轨道（周期 / SAA 占时 / 实测 sigma_avg 都来自它）
+  #   derive  = avg（轨道平均，实测值）| saa_out | saa_in（按占时与内外比反解）
+  #   multiplier = 在该档之上再乘一个有出处的倍数（如 SPE）
+  environments:
+    - {tag: sampex_orbit_avg, orbit: sampex, derive: avg}
+    - {tag: sampex_saa_out,   orbit: sampex, derive: saa_out}
+    - {tag: sampex_saa_in,    orbit: sampex, derive: saa_in}
+    - {tag: alsat1_orbit_avg, orbit: alsat1, derive: avg}
+    - {tag: alsat1_saa_out,   orbit: alsat1, derive: saa_out}
+    - {tag: alsat1_saa_in,    orbit: alsat1, derive: saa_in}
+    - tag: sampex_spe_worst_day
+      orbit: sampex
+      derive: saa_out
+      multiplier: 10
+      source: "CREME96 worst day = 18h 窗口, Tylka/Dietrich/Boberg, IEEE TNS 44(6):2150, 1997；倍数取 Dyer 等给出的 x10 量级"
 
 # 默认的保护预算与表决阈值（策略未单独指定时使用）
 defaults:

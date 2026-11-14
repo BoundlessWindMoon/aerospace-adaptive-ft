@@ -1,29 +1,37 @@
 policy,stress_type,stress_level,trials,survive_ok_pct,det_recovered_pct,sdc_pct,due_pct
-native,Spatial_MBU,SEU (1-bit),400,89.5,0.0,10.5,0.0
-native,Spatial_MBU,DBU (2-bit Adjacent),400,91.25,0.0,8.75,0.0
-native,Spatial_MBU,QBU (4-bit Burst),400,89.75,0.0,10.25,0.0
-native,Temporal_Burst,k=1 Fault/Run,400,88.0,0.0,12.0,0.0
-native,Temporal_Burst,k=2 Faults/Run,400,80.5,0.0,19.5,0.0
-native,Temporal_Burst,k=4 Faults/Run,400,64.0,0.0,36.0,0.0
-native,Temporal_Burst,k=8 Faults/Run,400,38.0,0.0,62.0,0.0
-swift,Spatial_MBU,SEU (1-bit),400,50.0,0.0,3.25,46.75
-swift,Spatial_MBU,DBU (2-bit Adjacent),400,53.5,0.0,3.25,43.25
-swift,Spatial_MBU,QBU (4-bit Burst),400,48.25,0.0,2.25,49.5
-swift,Temporal_Burst,k=1 Fault/Run,400,51.5,0.0,3.25,45.25
-swift,Temporal_Burst,k=2 Faults/Run,400,32.25,0.0,3.25,64.5
-swift,Temporal_Burst,k=4 Faults/Run,400,16.75,0.0,7.5,75.75
-swift,Temporal_Burst,k=8 Faults/Run,400,8.25,0.0,11.5,80.25
-exact_tmr,Spatial_MBU,SEU (1-bit),400,98.25,64.25,1.75,0.0
-exact_tmr,Spatial_MBU,DBU (2-bit Adjacent),400,98.5,62.25,1.5,0.0
-exact_tmr,Spatial_MBU,QBU (4-bit Burst),400,99.0,65.5,1.0,0.0
-exact_tmr,Temporal_Burst,k=1 Fault/Run,400,98.0,63.5,2.0,0.0
-exact_tmr,Temporal_Burst,k=2 Faults/Run,400,97.25,76.5,2.75,0.0
-exact_tmr,Temporal_Burst,k=4 Faults/Run,400,93.0,79.5,6.75,0.25
-exact_tmr,Temporal_Burst,k=8 Faults/Run,400,86.25,78.0,11.5,2.25
-approx_simd,Spatial_MBU,SEU (1-bit),400,98.0,45.25,2.0,0.0
-approx_simd,Spatial_MBU,DBU (2-bit Adjacent),400,98.75,43.75,1.25,0.0
-approx_simd,Spatial_MBU,QBU (4-bit Burst),400,99.0,46.0,1.0,0.0
-approx_simd,Temporal_Burst,k=1 Fault/Run,400,98.0,41.5,1.5,0.5
-approx_simd,Temporal_Burst,k=2 Faults/Run,400,96.5,63.25,3.5,0.0
-approx_simd,Temporal_Burst,k=4 Faults/Run,400,92.25,72.75,6.5,1.25
-approx_simd,Temporal_Burst,k=8 Faults/Run,400,84.75,75.75,13.25,2.0
+native,Spatial_MBU,SEU (1-bit),1600,87.81,0.0,12.19,0.0
+native,Spatial_MBU,DBU (2-bit Adjacent),1600,89.75,0.0,10.25,0.0
+native,Spatial_MBU,QBU (4-bit Burst),1600,85.94,0.0,14.06,0.0
+native,Temporal_Burst,k=1 Fault/Run,1600,85.56,0.0,14.44,0.0
+native,Temporal_Burst,k=2 Faults/Run,1600,73.12,0.0,26.88,0.0
+native,Temporal_Burst,k=3 Faults/Run,1600,66.0,0.0,34.0,0.0
+native,Temporal_Burst,k=4 Faults/Run,1600,57.56,0.0,42.44,0.0
+native,Temporal_Burst,k=6 Faults/Run,1600,44.62,0.0,55.38,0.0
+native,Temporal_Burst,k=8 Faults/Run,1600,34.44,0.0,65.56,0.0
+swift,Spatial_MBU,SEU (1-bit),1600,29.38,0.0,0.0,70.62
+swift,Spatial_MBU,DBU (2-bit Adjacent),1600,32.0,0.0,0.0,68.0
+swift,Spatial_MBU,QBU (4-bit Burst),1600,29.19,0.0,0.0,70.81
+swift,Temporal_Burst,k=1 Fault/Run,1600,28.94,0.0,0.0,71.06
+swift,Temporal_Burst,k=2 Faults/Run,1600,9.06,0.0,0.0,90.94
+swift,Temporal_Burst,k=3 Faults/Run,1600,2.94,0.0,0.0,97.06
+swift,Temporal_Burst,k=4 Faults/Run,1600,0.62,0.0,0.0,99.38
+swift,Temporal_Burst,k=6 Faults/Run,1600,0.19,0.0,0.0,99.81
+swift,Temporal_Burst,k=8 Faults/Run,1600,0.0,0.0,0.0,100.0
+exact_tmr,Spatial_MBU,SEU (1-bit),1600,100.0,78.12,0.0,0.0
+exact_tmr,Spatial_MBU,DBU (2-bit Adjacent),1600,100.0,77.81,0.0,0.0
+exact_tmr,Spatial_MBU,QBU (4-bit Burst),1600,100.0,80.88,0.0,0.0
+exact_tmr,Temporal_Burst,k=1 Fault/Run,1600,100.0,81.06,0.0,0.0
+exact_tmr,Temporal_Burst,k=2 Faults/Run,1600,99.88,95.62,0.0,0.12
+exact_tmr,Temporal_Burst,k=3 Faults/Run,1600,99.94,98.88,0.0,0.06
+exact_tmr,Temporal_Burst,k=4 Faults/Run,1600,99.69,99.62,0.0,0.31
+exact_tmr,Temporal_Burst,k=6 Faults/Run,1600,98.81,98.81,0.0,1.19
+exact_tmr,Temporal_Burst,k=8 Faults/Run,1600,98.06,98.06,0.0,1.94
+approx_simd,Spatial_MBU,SEU (1-bit),1600,100.0,42.19,0.0,0.0
+approx_simd,Spatial_MBU,DBU (2-bit Adjacent),1600,100.0,40.19,0.0,0.0
+approx_simd,Spatial_MBU,QBU (4-bit Burst),1600,99.94,42.5,0.06,0.0
+approx_simd,Temporal_Burst,k=1 Fault/Run,1600,100.0,42.56,0.0,0.0
+approx_simd,Temporal_Burst,k=2 Faults/Run,1600,99.94,55.31,0.06,0.0
+approx_simd,Temporal_Burst,k=3 Faults/Run,1600,100.0,61.56,0.0,0.0
+approx_simd,Temporal_Burst,k=4 Faults/Run,1600,100.0,65.94,0.0,0.0
+approx_simd,Temporal_Burst,k=6 Faults/Run,1600,100.0,71.19,0.0,0.0
+approx_simd,Temporal_Burst,k=8 Faults/Run,1600,100.0,73.38,0.0,0.0

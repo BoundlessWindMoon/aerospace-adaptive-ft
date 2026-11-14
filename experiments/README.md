@@ -140,6 +140,46 @@ python3 experiments/aggregate.py --json results/rq1_aggregate.json
 
 负载在某个注错类别下没有插桩点时记录 `dyn_target_insts=0` 且 0 次试验。
 
+## 时序层：从条件概率到绝对速率（RQ9）
+
+上面所有率值都是**条件概率** `P(结局 | 一个故障落在可注入点上)`。要报 MTTF 或
+"每任务失效多少次"，必须乘上一个绝对到达率。这一步由 `experiments/temporal.py`
+做，纯后处理，读 RQ1 的 PMU 与 RQ6 的 `P(F|n)`，不跑新 campaign：
+
+$$a=\lambda t_{exec},\quad P_F=\sum_{n\ge1}P(F|n)\frac{a^ne^{-a}}{n!},\quad \text{MTTF}=\frac{t_{exec}}{P_F}$$
+
+```bash
+/tmp/orbenv/bin/python experiments/orbit_rates.py     # 离线一次，生成轨道剖面
+python3 experiments/benchmark_harness.py --rq rq9      # 读 rq1/rq6 的 CSV 出表
+```
+
+口径与出处：
+
+| 环节 | 用的方案 |
+| :-- | :-- |
+| 求和链 `P_F = Σ P(F\|n)P(n)` 与复合 MTTF 的占时加权 | Ostler et al., IEEE TNS 56(6):3519-3526, 2009 |
+| 实际生效的单故障归一化 `λ = g·Δt·Δm` | Schirmeier, Borchert, Spinczyk, DSN 2015 |
+| MWTF 定义（单位有用工作的失效数之倒数） | Bohman et al., IEEE TNS 66(1), 2019 |
+| 同绝对速率下的公平对比（fixed-rate campaign） | Sotiropoulos et al., IEEE SOCC 2026 |
+| 轨道 → 地磁场 → 分段速率 | Jacobs et al., ACM TRETS 5(4):21, 2012 |
+
+必须和论文一起声明的三件事：
+
+- 实际生效的是 **Schirmeier 的单故障形式**。所有环境下 $a\le4\times10^{-6}$，
+  $n\ge2$ 的 Poisson 质量 $\le10^{-50}$，Ostler 的求和在数值上是惰性的，
+  只作为 $a$ 增大时的推广保留。
+- Ostler 的 $t_{scrub}$ 是平台常数，我们用的是**一次执行**，所以分母随策略变化。
+  这让运行时开销进入可靠性指标（= SOCC'26 的 MTTF 定义），不是 Ostler 的口径。
+- 故障空间 $\Delta m$ 全策略取同一常数（即 fixed-rate campaign），没有
+  proportional-rate 伴侣。SOCC'26 实证两者给出相同的加固优先级排序。
+
+轨道剖面 `experiments/orbit_rates.py` 把周期、SAA 占时、过境驻留**从同一次
+SGP4 传播**算出，再与同一颗卫星实测的 $\sigma_{avg}$ 配对，避免跨轨道混用参数。
+SAA 判据是 IGRF 总场强低于阈值且 L 壳在内带范围内；阈值经扫描后取
+20000 nT，因为该档的过境驻留 8.3–9.6 min 落在 Underwood (ESA SP-439, 2000)
+独立实测的 5–10 min 内，且 97–99.9% 的判定样本落在 SAA 的常规地理范围内。
+该脚本需要 `sgp4` 与 `ppigrf`，只在重新生成剖面时运行；产物入库。
+
 ## 输出
 
 | 文件 | 内容 |
@@ -148,4 +188,8 @@ python3 experiments/aggregate.py --json results/rq1_aggregate.json
 | `results/rq1_fault_injection_outcomes.csv` | 五分类结局、置信区间、MWTF |
 | `results/rq1_*_int.csv` / `_all.csv` | 整数类别 / 全类别注错口径 |
 | `results/rq2..rq8_*.csv` | 选择性保护、δ 敏感性、自适应轨迹、位域敏感性、MBU 冲击、规模扫描、指令类别与 RISC-V |
+| `results/rq9_temporal_mttf.csv` | 各环境下的 MTTF（带 95% CI）、MWTF、每任务失效数、复合 MTTF |
+| `results/rq9_detection_budget.csv` | SAA 过境窗口 vs 攒到第 k 个事件的延迟，反应式控制器的延迟下界 |
+| `results/rq9_orbit_profile.csv` | 每条轨道的周期、SAA 占时、过境驻留、与 SAA 地理范围的一致率 |
+| `results/rq9_orbit_timeseries.csv` | 沿轨的 \|B\|、L 壳与 SAA 标记 |
 | `results/eval_dashboard.html` | 汇总看板 |

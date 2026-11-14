@@ -206,10 +206,10 @@ DEFAULT_CMD_TIMEOUT_S = 900
 
 
 def run_cmd(cmd, cwd=ROOT_DIR, allow_nonzero=False, timeout_s=DEFAULT_CMD_TIMEOUT_S,
-            want_stderr=False):
+            want_stderr=False, env=None):
     try:
         res = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, timeout=timeout_s)
+                             text=True, timeout=timeout_s, env=env)
     except subprocess.TimeoutExpired as e:
         partial = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         msg = f"[Timeout {timeout_s}s] {' '.join(map(str, cmd))}"
@@ -593,6 +593,24 @@ def print_smoke_summary(pmu_rows, fi_rows):
     print("=== [Smoke] 未写入 results/*.csv（smoke 模式不覆盖正式数据）===\n")
 
 
+def fi_binary(tag, cfg, grid_key, arch="x86_64"):
+    """取某策略的注入器二进制。
+
+    类别名从配置读，必须是 fault_categories 里**当前**在用的名字——早期版本
+    写死找 `bin_{tag}_fi_fp_x86_64` 并在找不到时回落到 `bin_{tag}_fi`，
+    而 `fp` 是四类别时代的旧名字，七类别改版后 RQ1 不再构建它，于是 RQ5/RQ6
+    一直静默地跑在上一代构建留下的陈旧二进制上。这里不回落、直接报错。
+    """
+    cat = cfg.get("grids", {}).get(grid_key, {}).get("fi_category", "fp64")
+    path = BUILD_DIR / f"bin_{tag}_fi_{cat}_{arch}"
+    if not path.exists():
+        raise RuntimeError(
+            f"缺少注入器二进制 {path.name}；它由 RQ1 构建，请先跑 "
+            f"--rq rq1（或 --rq rq1,{grid_key}）。注意 grids.{grid_key}."
+            f"fi_category 必须是 fault_categories 里在用的类别名")
+    return path
+
+
 def run_selected_research_questions(args):
     cfg = load_config(args.config)
     apply_threshold_env(cfg)
@@ -600,7 +618,9 @@ def run_selected_research_questions(args):
         args.trials = int(cfg.get("trials", 1000))
     if args.smoke:
         smoke_cfg = cfg.get("smoke", {})
-        args.rq = "rq1"
+        # 只在用户没点名 RQ 时才收窄到 rq1；显式 --rq 要保留（如纯后处理的 rq9）
+        if args.rq == "all":
+            args.rq = "rq1"
         if args.fi_type == "balanced" and smoke_cfg.get("categories"):
             # smoke 只跑代表性类别（各风险档一个），保证秒级反馈
             args.fi_type = ",".join(smoke_cfg["categories"])
@@ -809,9 +829,7 @@ def run_selected_research_questions(args):
         print("=== [RQ5] Running IEEE-754 Bit-Field Vulnerability Anatomy ===")
         rq5_rows = []
         for pol in ["native", "swift", "approx_simd"]:
-            fi_bin = BUILD_DIR / f"bin_{pol}_fi_fp_x86_64"
-            if not fi_bin.exists():
-                fi_bin = BUILD_DIR / f"bin_{pol}_fi"
+            fi_bin = fi_binary(pol, cfg, "rq5")
             bf_out = run_cmd([str(fi_bin), "--bitfield", pol])
             for line in bf_out.strip().splitlines():
                 if line.startswith("BITFIELD_CSV,"):
@@ -835,13 +853,19 @@ def run_selected_research_questions(args):
     # RQ6: Spatial MBU (1/2/4-bit) & Temporal Multi-Fault Burst (k=1..8) Stress Test
     # =========================================================================
     if run_all or "rq6" in rqs:
-        print("=== [RQ6] Running Spatial MBU (1/2/4-bit) & Temporal Multi-Fault Burst (k=1..8) Stress Test ===")
+        print("=== [RQ6] Running Spatial MBU (1/2/4-bit) & Temporal Multi-Fault Burst Stress Test ===")
+        rq6_cfg = cfg.get("grids", {}).get("rq6", {})
+        rq6_env = dict(os.environ)
+        if rq6_cfg.get("burst_counts"):
+            rq6_env["ATFT_BURST_COUNTS"] = ",".join(
+                str(int(k)) for k in rq6_cfg["burst_counts"])
+        if rq6_cfg.get("trials_per_benchmark"):
+            rq6_env["ATFT_STRESS_TRIALS"] = str(int(rq6_cfg["trials_per_benchmark"]))
         rq6_rows = []
-        for pol in ["native", "swift", "exact_tmr", "approx_simd"]:
-            fi_bin = BUILD_DIR / f"bin_{pol}_fi_fp_x86_64"
-            if not fi_bin.exists():
-                fi_bin = BUILD_DIR / f"bin_{pol}_fi"
-            st_out = run_cmd([str(fi_bin), "--stress", pol])
+        for pol in rq6_cfg.get("policies",
+                               ["native", "swift", "exact_tmr", "approx_simd"]):
+            fi_bin = fi_binary(pol, cfg, "rq6")
+            st_out = run_cmd([str(fi_bin), "--stress", pol], env=rq6_env)
             for line in st_out.strip().splitlines():
                 if line.startswith("STRESS_CSV,"):
                     p = line.split(",")
@@ -894,6 +918,24 @@ def run_selected_research_questions(args):
     if run_all or "rq8" in rqs:
         run_rq8_instruction_category_and_riscv(ssa_ll, cfg)
 
+    # =========================================================================
+    # RQ9: 时序归一化 —— 条件概率 -> 绝对速率（MTTF / MWTF / 每任务失效数）
+    # 纯后处理：读 RQ1 的 PMU 与 RQ6 的 P(F|n)，不跑新 campaign
+    # =========================================================================
+    if run_all or "rq9" in rqs:
+        need = [RES_DIR / "rq1_pmu_performance_qor.csv",
+                RES_DIR / "rq6_mbu_burst_stress.csv"]
+        missing = [p.name for p in need if not p.exists()]
+        if missing:
+            print(f"=== [RQ9] 跳过：缺少 {', '.join(missing)}（先跑 rq1 与 rq6）===")
+        else:
+            print("=== [RQ9] Temporal normalization: MTTF / MWTF / failures-per-mission ===")
+            cmd = [sys.executable, str(ROOT_DIR / "experiments" / "temporal.py"),
+                   "--json", str(RES_DIR / "rq9_temporal.json")]
+            if args.config:
+                cmd += ["--config", str(args.config)]
+            print(run_cmd(cmd).strip())
+
     save_or_diff_snapshot(args.save_snapshot, args.diff_snapshot)
     print("=== Requested Evaluations Completed! ===")
 
@@ -901,7 +943,7 @@ def run_selected_research_questions(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Decoupled Compiler Fault-Tolerance Evaluation Harness")
     parser.add_argument("--rq", default="all",
-                        help="Comma-separated RQs to run: all | rq1,rq2,rq3,rq4,rq5,rq6,rq7,rq8")
+                        help="Comma-separated RQs to run: all | rq1,rq2,rq3,rq4,rq5,rq6,rq7,rq8,rq9")
     parser.add_argument("--policy", default="all",
                         help="Comma-separated policies for RQ1 (e.g., native,swift,approx_simd)")
     parser.add_argument("--arch", default="x86_64", choices=["x86_64", "riscv64"],

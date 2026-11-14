@@ -1,13 +1,13 @@
 policy,bit_field,trials,masked_pct,det_recovered_pct,benign_pct,sdc_pct,due_pct
-native,Sign (Bit 63),500,13.4,0.0,29.4,57.2,0.0
-native,Exponent (Bits 52-62),500,10.4,0.0,34.8,54.8,0.0
-native,Mantissa_High (Bits 32-51),500,12.8,0.0,83.2,4.0,0.0
-native,Mantissa_Low (Bits 0-31),500,67.2,0.0,32.8,0.0,0.0
-swift,Sign (Bit 63),500,13.4,0.0,11.8,15.8,59.0
-swift,Exponent (Bits 52-62),500,10.4,0.0,15.6,13.6,60.4
-swift,Mantissa_High (Bits 32-51),500,11.8,0.0,27.6,1.8,58.8
-swift,Mantissa_Low (Bits 0-31),500,64.0,0.0,8.8,0.0,27.2
-approx_simd,Sign (Bit 63),500,7.6,70.0,14.2,8.0,0.2
-approx_simd,Exponent (Bits 52-62),500,8.6,70.6,14.0,5.8,1.0
-approx_simd,Mantissa_High (Bits 32-51),500,14.8,54.0,29.4,1.8,0.0
-approx_simd,Mantissa_Low (Bits 0-31),500,54.0,34.2,11.8,0.0,0.0
+native,Sign (Bit 63),400,1.25,0.0,31.0,67.75,0.0
+native,Exponent (Bits 52-62),400,1.5,0.0,39.75,58.75,0.0
+native,Mantissa_High (Bits 32-51),400,4.25,0.0,92.5,3.25,0.0
+native,Mantissa_Low (Bits 0-31),400,63.25,0.0,36.75,0.0,0.0
+swift,Sign (Bit 63),400,1.0,0.0,0.0,0.0,99.0
+swift,Exponent (Bits 52-62),400,1.0,0.0,0.0,0.0,99.0
+swift,Mantissa_High (Bits 32-51),400,1.75,0.0,0.0,0.0,98.25
+swift,Mantissa_Low (Bits 0-31),400,56.25,0.0,0.0,0.0,43.75
+approx_simd,Sign (Bit 63),400,1.5,75.0,23.5,0.0,0.0
+approx_simd,Exponent (Bits 52-62),400,3.0,75.0,22.0,0.0,0.0
+approx_simd,Mantissa_High (Bits 32-51),400,5.0,54.75,40.25,0.0,0.0
+approx_simd,Mantissa_Low (Bits 0-31),400,51.5,25.0,23.5,0.0,0.0

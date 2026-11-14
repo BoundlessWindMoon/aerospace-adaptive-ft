@@ -1022,7 +1022,28 @@ static int run_mbu_and_burst_stress(const char *policy_name) {
 
     int targets[NUM_BENCHES];
     int n_targets = bench_select_tagged(BTAG_REPR, targets, NUM_BENCHES);
-    const int trials_per_bench = 80;
+
+    // 每个负载的试验数与 k 的取值都可配：P(F|n) 的置信区间宽度直接取决于
+    // 试验数，而 n 的采样点决定 Ostler 求和的插值精度。
+    const char *v = getenv("ATFT_STRESS_TRIALS");
+    int trials_per_bench = (v && *v) ? atoi(v) : 80;
+    if (trials_per_bench <= 0) trials_per_bench = 80;
+
+    int burst_counts[FI_MAX_EVENTS];
+    int n_burst = 0;
+    if ((v = getenv("ATFT_BURST_COUNTS")) && *v) {
+        const char *p = v;
+        while (*p && n_burst < FI_MAX_EVENTS) {
+            int k = atoi(p);
+            if (k > 0 && k <= FI_MAX_EVENTS) burst_counts[n_burst++] = k;
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
+    if (n_burst == 0) {
+        const int defaults[4] = {1, 2, 4, 8};
+        for (n_burst = 0; n_burst < 4; n_burst++) burst_counts[n_burst] = defaults[n_burst];
+    }
 
     // (A) 空间多比特翻转：1-bit SEU / 2-bit DBU / 4-bit QBU（每次运行 1 个事件）
     const uint32_t mbu_widths[3] = {1, 2, 4};
@@ -1043,14 +1064,14 @@ static int run_mbu_and_burst_stress(const char *policy_name) {
         stress_report(policy_name, "Spatial_MBU", mbu_labels[mw], &agg);
     }
 
-    // (B) 时间维连发故障：单次运行内注入 k = 1/2/4/8 个独立故障
-    const int burst_counts[4] = {1, 2, 4, 8};
-    const char *burst_labels[4] = {"k=1 Fault/Run", "k=2 Faults/Run",
-                                   "k=4 Faults/Run", "k=8 Faults/Run"};
-    for (int bc = 0; bc < 4; bc++) {
+    // (B) 时间维连发故障：单次运行内注入 k 个独立故障，k 由配置给出
+    for (int bc = 0; bc < n_burst; bc++) {
         fi_stats_t agg;
         memset(&agg, 0, sizeof(agg));
         stress_ctx_t ctx = { 1, burst_counts[bc] };
+        char label[48];
+        snprintf(label, sizeof(label), "k=%d Fault%s/Run", burst_counts[bc],
+                 burst_counts[bc] == 1 ? "" : "s");
         for (int bi = 0; bi < n_targets; bi++) {
             int b = targets[bi];
             fi_stats_t st;
@@ -1060,7 +1081,7 @@ static int run_mbu_and_burst_stress(const char *policy_name) {
             agg.trials += st.trials; agg.masked += st.masked; agg.det_rec += st.det_rec;
             agg.benign += st.benign; agg.sdc += st.sdc; agg.due += st.due;
         }
-        stress_report(policy_name, "Temporal_Burst", burst_labels[bc], &agg);
+        stress_report(policy_name, "Temporal_Burst", label, &agg);
     }
 
     free_workspace(&ws);
