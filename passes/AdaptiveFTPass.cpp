@@ -100,6 +100,12 @@ static cl::opt<bool> AtftDeltaProfile(
     cl::desc("Instrument voting sites to profile the fault-free |R-A| envelope"),
     cl::init(false));
 
+// D8 整数通路：把内联表决结果接回数据流，并让两条副本保持可注错
+static cl::opt<bool> AtftIntTMRWire(
+    "atft-int-tmr-wire",
+    cl::desc("Wire the integer TMR inline vote back into the dataflow and keep replicas injectable"),
+    cl::init(false));
+
 // D3 副本一致性判据改为按位相等：两条近似副本是同一条 f32 链的复制，
 // 无故障时按 IEEE-754 必然逐位相同，原先的 1e-6 / 1e-5 松弛量没有来源
 static cl::opt<bool> AtftReplicaExact(
@@ -983,8 +989,13 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
         FunctionType::get(ptr->getType(), {ptr->getType()}, false), "", "=r,0", true);
     Value *p1 = markInternal(IRB.CreateCall(ptrBar, {ptr}));
     Value *p2 = markInternal(IRB.CreateCall(ptrBar, {ptr}));
-    replica1Map[LD] = markInternal(IRB.CreateLoad(LD->getType(), p1, LD->getName() + ".ld.itmr1"));
-    replica2Map[LD] = markInternal(IRB.CreateLoad(LD->getType(), p2, LD->getName() + ".ld.itmr2"));
+    Value *l1 = IRB.CreateLoad(LD->getType(), p1, LD->getName() + ".ld.itmr1");
+    Value *l2 = IRB.CreateLoad(LD->getType(), p2, LD->getName() + ".ld.itmr2");
+    // 冗余 load 在 D8 下保持可注错：三份 load 都是真实存在的硬件读，
+    // 裁判层看不见它们就等于把故障空间固定在原件上
+    if (!AtftIntTMRWire) { markInternal(l1); markInternal(l2); }
+    replica1Map[LD] = l1;
+    replica2Map[LD] = l2;
   }
 
   for (PHINode *PN : phiNodes) {
@@ -1006,6 +1017,7 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
 
     Instruction *rep1 = inst->clone();
     Instruction *rep2 = inst->clone();
+    std::set<Value *> itmrInternalUsers;
     for (unsigned k = 0; k < inst->getNumOperands(); ++k) {
       Value *op = inst->getOperand(k);
       if (isa<BasicBlock>(op)) continue;
@@ -1018,8 +1030,13 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     }
     IRB.Insert(rep1, inst->getName() + ".itmr1");
     IRB.Insert(rep2, inst->getName() + ".itmr2");
-    markInternal(rep1);
-    markInternal(rep2);
+    // 两条副本**不**打 atft.voter.internal：打了就不再是注错点，整数通路的
+    // 故障空间会停在 352 个点不变（与 native 相同），注入必然命中原件，
+    // 看起来"保护有效"其实是裁判看不见冗余硬件。与 fp64 精确三模
+    // （188 -> 564 个点）保持同一口径。
+    if (!AtftIntTMRWire) { markInternal(rep1); markInternal(rep2); }
+    itmrInternalUsers.insert(rep1);
+    itmrInternalUsers.insert(rep2);
     replica1Map[inst] = rep1;
     replica2Map[inst] = rep2;
 
@@ -1029,10 +1046,24 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
       Value *cmp23 = markInternal(IRB.CreateICmpEQ(rep1, rep2, "itmr.c23"));
       Value *sel23 = markInternal(IRB.CreateSelect(cmp23, rep1, inst, "itmr.s23"));
       Value *voted = markInternal(IRB.CreateSelect(cmp12, inst, sel23, "itmr.inline.vote"));
-      Type *vt = inst->getType();
-      InlineAsm *keepVote = InlineAsm::get(
-          FunctionType::get(vt, {vt}, false), "", "=r,0", true);
-      markInternal(IRB.CreateCall(keepVote, {voted}));
+      itmrInternalUsers.insert(cmp12);
+      itmrInternalUsers.insert(cmp23);
+      itmrInternalUsers.insert(sel23);
+      itmrInternalUsers.insert(voted);
+      // 表决结果必须**接回数据流**。原实现只用一条 InlineAsm 把 voted 保活、
+      // 不替换使用者，于是原件被打坏后照样往下游传，整条内联表决等于白跑：
+      // 整数类 SDC 36.17% 在三模后只降 1.8pp 就是这么来的。
+      if (AtftIntTMRWire) {
+        inst->replaceUsesWithIf(voted, [&](Use &U) {
+          return itmrInternalUsers.count(U.getUser()) == 0;
+        });
+      } else {
+        // 冻结基线的原行为：只把表决结果保活，不接回数据流
+        Type *vt = inst->getType();
+        InlineAsm *keepVote = InlineAsm::get(
+            FunctionType::get(vt, {vt}, false), "", "=r,0", true);
+        markInternal(IRB.CreateCall(keepVote, {voted}));
+      }
     }
   }
 

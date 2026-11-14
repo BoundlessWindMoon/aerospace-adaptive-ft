@@ -100,6 +100,8 @@ def ablation_matrix(delta_table, seed=None):
         ("opt_delta",          "approx-simd",  dflags,           mk(denv)),
         ("opt_cmptmr_delta",   "approx-simd",  base + dflags,    mk(denv)),
         ("native_cmptmr",      "native",       base,             mk({})),
+        ("opt_intwire",        "approx-simd",  ["-atft-int-tmr-wire"], mk({})),
+        ("opt_all",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire"], mk(denv)),
     ]
 
 
