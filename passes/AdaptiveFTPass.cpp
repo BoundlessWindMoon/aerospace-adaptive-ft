@@ -100,6 +100,23 @@ static cl::opt<bool> AtftDeltaProfile(
     cl::desc("Instrument voting sites to profile the fault-free |R-A| envelope"),
     cl::init(false));
 
+// D9 整数通路只在**边界**表决：值离开被复制子图（流向 store / 地址 / 调用 /
+// 未被复制的指令）时才插表决，子图内部三条链并行传播不校验。
+// 依据 SWIFT (CGO'05) 的同步点校验与 nZDC (DAC'16) 的"变成地址或控制流之前校验"，
+// 单比特故障沿一条链传播，到第一个边界被多数决掩盖，保护强度不变而表决次数大减。
+static cl::opt<bool> AtftIntTMRBoundary(
+    "atft-int-tmr-boundary",
+    cl::desc("Vote only where a replicated integer value leaves the replicated subgraph (implies -atft-int-tmr-wire)"),
+    cl::init(false));
+
+// D10 按通路分预算：整数通路与浮点近似通路的"单位开销收益"差一个量级，
+// 用同一个 -atft-budget 同时压两条通路必然在其中一条上做错决策。
+// < 0 表示沿用全局预算，保持原行为。
+static cl::opt<double> AtftIntBudget(
+    "atft-int-budget",
+    cl::desc("Separate protection budget for the integer datapath (<0 = follow -atft-budget)"),
+    cl::init(-1.0));
+
 // D8 整数通路：把内联表决结果接回数据流，并让两条副本保持可注错
 static cl::opt<bool> AtftIntTMRWire(
     "atft-int-tmr-wire",
@@ -941,6 +958,7 @@ static bool isReplicableIntInst(Instruction *I) {
 
 void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
                                   const std::string &rankMethod, double budget) {
+  if (AtftIntBudget >= 0.0) budget = AtftIntBudget;
   auto instScores = computeInstructionCriticalityMap(F, LI, rankMethod);
 
   Module *M = F.getParent();
@@ -993,7 +1011,7 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     Value *l2 = IRB.CreateLoad(LD->getType(), p2, LD->getName() + ".ld.itmr2");
     // 冗余 load 在 D8 下保持可注错：三份 load 都是真实存在的硬件读，
     // 裁判层看不见它们就等于把故障空间固定在原件上
-    if (!AtftIntTMRWire) { markInternal(l1); markInternal(l2); }
+    if (!AtftIntTMRWire && !AtftIntTMRBoundary) { markInternal(l1); markInternal(l2); }
     replica1Map[LD] = l1;
     replica2Map[LD] = l2;
   }
@@ -1034,14 +1052,28 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     // 故障空间会停在 352 个点不变（与 native 相同），注入必然命中原件，
     // 看起来"保护有效"其实是裁判看不见冗余硬件。与 fp64 精确三模
     // （188 -> 564 个点）保持同一口径。
-    if (!AtftIntTMRWire) { markInternal(rep1); markInternal(rep2); }
+    if (!AtftIntTMRWire && !AtftIntTMRBoundary) { markInternal(rep1); markInternal(rep2); }
     itmrInternalUsers.insert(rep1);
     itmrInternalUsers.insert(rep2);
     replica1Map[inst] = rep1;
     replica2Map[inst] = rep2;
 
+    // 边界判定：所有使用者都会被复制时，这个节点不需要表决，
+    // 故障沿单条链继续传播，到第一个离开子图的点再被多数决掩盖
+    bool needVote = true;
+    if (AtftIntTMRBoundary) {
+      needVote = false;
+      for (User *U : inst->users()) {
+        auto *uI = dyn_cast<Instruction>(U);
+        if (!uI) { needVote = true; break; }
+        if (itmrInternalUsers.count(uI)) continue;
+        bool replicated = selectedSet.count(uI) || replica1Map.count(uI);
+        if (!replicated) { needVote = true; break; }
+      }
+    }
+
     // 按位一致性内联表决（i1 结果不参与，避免无意义开销）
-    if (isSupportedIntTy(inst->getType())) {
+    if (needVote && isSupportedIntTy(inst->getType())) {
       Value *cmp12 = markInternal(IRB.CreateICmpEQ(inst, rep1, "itmr.c12"));
       Value *cmp23 = markInternal(IRB.CreateICmpEQ(rep1, rep2, "itmr.c23"));
       Value *sel23 = markInternal(IRB.CreateSelect(cmp23, rep1, inst, "itmr.s23"));
@@ -1053,9 +1085,14 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
       // 表决结果必须**接回数据流**。原实现只用一条 InlineAsm 把 voted 保活、
       // 不替换使用者，于是原件被打坏后照样往下游传，整条内联表决等于白跑：
       // 整数类 SDC 36.17% 在三模后只降 1.8pp 就是这么来的。
-      if (AtftIntTMRWire) {
+      if (AtftIntTMRWire || AtftIntTMRBoundary) {
         inst->replaceUsesWithIf(voted, [&](Use &U) {
-          return itmrInternalUsers.count(U.getUser()) == 0;
+          if (itmrInternalUsers.count(U.getUser())) return false;
+          if (!AtftIntTMRBoundary) return true;
+          // 边界模式下只替换"离开子图"的那些使用者，子图内部仍走原链
+          auto *uI = dyn_cast<Instruction>(U.getUser());
+          if (!uI) return true;
+          return !(selectedSet.count(uI) || replica1Map.count(uI));
         });
       } else {
         // 冻结基线的原行为：只把表决结果保活，不接回数据流
