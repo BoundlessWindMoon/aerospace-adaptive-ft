@@ -7,8 +7,6 @@
 
 ![方法总体](figures/method_overview.png)
 
-图由 `docs/figures/method_overview.py` 生成。
-
 | 模块 | 判定点 | 当前取值 | 依据 |
 |---|---|---|---|
 | 关键性评分 | 三项加权公式 | w1=2.5, w2=1.8, w3=0.8 | 结构有先例，权重拍的 |
