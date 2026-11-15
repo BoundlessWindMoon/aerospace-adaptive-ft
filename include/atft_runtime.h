@@ -189,6 +189,10 @@ double *atft_abft_scratch(int which, long n);
 // 行级校验的分解形式：vb 在最外层算一次，每行只花 O(nj + nk)
 void   atft_abft_colsum_into(const double *B, int nk, int nj, long ldb, double *vb);
 double atft_abft_row_presum(const double *crow, int nj, double *crow_copy);
+// 累加器被常量初始化时：初值已知，不需要快照，整矩阵一次校验
+void   atft_abft_check_matrix_const(double *C, const double *A, const double *B,
+                                    int ni, int nj, int nk, long ldc, long lda,
+                                    long ldb, double alpha, double init_c);
 void   atft_abft_check_row(double *crow, const double *arow, const double *B,
                            const double *vb, const double *crow_old,
                            int nj, int nk, long ldb, double alpha, double pre_sum);

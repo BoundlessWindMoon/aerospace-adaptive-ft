@@ -729,3 +729,56 @@ double atft_abft_row_presum(const double *crow, int nj, double *crow_copy) {
     }
     return s;
 }
+
+// ----------------------------------------------------------------------------
+// 累加器被**常量初始化**时的整矩阵校验。
+//
+// 不需要快照：归约开始前每个元素的值已知（就是那个常量 c），所以
+//     sum_j C[i][j] == nj*c + alpha * sum_k A[i][k] * (sum_j B[k][j])
+// 这把"归约区域必须排除其它写入"放宽成"其它写入的值是已知的"，
+// 比做循环分布更一般 —— 分布只是让快照点存在，而这里直接把初值算出来。
+// 重算也不需要原数据副本：原值就是 c。
+// ----------------------------------------------------------------------------
+void atft_abft_check_matrix_const(double *C, const double *A, const double *B,
+                                  int ni, int nj, int nk, long ldc, long lda,
+                                  long ldb, double alpha, double init_c) {
+    if (!g_atft_abft_enabled) return;
+    double *vb = atft_abft_scratch(2, nk);
+    if (!vb) return;
+    for (int k = 0; k < nk; k++) {
+        double s = 0.0;
+        const double *row = B + (long)k * ldb;
+        for (int j = 0; j < nj; j++) s += row[j];
+        vb[k] = s;
+    }
+    for (int i = 0; i < ni; i++) {
+        double *crow = C + (long)i * ldc;
+        const double *arow = A + (long)i * lda;
+        double lhs = 0.0;
+        for (int j = 0; j < nj; j++) lhs += crow[j];
+        double acc = 0.0, nrm_a = 0.0, nrm_v = 0.0;
+        for (int k = 0; k < nk; k++) {
+            acc += arow[k] * vb[k];
+            double a = fabs(arow[k]), v = fabs(vb[k]);
+            if (a > nrm_a) nrm_a = a;
+            if (v > nrm_v) nrm_v = v;
+        }
+        double rhs = (double)nj * init_c + alpha * acc;
+        double scale = fabs(rhs) > 1.0 ? fabs(rhs) : 1.0;
+        double tol = ATFT_ABFT_KAPPA * ATFT_U_FP64 *
+                     ((double)nk * nrm_a * nrm_v + scale * (double)nj);
+        g_atft_abft.checks++;
+        if (fabs(lhs - rhs) <= tol) continue;
+        g_atft_abft.flagged++;
+        g_atft_state.detected_faults++;
+        if (g_atft_abft_repair) {
+            for (int j = 0; j < nj; j++) {
+                double s = 0.0;
+                for (int k = 0; k < nk; k++) s += arow[k] * B[(long)k * ldb + j];
+                crow[j] = init_c + alpha * s;
+            }
+            g_atft_abft.repaired++;
+            g_atft_state.recovered_by_reexec++;
+        }
+    }
+}

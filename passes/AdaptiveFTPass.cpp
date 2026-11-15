@@ -830,23 +830,63 @@ static bool classifyRowCol(Value *AccPtr, const std::vector<Loop *> &nest,
   return haveRow && haveCol;
 }
 
-static Loop *reductionRegion(const std::vector<Loop *> &nest, StoreInst *SI) {
+// 归约区域：最外层那个"累加器在归约开始前的值是**已知的**"的循环。
+// 已知有两种来源：
+//   (a) 区域内除归约语句外没有别的写入 -> 用 preheader 快照拿到
+//   (b) 别的写入是把一个常量写进累加器 -> 初值解析可得，连快照都不用
+// (b) 比做循环分布更一般：分布只是让快照点存在，而这里直接把初值算出来。
+// 返回区域循环；initConst 非空时表示走 (b)，值为那个常量。
+static Loop *reductionRegion(const std::vector<Loop *> &nest, StoreInst *SI,
+                             ConstantFP *&initConst, Value *&initScale) {
   Value *accBase = gepBasePtr(SI->getPointerOperand());
   for (Loop *L : nest) {           // 最外到最内
     bool clean = true;
+    ConstantFP *konst = nullptr;
+    Value *scaleVal = nullptr;
     for (BasicBlock *BB : L->blocks()) {
       for (Instruction &I : *BB) {
         auto *OtherSI = dyn_cast<StoreInst>(&I);
-        if (OtherSI && OtherSI != SI &&
-            gepBasePtr(OtherSI->getPointerOperand()) == accBase) {
-          clean = false;
-          break;
+        if (!OtherSI || OtherSI == SI) continue;
+        if (gepBasePtr(OtherSI->getPointerOperand()) != accBase) continue;
+        auto *CFP = dyn_cast<ConstantFP>(OtherSI->getValueOperand());
+        if (CFP && !scaleVal && (!konst || konst->isExactlyValue(CFP->getValueAPF()))) {
+          konst = CFP;        // 常量初始化：初值已知
+          continue;
         }
+        // `ACC[..] = ACC[..] * inv`（gemm 的 C *= beta、2mm 的 D *= beta）：
+        // 初值同样是已知的 —— 快照乘上那个循环不变标量即可。
+        // 所以"已知初值"有三种来源：无其它写入 / 常量 / 已知仿射缩放。
+        if (!konst) {
+          if (auto *FM = dyn_cast<BinaryOperator>(OtherSI->getValueOperand())) {
+            if (FM->getOpcode() == Instruction::FMul) {
+              for (unsigned q = 0; q < 2; ++q) {
+                auto *LD = dyn_cast<LoadInst>(FM->getOperand(q));
+                Value *inv = FM->getOperand(1 - q);
+                if (LD && samePointer(LD->getPointerOperand(),
+                                      OtherSI->getPointerOperand()) &&
+                    L->isLoopInvariant(inv) && inv->getType()->isDoubleTy() &&
+                    (!scaleVal || scaleVal == inv)) {
+                  scaleVal = inv;
+                  break;
+                }
+              }
+              if (scaleVal) continue;
+            }
+          }
+        }
+        clean = false;        // 其它形式的写入：初值不可知
+        break;
       }
       if (!clean) break;
     }
-    if (clean) return L;
+    if (clean) {
+      initConst = konst;
+      initScale = scaleVal;
+      return L;
+    }
   }
+  initConst = nullptr;
+  initScale = nullptr;
   return nullptr;
 }
 
@@ -862,7 +902,9 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
   Type *I64 = Type::getInt64Ty(Ctx);
   Type *PtrTy = PointerType::getUnqual(Ctx);
 
-  Loop *Star = reductionRegion(nest, SI);
+  ConstantFP *initConst = nullptr;
+  Value *initScale = nullptr;
+  Loop *Star = reductionRegion(nest, SI, initConst, initScale);
   if (!Star) {
     errs() << "ATFT_ABFT_SKIP," << F.getName() << ",no-reduction-region\n";
     return false;
@@ -878,8 +920,12 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
            << (outerLevels + 1) << ">=" << nest.size() << ")\n";
     return false;
   }
-  // 行级校验要求 L* 恰好把归约维包住、而输出的列维在 L* 内
-  if (Star != LoopK && Star != LoopJ) {
+  // 两条插桩路径，按 L* 的位置选：
+  //   (a) L* 把行循环也包在里面，且累加器是常量初始化 -> 整矩阵一次校验，不用快照
+  //   (b) L* 在行循环内部（行级）           -> 每行快照 + 每行校验
+  bool matrixLevel = (initConst || initScale) &&
+                     (Star == LoopI || Star->contains(LoopI));
+  if (!matrixLevel && Star != LoopK && Star != LoopJ) {
     errs() << "ATFT_ABFT_SKIP," << F.getName() << ",region-not-row-level\n";
     return false;
   }
@@ -894,10 +940,10 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
 
   SCEVExpander Exp(SE, DL, "atft.abft");
   Instruction *IP = Pre->getTerminator();
+  unsigned elemBytes = DL.getTypeAllocSize(F64);
   Instruction *OuterIP = nest.front()->getLoopPreheader()
                              ? nest.front()->getLoopPreheader()->getTerminator()
                              : nullptr;
-  unsigned elemBytes = DL.getTypeAllocSize(F64);
   if (!OuterIP) {
     errs() << "ATFT_ABFT_SKIP," << F.getName() << ",no-outer-preheader\n";
     return false;
@@ -918,6 +964,66 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
     if (!start || !Exp.isSafeToExpand(start)) return nullptr;
     return Exp.expandCodeFor(start, Ptr->getType(), IP);
   };
+
+  if (matrixLevel) {
+    // 整矩阵路径：维度与步长在 L* 的 preheader 物化，校验调用插在 L* 出口
+    Value *baseC = gepBasePtr(SI->getPointerOperand());
+    Value *baseA = gepBasePtr(termA);
+    Value *bB = gepBasePtr(termB);
+    Value *ldc = rowStrideSCEV(SI->getPointerOperand(), LoopI, SE, Exp, IP, elemBytes);
+    Value *lda = rowStrideSCEV(termA, LoopI, SE, Exp, IP, elemBytes);
+    Value *ldbv = rowStrideSCEV(termB, LoopK, SE, Exp, IP, elemBytes);
+    Value *niv = tripCountSCEV(LoopI, SE, Exp, IP);
+    Value *njv = tripCountSCEV(LoopJ, SE, Exp, IP);
+    Value *nkv = tripCountSCEV(LoopK, SE, Exp, IP);
+    if (!baseC || !baseA || !bB || !ldc || !lda || !ldbv || !niv || !njv || !nkv) {
+      errs() << "ATFT_ABFT_SKIP," << F.getName() << ",matrix-bind-missing\n";
+      return false;
+    }
+    IRBuilder<> E2(&*Exit->getFirstInsertionPt());
+    Value *alpha2 = (alphaVal && alphaVal->getType() == F64)
+                        ? alphaVal : ConstantFP::get(F64, 1.0);
+    Instruction *call = nullptr;
+    if (initConst) {
+      FunctionCallee MatFn = M->getOrInsertFunction(
+          "atft_abft_check_matrix_const", Type::getVoidTy(Ctx), PtrTy, PtrTy, PtrTy,
+          I32, I32, I32, I64, I64, I64, F64, F64);
+      call = E2.CreateCall(
+          MatFn, {baseC, baseA, bB, niv, njv, nkv, ldc, lda, ldbv, alpha2,
+                  ConstantFP::get(F64, initConst->getValueAPF().convertToDouble())});
+    } else {
+      // 已知仿射缩放：初值 = scale x 快照。快照在 L* 的 preheader 拍，
+      // 那时缩放还没发生（缩放语句在 L* 内部）。
+      FunctionCallee ScratchFn =
+          M->getOrInsertFunction("atft_abft_scratch", PtrTy, I32, I64);
+      FunctionCallee PreSumFn = M->getOrInsertFunction(
+          "atft_abft_pre_rowsum", Type::getVoidTy(Ctx), PtrTy, I32, I32, I64, PtrTy);
+      FunctionCallee PreCopyFn = M->getOrInsertFunction(
+          "atft_abft_pre_copy", Type::getVoidTy(Ctx), PtrTy, I32, I32, I64, PtrTy);
+      FunctionCallee PostFn = M->getOrInsertFunction(
+          "atft_abft_post_gemm", Type::getVoidTy(Ctx), PtrTy, PtrTy, PtrTy,
+          I32, I32, I32, I64, I64, I64, F64, F64, PtrTy, PtrTy);
+      IRBuilder<> P(IP);
+      auto mk = [&](Value *v) {
+        if (auto *I = dyn_cast<Instruction>(v))
+          I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+        return v;
+      };
+      Value *niL = mk(P.CreateSExt(niv, I64));
+      Value *njL = mk(P.CreateSExt(njv, I64));
+      Value *rs = mk(P.CreateCall(ScratchFn, {ConstantInt::get(I32, 0), niL}));
+      Value *cp = mk(P.CreateCall(ScratchFn, {ConstantInt::get(I32, 1),
+                                              mk(P.CreateMul(niL, njL))}));
+      mk(P.CreateCall(PreSumFn, {baseC, niv, njv, ldc, rs}));
+      mk(P.CreateCall(PreCopyFn, {baseC, niv, njv, ldc, cp}));
+      call = E2.CreateCall(PostFn, {baseC, baseA, bB, niv, njv, nkv, ldc, lda,
+                                    ldbv, alpha2, initScale, rs, cp});
+    }
+    call->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+    errs() << "ATFT_ABFT_INSERTED," << F.getName() << ",matrix-level,region-depth="
+           << (outerLevels + 1) << ",nest-depth=" << nest.size() << "\n";
+    return true;
+  }
 
   Value *cRow = rowBaseSCEV(SI->getPointerOperand(), LoopJ);
   Value *aRow = rowBaseSCEV(termA, LoopK);
