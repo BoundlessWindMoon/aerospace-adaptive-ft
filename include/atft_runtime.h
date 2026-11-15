@@ -183,6 +183,9 @@ void atft_abft_post_gemm(double *C, const double *A, const double *B,
                          const double *c_old);
 void atft_abft_pre_copy(const double *C, int ni, int nj, long ldc, double *dst);
 
+// 编译期插桩用的按需增长暂存缓冲（0 = 行和，1 = 原数据副本）
+double *atft_abft_scratch(int which, long n);
+
 // 矩阵向量：y[j] (或 tmp[i]) 的全和校验。vec_len 给 y 的长度，
 // mode=0 表示 y[i] = sum_j A[i][j]*x[j]，mode=1 表示 y[j] = sum_i A[i][j]*x[i]
 void atft_abft_check_matvec(const double *y, const double *A, const double *x,

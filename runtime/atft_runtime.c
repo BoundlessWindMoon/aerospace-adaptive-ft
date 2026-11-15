@@ -634,3 +634,23 @@ void atft_abft_check_matvec(const double *y, const double *A, const double *x,
         g_atft_state.detected_faults++;
     }
 }
+
+// ----------------------------------------------------------------------------
+// 编译期自动插桩需要的暂存缓冲：行和与原数据副本。
+// Pass 不方便在 IR 里做内存管理，所以由运行时给两块按需增长的静态缓冲。
+// which: 0 = 行和（n 个 double），1 = 原数据副本（n 个 double）
+// ----------------------------------------------------------------------------
+static double *g_scratch[2] = {NULL, NULL};
+static size_t  g_scratch_cap[2] = {0, 0};
+
+double *atft_abft_scratch(int which, long n) {
+    if (which < 0 || which > 1 || n <= 0) return NULL;
+    size_t need = (size_t)n;
+    if (g_scratch_cap[which] < need) {
+        double *grown = (double *)realloc(g_scratch[which], sizeof(double) * need);
+        if (!grown) return NULL;
+        g_scratch[which] = grown;
+        g_scratch_cap[which] = need;
+    }
+    return g_scratch[which];
+}
