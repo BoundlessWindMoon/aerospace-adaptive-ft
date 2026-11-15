@@ -1,0 +1,18 @@
+benchmark,work_share_pct,nest_depth,out_dims,max_array_dims,verdict,inserted,reason
+pb_2mm,32.8,3,2,2,reducible,True,代价可降阶（2+0 < 3）且归约在环上
+pb_floyd_warshall,16.91,3,2,2,semiring_blocked,False,代价可降阶（2+0 < 3）但归约是条件更新：min/max 型半环没有加法逆元，校验和无定义
+pb_gemm,15.89,3,2,2,reducible,True,代价可降阶（2+0 < 3）且归约在环上
+pb_jacobi2d,11.45,3,2,2,not_reducible,False,校验代价不降阶：max_array_dims 2 + 阶段层 1 >= 巢深 3（校验要每个阶段跑一次）
+axc_sobel,8.08,2,2,2,not_reducible,False,每个输出只有 O(1) 工作量（巢深 2 = 输出维数 2）
+pb_nussinov,3.4,3,2,3,not_reducible,False,校验代价不降阶：max_array_dims 3 + 阶段层 0 >= 巢深 3
+parsec_blackscholes,3.19,1,1,1,not_reducible,False,每个输出只有 O(1) 工作量（巢深 1 = 输出维数 1）
+pb_deriche,1.43,2,2,2,not_reducible,False,每个输出只有 O(1) 工作量（巢深 2 = 输出维数 2）
+obpmark_image_proc,0.75,1,1,0,unrecognized,False,无数组读：不是可识别的内核形态
+pb_atax,0.55,2,1,2,not_reducible,False,校验代价不降阶：max_array_dims 2 + 阶段层 0 >= 巢深 2
+pb_bicg,0.43,2,1,2,not_reducible,False,校验代价不降阶：max_array_dims 2 + 阶段层 0 >= 巢深 2
+pb_durbin,0.21,2,1,2,not_reducible,False,校验代价不降阶：max_array_dims 2 + 阶段层 0 >= 巢深 2
+dsp_kissfft,0.11,1,1,1,not_reducible,False,每个输出只有 O(1) 工作量（巢深 1 = 输出维数 1）
+pb_ludcmp,2.95,,,,undumped,False,前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）
+coast_quicksort,1.5,,,,undumped,False,前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）
+obpmark_image_prep,0.28,,,,undumped,False,前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）
+coast_crc16,0.06,,,,undumped,False,前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）

@@ -111,6 +111,12 @@ static cl::opt<std::string> AtftDumpSums(
     cl::desc("Extract reduction loop nests into a symbolic sum description (CSV path)"),
     cl::init(""));
 
+static cl::opt<std::string> AtftDumpNests(
+    "atft-dump-nests",
+    cl::desc("Dump a structural description of every innermost-loop store "
+             "(CSV path) so reducibility can be decided for all workloads"),
+    cl::init(""));
+
 static cl::opt<std::string> AtftReportFile(
     "atft-report",
     cl::desc("Output CSV file path for criticality analysis report"),
@@ -1115,6 +1121,115 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
          << (outerLevels + 1) << ",nest-depth=" << nest.size() << "\n";
   g_abftInserted.insert(&F);
   return true;
+}
+
+// ----------------------------------------------------------------------------
+// 全量巢描述：给**每一个**最内层循环里的标量 store 落一行，不管它是否匹配
+// 已识别的归约/线性映射形态。
+//
+// 为什么需要它：判据只能对"被识别出来的"内核给出进/不进的理由，而答辩会问
+// "剩下那一半工作量为什么没覆盖"。要回答这个问题就得对全部负载给出归类，
+// 而归类必须由程序结构导出，不能按内核名手写。
+//
+// 每行给出：巢深度、输出下标维数、被读数组的下标维数并集、算子集合、
+// 以及运算是否落在环上（有加法逆元）—— min/max 型的半环没有逆元，
+// 校验和在半环上无定义，这是 floyd-warshall / nussinov 不可约的根本原因。
+// ----------------------------------------------------------------------------
+void dumpAllNests(Function &F, LoopInfo &LI, ScalarEvolution &SE,
+                  std::ostream &OS) {
+  std::set<std::string> emitted;
+  std::vector<Loop *> innermost;
+  for (Loop *L : LI.getLoopsInPreorder())
+    if (L->getSubLoops().empty()) innermost.push_back(L);
+
+  for (Loop *Inner : innermost) {
+    std::vector<Loop *> nest;
+    for (Loop *L = Inner; L; L = L->getParentLoop()) nest.push_back(L);
+    std::reverse(nest.begin(), nest.end());
+    std::map<const Loop *, unsigned> depthOf;
+    for (unsigned d = 0; d < nest.size(); ++d) depthOf[nest[d]] = d;
+
+    for (BasicBlock *BB : Inner->blocks()) {
+      for (Instruction &I : *BB) {
+        auto *SI = dyn_cast<StoreInst>(&I);
+        if (!SI) continue;
+        Type *ty = SI->getValueOperand()->getType();
+        if (!ty->isFloatingPointTy() && !ty->isIntegerTy()) continue;
+
+        AccessInfo accAcc;
+        if (!describeAccessSCEV(SI->getPointerOperand(), SE, depthOf, accAcc))
+          continue;
+
+        // 沿 store 的值向上走，收集算子与被读数组的下标维数
+        std::set<unsigned> readDims;
+        std::map<std::string, size_t> arrayDims;   // 每个被读数组自己的维数
+        std::set<std::string> ops;
+        bool hasCall = false;
+        unsigned phiOutsideHeader = 0;
+        std::set<Value *> seen;
+        std::vector<Value *> work{SI->getValueOperand()};
+        while (!work.empty()) {
+          Value *v = work.back();
+          work.pop_back();
+          if (!v || !seen.insert(v).second) continue;
+          if (auto *LD = dyn_cast<LoadInst>(v)) {
+            AccessInfo t;
+            if (describeAccessSCEV(LD->getPointerOperand(), SE, depthOf, t)) {
+              readDims.insert(t.idxDeps.begin(), t.idxDeps.end());
+              size_t &d = arrayDims[t.base];
+              d = std::max(d, t.idxDeps.size());
+            }
+            continue;
+          }
+          auto *inst = dyn_cast<Instruction>(v);
+          if (!inst) continue;
+          ops.insert(inst->getOpcodeName());
+          if (auto *cal = dyn_cast<CallInst>(inst)) hasCall = true;
+          // 由控制流选出来的值（min/max/条件更新）在代数上是 select，没有加法
+          // 逆元。LLVM 把它编译成"非循环头上的 phi"，所以这里数的是这种 phi：
+          // floyd-warshall 与 nussinov 的 min-plus 就是这么现身的。
+          if (auto *ph = dyn_cast<PHINode>(inst)) {
+            bool isHeader = false;
+            for (Loop *L : nest)
+              if (L->getHeader() == ph->getParent()) isHeader = true;
+            if (!isHeader) phiOutsideHeader++;
+            // min/max 型条件更新的判别式：phi 的某个入边直接就是"对被写地址
+            // 的 load"，也就是"要么保留旧值、要么换成新值"。这正是 min-plus /
+            // max-plus 半环的形态，而半环没有加法逆元，校验和在其上无定义。
+            for (Value *iv : ph->incoming_values())
+              if (auto *LD = dyn_cast<LoadInst>(iv))
+                if (samePointer(LD->getPointerOperand(), SI->getPointerOperand()))
+                  selfPhi = true;
+          }
+          for (Use &U : inst->operands()) work.push_back(U.get());
+        }
+        // 最内层循环体里是否有喂给条件分支的比较（min/max 的另一半证据）
+        bool cmpDrivesBranch = false;
+        for (BasicBlock *B2 : Inner->blocks()) {
+          auto *br = dyn_cast<BranchInst>(B2->getTerminator());
+          if (!br || !br->isConditional()) continue;
+          if (B2 == Inner->getLoopLatch()) continue;
+          if (isa<CmpInst>(br->getCondition())) cmpDrivesBranch = true;
+        }
+        size_t maxArrayDims = 0;
+        for (auto &kv : arrayDims) maxArrayDims = std::max(maxArrayDims, kv.second);
+
+        std::string line = "NEST," + F.getName().str() + "," +
+                           std::to_string(nest.size()) + "," +
+                           std::to_string(accAcc.idxDeps.size()) + ",";
+        for (unsigned d : accAcc.idxDeps) line += "i" + std::to_string(d) + ";";
+        line += "," + std::to_string(readDims.size()) + ",";
+        for (unsigned d : readDims) line += "i" + std::to_string(d) + ";";
+        line += "," + std::to_string(maxArrayDims);
+        line += "," + std::string(ty->isFloatingPointTy() ? "fp" : "int") + ",";
+        for (const std::string &o : ops) line += o + ";";
+        line += "," + std::to_string(phiOutsideHeader) + "," +
+                std::string(cmpDrivesBranch ? "cmp_branch" : "no_cmp_branch") +
+                "," + std::string(hasCall ? "has_call" : "no_call");
+        if (emitted.insert(line).second) OS << line << "\n";
+      }
+    }
+  }
 }
 
 void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
@@ -2744,6 +2859,20 @@ public:
     }
 
     // 抽取 + 插桩共用同一遍分析：只给插桩开关时也要跑，产物丢进空流
+    if (!AtftDumpNests.empty()) {
+      std::ofstream nf(AtftDumpNests);
+      if (nf.is_open()) {
+        nf << "kind,function,nest_depth,out_dims,out_idx,read_dims,read_idx,"
+              "max_array_dims,elem_type,ops,phi_outside_header,cmp_branch,calls\n";
+        for (Function *F : targetFuncs) {
+          expandFMulAddIntrinsics(*F);
+          auto &LI = FAM.getResult<LoopAnalysis>(*F);
+          auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(*F);
+          dumpAllNests(*F, LI, SE, nf);
+        }
+      }
+    }
+
     if (!AtftDumpSums.empty() || AtftABFTInsert) {
       std::ofstream ofs;
       std::ostringstream devnull;

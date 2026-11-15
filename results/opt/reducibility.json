@@ -1,0 +1,182 @@
+{
+  "total_native_insts": 6009723,
+  "share": {
+    "True": 0.4868645360193806,
+    "semiring": 0.16914506708545468,
+    "False": 0.2886341017714128,
+    "None": 0.05535629512375196
+  },
+  "inserted_share": 0.4868645360193806,
+  "rows": [
+    {
+      "benchmark": "pb_2mm",
+      "work_share_pct": 32.8,
+      "nest_depth": "3",
+      "out_dims": "2",
+      "max_array_dims": "2",
+      "verdict": "reducible",
+      "inserted": true,
+      "reason": "代价可降阶（2+0 < 3）且归约在环上"
+    },
+    {
+      "benchmark": "pb_floyd_warshall",
+      "work_share_pct": 16.91,
+      "nest_depth": "3",
+      "out_dims": "2",
+      "max_array_dims": "2",
+      "verdict": "semiring_blocked",
+      "inserted": false,
+      "reason": "代价可降阶（2+0 < 3）但归约是条件更新：min/max 型半环没有加法逆元，校验和无定义"
+    },
+    {
+      "benchmark": "pb_gemm",
+      "work_share_pct": 15.89,
+      "nest_depth": "3",
+      "out_dims": "2",
+      "max_array_dims": "2",
+      "verdict": "reducible",
+      "inserted": true,
+      "reason": "代价可降阶（2+0 < 3）且归约在环上"
+    },
+    {
+      "benchmark": "pb_jacobi2d",
+      "work_share_pct": 11.45,
+      "nest_depth": "3",
+      "out_dims": "2",
+      "max_array_dims": "2",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "校验代价不降阶：max_array_dims 2 + 阶段层 1 >= 巢深 3（校验要每个阶段跑一次）"
+    },
+    {
+      "benchmark": "axc_sobel",
+      "work_share_pct": 8.08,
+      "nest_depth": "2",
+      "out_dims": "2",
+      "max_array_dims": "2",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "每个输出只有 O(1) 工作量（巢深 2 = 输出维数 2）"
+    },
+    {
+      "benchmark": "pb_nussinov",
+      "work_share_pct": 3.4,
+      "nest_depth": "3",
+      "out_dims": "2",
+      "max_array_dims": "3",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "校验代价不降阶：max_array_dims 3 + 阶段层 0 >= 巢深 3"
+    },
+    {
+      "benchmark": "parsec_blackscholes",
+      "work_share_pct": 3.19,
+      "nest_depth": "1",
+      "out_dims": "1",
+      "max_array_dims": "1",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "每个输出只有 O(1) 工作量（巢深 1 = 输出维数 1）"
+    },
+    {
+      "benchmark": "pb_deriche",
+      "work_share_pct": 1.43,
+      "nest_depth": "2",
+      "out_dims": "2",
+      "max_array_dims": "2",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "每个输出只有 O(1) 工作量（巢深 2 = 输出维数 2）"
+    },
+    {
+      "benchmark": "obpmark_image_proc",
+      "work_share_pct": 0.75,
+      "nest_depth": "1",
+      "out_dims": "1",
+      "max_array_dims": "0",
+      "verdict": "unrecognized",
+      "inserted": false,
+      "reason": "无数组读：不是可识别的内核形态"
+    },
+    {
+      "benchmark": "pb_atax",
+      "work_share_pct": 0.55,
+      "nest_depth": "2",
+      "out_dims": "1",
+      "max_array_dims": "2",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "校验代价不降阶：max_array_dims 2 + 阶段层 0 >= 巢深 2"
+    },
+    {
+      "benchmark": "pb_bicg",
+      "work_share_pct": 0.43,
+      "nest_depth": "2",
+      "out_dims": "1",
+      "max_array_dims": "2",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "校验代价不降阶：max_array_dims 2 + 阶段层 0 >= 巢深 2"
+    },
+    {
+      "benchmark": "pb_durbin",
+      "work_share_pct": 0.21,
+      "nest_depth": "2",
+      "out_dims": "1",
+      "max_array_dims": "2",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "校验代价不降阶：max_array_dims 2 + 阶段层 0 >= 巢深 2"
+    },
+    {
+      "benchmark": "dsp_kissfft",
+      "work_share_pct": 0.11,
+      "nest_depth": "1",
+      "out_dims": "1",
+      "max_array_dims": "1",
+      "verdict": "not_reducible",
+      "inserted": false,
+      "reason": "每个输出只有 O(1) 工作量（巢深 1 = 输出维数 1）"
+    },
+    {
+      "benchmark": "pb_ludcmp",
+      "work_share_pct": 2.95,
+      "nest_depth": "",
+      "out_dims": "",
+      "max_array_dims": "",
+      "verdict": "undumped",
+      "inserted": false,
+      "reason": "前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）"
+    },
+    {
+      "benchmark": "coast_quicksort",
+      "work_share_pct": 1.5,
+      "nest_depth": "",
+      "out_dims": "",
+      "max_array_dims": "",
+      "verdict": "undumped",
+      "inserted": false,
+      "reason": "前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）"
+    },
+    {
+      "benchmark": "obpmark_image_prep",
+      "work_share_pct": 0.28,
+      "nest_depth": "",
+      "out_dims": "",
+      "max_array_dims": "",
+      "verdict": "undumped",
+      "inserted": false,
+      "reason": "前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）"
+    },
+    {
+      "benchmark": "coast_crc16",
+      "work_share_pct": 0.06,
+      "nest_depth": "",
+      "out_dims": "",
+      "max_array_dims": "",
+      "verdict": "undumped",
+      "inserted": false,
+      "reason": "前端没有抽出巢描述（非仿射寻址 / 循环携带依赖）"
+    }
+  ]
+}
