@@ -147,6 +147,14 @@ static cl::opt<bool> AtftNoBarrier(
     cl::desc("Measurement only: drop the CSE barriers (destroys redundancy, use for cost accounting)"),
     cl::init(false));
 
+// 整数通路改用双模检错 + 冷路径重执行：只留一份副本，汇点比对，
+// 检到不一致由运行时置位、上层整段重算。常驻成本从"3 份计算 + 4 条表决"
+// 降到"2 份计算 + 1 次比对"，而可靠性仍是纠错级（重算给出第三个值）。
+static cl::opt<bool> AtftIntDMR(
+    "atft-int-dmr",
+    cl::desc("Integer datapath: duplicate-and-check with cold-path re-execution instead of TMR"),
+    cl::init(false));
+
 // D10 按通路分预算：整数通路与浮点近似通路的"单位开销收益"差一个量级，
 // 用同一个 -atft-budget 同时压两条通路必然在其中一条上做错决策。
 // < 0 表示沿用全局预算，保持原行为。
@@ -1809,7 +1817,7 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     IRBuilder<> IRB(nextNode);
 
     Instruction *rep1 = inst->clone();
-    Instruction *rep2 = inst->clone();
+    Instruction *rep2 = AtftIntDMR ? nullptr : inst->clone();
     std::set<Value *> itmrInternalUsers;
     bool isolated = false;
     for (unsigned k = 0; k < inst->getNumOperands(); ++k) {
@@ -1819,44 +1827,61 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
       Value *r2 = replica2Map.count(op) ? replica2Map[op] : op;
       // 屏障只需一个操作数：有了它，两条副本与原件就已经互不相同，
       // 后续 CSE/GVN 无法折叠。每个操作数都加等于白付调度代价。
-      if (r1 == op && r2 == op && !isa<Constant>(op) && !isolated) {
+      if (r1 == op && (rep2 ? r2 == op : true) && !isa<Constant>(op) && !isolated) {
         r1 = insertZeroCostCSEBarrier(IRB, op);
-        r2 = insertZeroCostCSEBarrier(IRB, op);
+        if (rep2) r2 = insertZeroCostCSEBarrier(IRB, op);
         isolated = true;
       }
       rep1->setOperand(k, r1);
-      rep2->setOperand(k, r2);
+      if (rep2) rep2->setOperand(k, r2);
     }
     IRB.Insert(rep1, inst->getName() + ".itmr1");
-    IRB.Insert(rep2, inst->getName() + ".itmr2");
+    if (rep2) IRB.Insert(rep2, inst->getName() + ".itmr2");
     // 两条副本**不**打 atft.voter.internal：打了就不再是注错点，整数通路的
     // 故障空间会停在 352 个点不变（与 native 相同），注入必然命中原件，
     // 看起来"保护有效"其实是裁判看不见冗余硬件。与 fp64 精确三模
     // （188 -> 564 个点）保持同一口径。
-    if (!AtftIntTMRWire && !AtftIntTMRBoundary) { markInternal(rep1); markInternal(rep2); }
+    if (!AtftIntTMRWire && !AtftIntTMRBoundary && !AtftIntDMR) {
+      markInternal(rep1);
+      if (rep2) markInternal(rep2);
+    }
     markReplica(rep1);
-    markReplica(rep2);
+    if (rep2) markReplica(rep2);
     itmrInternalUsers.insert(rep1);
-    itmrInternalUsers.insert(rep2);
+    if (rep2) itmrInternalUsers.insert(rep2);
     replica1Map[inst] = rep1;
-    replica2Map[inst] = rep2;
+    if (rep2) replica2Map[inst] = rep2;
 
-    // 边界判定：所有使用者都会被复制时，这个节点不需要表决，
-    // 故障沿单条链继续传播，到第一个离开子图的点再被多数决掩盖
+    // 边界判定：所有使用者都会被复制时，这个节点不需要表决/比对，
+    // 故障沿单条链继续传播，到第一个离开子图的点再被处理
+    bool atBoundary = false;
+    for (User *U : inst->users()) {
+      auto *uI = dyn_cast<Instruction>(U);
+      if (!uI) { atBoundary = true; break; }
+      if (itmrInternalUsers.count(uI)) continue;
+      if (!(selectedSet.count(uI) || replica1Map.count(uI))) { atBoundary = true; break; }
+    }
+    // DMR：在**每个边界**比一次，而不是只在整数 store 汇点比。
+    // 只在 store 比的那一版实测丢了 6.4pp SDC（整数故障多半是喂给 GEP 的下标，
+    // 根本到不了整数 store），所以检测点必须覆盖"值离开被复制子图"的所有位置。
+    if (AtftIntDMR && atBoundary && isSupportedIntTy(inst->getType())) {
+      GlobalVariable *GFlag = cast<GlobalVariable>(
+          M->getOrInsertGlobal("g_atft_dmr_hit", I32Ty));
+      Value *ne = markInternal(IRB.CreateICmpNE(inst, rep1, "dmr.ne"));
+      Value *neI = markInternal(IRB.CreateZExt(ne, I32Ty));
+      Value *cur = markInternal(IRB.CreateLoad(I32Ty, GFlag, "dmr.flag"));
+      Value *upd = markInternal(IRB.CreateOr(cur, neI));
+      markInternal(IRB.CreateStore(upd, GFlag));
+    }
+
     bool needVote = true;
     if (AtftIntTMRBoundary) {
-      needVote = false;
-      for (User *U : inst->users()) {
-        auto *uI = dyn_cast<Instruction>(U);
-        if (!uI) { needVote = true; break; }
-        if (itmrInternalUsers.count(uI)) continue;
-        bool replicated = selectedSet.count(uI) || replica1Map.count(uI);
-        if (!replicated) { needVote = true; break; }
-      }
+      needVote = atBoundary;
     }
 
     // 按位一致性内联表决（i1 结果不参与，避免无意义开销）
-    if (needVote && isSupportedIntTy(inst->getType())) {
+    // DMR 模式不做逐节点表决，只在汇点比对一次
+    if (!AtftIntDMR && needVote && isSupportedIntTy(inst->getType())) {
       Value *cmp12 = markInternal(IRB.CreateICmpEQ(inst, rep1, "itmr.c12"));
       Value *cmp23 = markInternal(IRB.CreateICmpEQ(rep1, rep2, "itmr.c23"));
       Value *sel23 = markInternal(IRB.CreateSelect(cmp23, rep1, inst, "itmr.s23"));
@@ -1902,6 +1927,22 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
   // 以复用运行时唯一的 i32 表决器（它同时负责统计检出次数）
   for (StoreInst *SI : storeInsts) {
     Value *val = SI->getValueOperand();
+    if (AtftIntDMR) {
+      // 双模：汇点比一次，不一致就把全局标志按位或上去，由上层整段重算。
+      // 用"或"而不是分支或函数调用：无分支、无调用，3 条指令，而且标志是粘性的，
+      // 一次执行里只要有一处不一致就会被上层看到。
+      // 这里不纠错 —— 两份副本无法定位谁错，纠错交给重执行给出第三个值。
+      if (!replica1Map.count(val) || !isSupportedIntTy(val->getType())) continue;
+      IRBuilder<> IRB(SI);
+      GlobalVariable *GFlag = cast<GlobalVariable>(
+          M->getOrInsertGlobal("g_atft_dmr_hit", I32Ty));
+      Value *ne = markInternal(IRB.CreateICmpNE(val, replica1Map[val], "dmr.ne"));
+      Value *neI = markInternal(IRB.CreateZExt(ne, I32Ty));
+      Value *cur = markInternal(IRB.CreateLoad(I32Ty, GFlag, "dmr.flag"));
+      Value *upd = markInternal(IRB.CreateOr(cur, neI));
+      markInternal(IRB.CreateStore(upd, GFlag));
+      continue;
+    }
     if (!replica1Map.count(val) || !replica2Map.count(val)) continue;
     IRBuilder<> IRB(SI);
     Type *vt = val->getType();

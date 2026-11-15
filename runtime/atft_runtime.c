@@ -782,3 +782,29 @@ void atft_abft_check_matrix_const(double *C, const double *A, const double *B,
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// 整数通路的双模检错 + 冷路径重执行
+//
+// 第三份副本在无故障时提供零信息（与第二份逐位相同），有故障时只提供"被打中了"
+// 这一个 bit。单次执行的期望故障数 a <= 4e-6，所以把常驻的第三份换成
+// "检到不一致才整段重算"：平时 2 份 + 汇点比对，期望开销远低于三模的
+// 3 份计算 + 4 条表决。
+// 置位与取用分开，取用时清零，这样重算只做一次。
+// ----------------------------------------------------------------------------
+// 插桩直接按位或写这个全局（无分支无调用），运行时只负责取用与清零
+int g_atft_dmr_hit = 0;
+uint64_t g_atft_dmr_mismatches = 0;
+uint64_t g_atft_dmr_reexecs = 0;
+
+int atft_dmr_take_flag(void) {
+    int f = g_atft_dmr_hit;
+    g_atft_dmr_hit = 0;
+    if (f) {
+        g_atft_dmr_mismatches++;
+        g_atft_state.detected_faults++;
+        g_atft_dmr_reexecs++;
+        g_atft_state.recovered_by_reexec++;
+    }
+    return f;
+}

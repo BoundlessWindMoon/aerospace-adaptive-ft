@@ -202,6 +202,14 @@ void   atft_abft_check_row(double *crow, const double *arow, const double *B,
 void atft_abft_check_matvec(const double *y, const double *A, const double *x,
                             int m, int n, long lda, int mode);
 
+// ============================================================================
+// 6. 整数通路的双模检错 + 冷路径重执行（替掉常驻第三份副本）
+// ============================================================================
+extern int g_atft_dmr_hit;          // 插桩按位或写入
+extern uint64_t g_atft_dmr_mismatches;
+extern uint64_t g_atft_dmr_reexecs;
+int  atft_dmr_take_flag(void);     // 读并清零；非零表示需要重算一次
+
 // 打印统计摘要
 
 #ifdef __cplusplus

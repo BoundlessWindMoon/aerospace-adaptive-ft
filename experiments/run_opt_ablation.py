@@ -118,6 +118,9 @@ def ablation_matrix(delta_table, seed=None):
         ("opt_i64_split",      "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-tmr-i64",
                                                                 "-atft-int-budget=1.0"], mk(denv)),
+        # 整数通路双模 + 冷路径重执行（替掉常驻第三份副本）
+        ("opt_dmr",            "approx-simd",  base + dflags + ["-atft-int-dmr",
+                                                                "-atft-int-tmr-i64"], mk(denv)),
         # D10 按通路分预算：浮点近似通路跟随 --budget，整数通路恒为全量
         ("opt_split",          "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-budget=1.0"], mk(denv)),

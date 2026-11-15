@@ -545,7 +545,17 @@ static double g_abft_rowsum[4096];
 static double *g_abft_cold = NULL;
 static size_t g_abft_cold_cap = 0;
 
+// 冷路径重执行：双模检错置位后，整段重跑一次。
+// 故障注入器按"动态步号"注入，第一次执行已经走过那个步号，所以重跑是干净的；
+// 这正是用极低故障率（a <= 4e-6）换掉常驻第三份副本的那笔交易。
+static void invoke_once(suite_workspace_t *ws, int b);
+
 static void invoke_benchmark(suite_workspace_t *ws, int b) {
+    invoke_once(ws, b);
+    if (atft_dmr_take_flag()) invoke_once(ws, b);   // 检到不一致：重算一次
+}
+
+static void invoke_once(suite_workspace_t *ws, int b) {
     reset_mutable_buffers(ws, b);
     int n = ws->n_mat;
     if (g_abft_harness && g_atft_abft_enabled && (b == 0 || b == 1) && n <= 4096) {

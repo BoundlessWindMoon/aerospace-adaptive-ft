@@ -1,0 +1,74 @@
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a4_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/int_arith] flags=- trials=200
+  -> [native/cast] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [native/addr] flags=- trials=200
+  -> [native/cmp_branch] flags=- trials=200
+  -> [opt_i64/fp64] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 trials=200
+  -> [opt_i64/int_arith] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 trials=200
+  -> [opt_i64/cast] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 trials=200
+  -> [opt_i64/load] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 trials=200
+  -> [opt_i64/addr] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 trials=200
+  -> [opt_i64/cmp_branch] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 trials=200
+  -> [opt_dmr/fp64] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-dmr -atft-int-tmr-i64 trials=200
+  -> [opt_dmr/int_arith] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-dmr -atft-int-tmr-i64 trials=200
+  -> [opt_dmr/cast] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-dmr -atft-int-tmr-i64 trials=200
+  -> [opt_dmr/load] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-dmr -atft-int-tmr-i64 trials=200
+  -> [opt_dmr/addr] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-dmr -atft-int-tmr-i64 trials=200
+  -> [opt_dmr/cmp_branch] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-dmr -atft-int-tmr-i64 trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   30.08  0.83   14.31  0.45      0.00      2.3
+opt_i64          9.09    2.22  0.39    0.02  0.03      5.20      4.9
+opt_dmr          6.15    8.59  0.58    7.64  0.43      6.22      1.0
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.42  2.98    0.00      0.00   10   2000
+  int_arith      44.07  2.09   24.55      0.00   17   3400
+  cast           15.97  1.69   57.81      0.00   17   3400
+  load           24.97  2.04    3.46      0.00   16   3200
+  addr            2.01  0.71    0.04      0.00   16   3200
+  cmp_branch     64.06  1.98    0.00      0.00   17   3400
+
+[opt_i64] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.17  1.99    0.00     12.29   10   2000
+  int_arith       0.04  0.08    0.00      1.58   17   3400
+  cast            0.08  0.16    0.00      0.00   17   3400
+  load            3.01  0.92    0.08     17.34   16   3200
+  addr            2.01  0.71    0.04      0.00   16   3200
+  cmp_branch      0.00  0.00    0.00      0.00   17   3400
+
+[opt_dmr] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64            8.17  1.99    0.00     12.29   10   2000
+  int_arith      20.45  1.95   12.58      3.02   17   3400
+  cast            5.91  1.11   29.65      3.84   17   3400
+  load           15.00  1.60    3.54     18.15   16   3200
+  addr            2.01  0.71    0.04      0.00   16   3200
+  cmp_branch      0.00  0.00    0.00      0.00   17   3400
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a4_t200.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a4_t200.json
