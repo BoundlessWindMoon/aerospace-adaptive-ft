@@ -494,6 +494,48 @@ hashcons + union-find 的 e-graph。
   floyd-warshall/nussinov 没有可用不变量的结论对上。
 - 规则集极小（4 条）、搜索极快（7~17 个等价类），所以把它放进编译期是现实的。
 
+### 端到端跑通：从 LLVM IR 自动抽取到自动合成校验式
+
+前端已落地（`-atft-dump-sums`，`dumpReductionSums`）。识别的是**结构**而不是函数名：
+从最内层循环沿父链收集归纳变量，匹配"store 的值是 fadd、且 fadd 的一个操作数是对同一
+地址的 load"这一归约形态，再对每个数组访问算出它依赖哪些循环下标 —— 后者正是 e-graph
+因子外提规则需要的 `free(·)`。
+
+落地过程中有三个坑，都是"不看结构就会漏掉"的典型：
+
+- PolyBench 的 `C[i][j] += alpha*A[i][k]*B[k][j]` 在 IR 里是一条 `llvm.fmuladd` 内建，
+  不先展开成 fmul + fadd 就匹配不到归约形态
+- 没跑 GVN 时同一个 `C[i][j]` 在 load 与 store 各算一遍 GEP，按 Value 身份比地址会判不相等，
+  必须按"同 opcode + 操作数逐个结构相等"比（限深 5）
+- 要求"完美嵌套"会把 gemm 整个丢掉：它的外层 i 循环下挂着两个子循环（beta 缩放与 k 累加）
+
+抽出来的求和式直接喂给搜索（`eqsat_checker.py results/opt/sums.csv`），校验目标式按
+统一规则构造，不针对具体内核：累加数组的自由下标是结果下标、其余是归约下标，
+取一个结果下标作校验方向，目标式 = `sum_c sum_red prod(terms)`。
+
+| 函数 | 累加器 | 归约下标 | 校验方向 | 搜索前乘法 | 搜索后乘法 | 降幅 | 合成的校验式 |
+|---|---|---|---|---|---|---|---|
+| bench_pb_gemm | C[i0,i2] | i1 | i2 | 4096 | 64 | **64×** | `sum_i1(sum_i2(B[i1,i2]) * A[i0,i1])` |
+| bench_pb_2mm | tmp[i0,i1] | i2 | i1 | 4096 | 64 | **64×** | `sum_i2(A[i0,i2] * sum_i1(B[i1,i2]))` |
+| bench_pb_2mm | D[i0,i1] | i2 | i1 | 4096 | 64 | **64×** | `sum_i2(tmp[i0,i2] * sum_i1(C[i1,i2]))` |
+| bench_pb_atax | tmp[i0] | i1 | i0 | 4096 | 64 | **64×** | `sum_i1(sum_i0(A[i0,i1]) * x[i1])` |
+| bench_pb_atax | y[i1] | i0 | i1 | 4096 | 64 | **64×** | `sum_i0(sum_i1(A[i0,i1]) * tmp[i0])` |
+| bench_pb_bicg | s[i1] | i0 | i1 | 4096 | 64 | **64×** | `sum_i0(r[i0] * sum_i1(A[i0,i1]))` |
+| bench_pb_bicg | q[i0] | i1 | i0 | 4096 | 64 | **64×** | `sum_i1(sum_i0(A[i0,i1]) * p[i1])` |
+
+**7 条归约全部自动合成成功，乘法 4096 → 64。** 全程没有一行针对具体内核的代码。
+
+前端覆盖面（17 个负载）：
+
+- **命中 4 个**：gemm、2mm、atax、bicg（严格归约形态）
+- **结构命中但无用 13 条**：KissFFT 的蝶形算子（深度 1 的复数算术累加，不是对某个下标的归约）
+- **没命中、原因明确**：jacobi2d / deriche 是纯映射而非累加（`B[i][j] = c*(A[...]+...)`），
+  要加第二条模式（线性映射）才能收；ludcmp / durbin 有循环携带依赖；
+  floyd_warshall / nussinov 是 min-plus，**本来就该被排除**；crc16 / quicksort / sobel / obpmark 是
+  位运算与定点流水线
+- 结论：严格归约这一类覆盖 4/17，扩到"线性映射"可再收 2 个。**覆盖面本身就是分层比例的实测值**，
+  不是估计
+
 ### 这验到了什么、还没验什么
 
 验到了：**判层可以自动化**。搜索成功与否就是分层判据，不需要逐内核手工适配。

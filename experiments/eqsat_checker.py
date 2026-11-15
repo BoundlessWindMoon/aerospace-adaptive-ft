@@ -237,6 +237,56 @@ def render(eg, best, cid):
     return f"sum_{en[1]}({kids[0]})"
 
 
+def from_sums(path):
+    """读 `-atft-dump-sums` 的产物，对每条归约自动构造校验目标式并搜索。
+
+    构造规则（不针对具体内核）：累加数组的自由下标 = 结果下标，其余为归约下标；
+    取一个结果下标 c 作校验方向，目标式 = sum_c sum_{归约下标} prod(terms)。
+    这就是"把结果沿 c 方向求和"的不变量，ABFT 的行/列校验和是它的特例。
+    """
+    import csv as _csv
+    rows = [r for r in _csv.DictReader(open(path)) if r["kind"] == "REDUCTION"]
+    out = []
+    for r in rows:
+        if not r["function"].startswith("bench_"):
+            continue
+        acc_base, acc_idx = r["accumulator"].split(":")
+        acc_idx = [x for x in acc_idx.split(";") if x]
+        terms = []
+        for t in r["terms"].split("|"):
+            if not t:
+                continue
+            base, idx = t.split(":")
+            terms.append((base, [x for x in idx.split(";") if x]))
+        if not terms or not acc_idx:
+            continue
+        all_idx = sorted({i for _, ix in terms for i in ix} | set(acc_idx))
+        red_idx = [i for i in all_idx if i not in acc_idx]
+        if not red_idx:
+            continue
+        check_idx = acc_idx[-1]
+
+        eg = EGraph()
+        node = None
+        for base, ix in terms:
+            v = eg.add_enode(var("%s[%s]" % (base, ",".join(ix)), ix))
+            node = v if node is None else eg.add_enode(mul(node, v))
+        for i in red_idx:
+            node = eg.add_enode(summ(i, node))
+        root = eg.add_enode(summ(check_idx, node))
+
+        before = extract(eg, root)
+        m0 = before[eg.find(root)][1]
+        saturate(eg, root)
+        after = extract(eg, root)
+        m1, a1 = after[eg.find(root)][1], after[eg.find(root)][2]
+        out.append({"function": r["function"], "acc": "%s[%s]" % (acc_base, ",".join(acc_idx)),
+                    "check_dir": check_idx, "red": ",".join(red_idx),
+                    "m0": m0, "m1": m1, "a1": a1, "expr": render(eg, after, root),
+                    "layer": "代数校验层" if m1 < m0 else "回落指令冗余"})
+    return out
+
+
 def case_gemm(eg):
     """矩阵乘的行校验：sum_j sum_k A[i,k]*B[k,j]"""
     A = eg.add_enode(var("A[i,k]", {"i", "k"}))
@@ -296,8 +346,28 @@ def main():
           f"与 Huang & Abraham 1984 的账本一致）")
 
 
+def main_from_sums(path):
+    rows = from_sums(path)
+    print(f"从 IR 抽到的归约 -> 自动合成校验式（N = {N}）\n")
+    print(f"{'函数':>18}{'累加器':>14}{'归约下标':>9}{'校验方向':>9}"
+          f"{'搜索前乘法':>11}{'搜索后乘法':>11}{'降幅':>7}{'判定':>12}")
+    for r in rows:
+        ratio = f"{r['m0'] / r['m1']:.0f}x" if r["m1"] and r["m1"] < r["m0"] else "-"
+        print(f"{r['function']:>18}{r['acc']:>14}{r['red']:>9}{r['check_dir']:>9}"
+              f"{r['m0']:>11}{r['m1']:>11}{ratio:>7}{r['layer']:>12}")
+    print()
+    for r in rows:
+        print(f"  {r['function']}: {r['expr']}")
+        print(f"      乘法 {r['m1']}  加法 {r['a1']}")
+    return rows
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1:
+        main_from_sums(sys.argv[1])
+    else:
+        main()
 
 
 
