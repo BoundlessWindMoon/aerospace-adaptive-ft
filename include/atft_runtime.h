@@ -170,6 +170,7 @@ typedef struct {
 extern atft_abft_stats_t g_atft_abft;
 extern int g_atft_abft_enabled;      // 0 = 不做校验（基线行为）
 extern int g_atft_abft_repair;       // 1 = 检出后重算该行
+extern int g_atft_abft_colcheck;     // 1 = 加列方向校验，单错可定位（ATFT_ABFT_COLCHECK）
 
 void atft_abft_set(int enabled, int repair);
 
@@ -183,7 +184,17 @@ void atft_abft_post_gemm(double *C, const double *A, const double *B,
                          const double *c_old);
 void atft_abft_pre_copy(const double *C, int ni, int nj, long ldc, double *dst);
 
-// 编译期插桩用的按需增长暂存缓冲（0 = 行和，1 = 原数据副本，2 = B 的列和 vb）
+// 行列双向校验：列方向预和只要 O(n)，取代 pre_copy 的 O(n^2) 快照。
+// 单错时行/列 syndrome 同时给出位置与幅值，修复是 C[i][j] -= (s_i+t_j)/2，O(1)。
+void atft_abft_pre_colsum(const double *C, int ni, int nj, long ldc, double *colsum);
+void atft_abft_post_gemm_rc(double *C, const double *A, const double *B,
+                            int ni, int nj, int nk, long ldc, long lda, long ldb,
+                            double alpha, double beta, const double *rowsum_pre,
+                            const double *colsum_pre);
+
+// 编译期插桩用的按需增长暂存缓冲
+// 0 = 行和，1 = 原数据副本，2 = B 的列和 vb，3 = C 的列和，4 = A 的列和 va，
+// 5 = 行 syndrome，6 = 列 syndrome
 double *atft_abft_scratch(int which, long n);
 
 // 行级校验的分解形式：vb 在最外层算一次，每行只花 O(nj + nk)

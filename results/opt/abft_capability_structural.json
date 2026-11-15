@@ -1,0 +1,108 @@
+{
+  "structural": [
+    {
+      "candidate": "row_sum",
+      "n_checks_per_output_row": 1.0,
+      "checks_total_at_m_n": 8,
+      "rank": 8,
+      "min_dependent_cols": 2,
+      "guaranteed_detect_k": 1,
+      "single_error_localizable": false,
+      "tau_amplification_maxw": 1.0,
+      "correction_memory": "O(m*n) snapshot",
+      "cost_families": 1,
+      "note": "当前 eqsat 产物"
+    },
+    {
+      "candidate": "col_sum",
+      "n_checks_per_output_row": 1.0,
+      "checks_total_at_m_n": 8,
+      "rank": 8,
+      "min_dependent_cols": 2,
+      "guaranteed_detect_k": 1,
+      "single_error_localizable": false,
+      "tau_amplification_maxw": 1.0,
+      "correction_memory": "O(m*n) snapshot",
+      "cost_families": 1,
+      "note": "转置方向"
+    },
+    {
+      "candidate": "row+col",
+      "n_checks_per_output_row": 2.0,
+      "checks_total_at_m_n": 16,
+      "rank": 15,
+      "min_dependent_cols": 4,
+      "guaranteed_detect_k": 3,
+      "single_error_localizable": true,
+      "tau_amplification_maxw": 1.0,
+      "correction_memory": "O(1) recompute",
+      "cost_families": 2,
+      "note": "行列双校验和"
+    },
+    {
+      "candidate": "row+weighted_idx",
+      "n_checks_per_output_row": 2.0,
+      "checks_total_at_m_n": 16,
+      "rank": 16,
+      "min_dependent_cols": 3,
+      "guaranteed_detect_k": 2,
+      "single_error_localizable": true,
+      "tau_amplification_maxw": 8.0,
+      "correction_memory": "O(1) recompute",
+      "cost_families": 2,
+      "note": "加权校验和 w=j+1"
+    },
+    {
+      "candidate": "row+sign_bits",
+      "n_checks_per_output_row": 4.0,
+      "checks_total_at_m_n": 32,
+      "rank": 32,
+      "min_dependent_cols": 4,
+      "guaranteed_detect_k": 3,
+      "single_error_localizable": true,
+      "tau_amplification_maxw": 1.0,
+      "correction_memory": "O(1) recompute",
+      "cost_families": 4,
+      "note": "符号位定位校验"
+    },
+    {
+      "candidate": "grid_2x2",
+      "n_checks_per_output_row": 4.0,
+      "checks_total_at_m_n": 32,
+      "rank": 28,
+      "min_dependent_cols": 4,
+      "guaranteed_detect_k": 3,
+      "single_error_localizable": true,
+      "tau_amplification_maxw": 1.0,
+      "correction_memory": "O(1) recompute",
+      "cost_families": 4,
+      "note": "行列各切两块的网格码"
+    }
+  ],
+  "false_alarm": {
+    "row_sum": {
+      "fa": 0,
+      "ratio_max": 0.004012684557011428
+    },
+    "col_sum": {
+      "fa": 0,
+      "ratio_max": 0.004023271210815716
+    },
+    "row+col": {
+      "fa": 0,
+      "ratio_max": 0.004023271210815716
+    },
+    "row+weighted_idx": {
+      "fa": 0,
+      "ratio_max": 0.004012684557011428
+    },
+    "row+sign_bits": {
+      "fa": 0,
+      "ratio_max": 0.004462143140096497
+    },
+    "grid_2x2": {
+      "fa": 0,
+      "ratio_max": 0.0031920334253253933
+    }
+  }
+}

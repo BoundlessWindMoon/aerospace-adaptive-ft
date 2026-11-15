@@ -1,0 +1,38 @@
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a4_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=400
+  -> [abft_auto/fp64] flags=-atft-abft-insert trials=400
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   29.21  2.10    0.00  0.00      0.00      3.4
+abft_auto        1.01   28.61  2.09    0.00  0.00      8.33      3.5
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.21  2.10    0.00      0.00   10   4000
+
+[abft_auto] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           28.61  2.09    0.00      8.33   10   4000
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a4_t400_k0.05.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a4_t400_k0.05.json

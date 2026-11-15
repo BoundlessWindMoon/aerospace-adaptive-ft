@@ -502,20 +502,44 @@ typedef float v2f32 __attribute__((ext_vector_type(2)));
 atft_abft_stats_t g_atft_abft = {0, 0, 0};
 int g_atft_abft_enabled = 0;
 int g_atft_abft_repair = 1;
+int g_atft_abft_colcheck = 0;
 
 #define ATFT_U_FP64 2.220446049250313e-16
-#define ATFT_ABFT_KAPPA 32.0
+// kappa 原来写死 32。离线实测（experiments/abft_capability.py）无故障残差只需
+// kappa >= 0.0031~0.0045，而每把 kappa 翻一倍就多吃掉约 1/53 的可检测尾数位
+// （n=64 实测 1.5~1.9pp 检出率/倍频）。所以它应当由残差量出来，而不是给一个常数。
+// 默认仍是 32.0，冻结基线行为不变；ATFT_ABFT_KAPPA 可覆盖。
+static double g_abft_kappa = 32.0;
+#define ATFT_ABFT_KAPPA g_abft_kappa
+
+// 行列双向校验下"定位不出单错"的次数（多错或行列不一致），只用于诊断报告
+static unsigned long long g_abft_rc_ambiguous = 0;
+
+// 行列双向校验的核心（定义在下面 post_gemm 之前）
+static int atft_abft_rowcol_core(double *C, const double *A, const double *B,
+                                 int ni, int nj, int nk, long ldc, long lda,
+                                 long ldb, double alpha, double beta,
+                                 const double *rowpre, const double *colpre,
+                                 double init_c);
 
 static void atft_abft_report(void) {
-    fprintf(stderr, "ATFT_ABFT_STATS,checks=%llu,flagged=%llu,repaired=%llu\n",
+    fprintf(stderr, "ATFT_ABFT_STATS,checks=%llu,flagged=%llu,repaired=%llu,"
+                    "rc_ambiguous=%llu,kappa=%g\n",
             (unsigned long long)g_atft_abft.checks,
             (unsigned long long)g_atft_abft.flagged,
-            (unsigned long long)g_atft_abft.repaired);
+            (unsigned long long)g_atft_abft.repaired,
+            g_abft_rc_ambiguous, g_abft_kappa);
 }
 
 void atft_abft_set(int enabled, int repair) {
     g_atft_abft_enabled = enabled ? 1 : 0;
     g_atft_abft_repair = repair ? 1 : 0;
+    const char *k = getenv("ATFT_ABFT_KAPPA");
+    if (k) {
+        double v = atof(k);
+        if (v > 0.0) g_abft_kappa = v;
+    }
+    g_atft_abft_colcheck = getenv("ATFT_ABFT_COLCHECK") ? 1 : 0;
     // 诊断用：退出时报一次校验次数，用来确认插桩真的被执行到
     if (g_atft_abft_enabled && getenv("ATFT_ABFT_VERBOSE")) atexit(atft_abft_report);
 }
@@ -534,6 +558,168 @@ void atft_abft_pre_copy(const double *C, int ni, int nj, long ldc, double *dst) 
     if (!g_atft_abft_enabled || !dst) return;
     for (int i = 0; i < ni; i++)
         memcpy(dst + (long)i * nj, C + (long)i * ldc, sizeof(double) * (size_t)nj);
+}
+
+// 列方向预和：取代 O(n^2) 的 pre_copy，只要 O(n)。
+void atft_abft_pre_colsum(const double *C, int ni, int nj, long ldc, double *colsum) {
+    if (!g_atft_abft_enabled || !colsum) return;
+    for (int j = 0; j < nj; j++) colsum[j] = 0.0;
+    for (int i = 0; i < ni; i++) {
+        const double *row = C + (long)i * ldc;
+        for (int j = 0; j < nj; j++) colsum[j] += row[j];
+    }
+}
+
+// beta != 0 的整矩阵路径：行列双向校验版本，不需要原数据副本。
+void atft_abft_post_gemm_rc(double *C, const double *A, const double *B,
+                            int ni, int nj, int nk, long ldc, long lda, long ldb,
+                            double alpha, double beta, const double *rowsum_pre,
+                            const double *colsum_pre) {
+    if (!g_atft_abft_enabled || !rowsum_pre || !colsum_pre) return;
+    atft_abft_rowcol_core(C, A, B, ni, nj, nk, ldc, lda, ldb, alpha, beta,
+                          rowsum_pre, colsum_pre, 0.0);
+}
+
+// ----------------------------------------------------------------------------
+// 行列双向校验 + 单错定位修正。
+//
+// 为什么加列方向：行校验只给"哪一行错了"，所以修复必须重算整行，而重算
+// C_new = beta*C_old + alpha*A*B 需要 C 的原值，于是被迫留 O(n^2) 快照。
+// 加一条列校验后，行 syndrome 给 i、列 syndrome 给 j，而 syndrome 本身就是
+// 错误的幅值：单错时 s_i = C[i][j]_bad - C[i][j]_true，于是
+//       C[i][j] -= (s_i + t_j)/2
+// 就是修复，O(1)，**不需要任何原数据副本** —— 只要 O(n) 的行/列预和。
+// 代价是一个校验族：va[k] = sum_i A[i][k] 之后 rhs_j = sum_k va[k]*B[k][j]，
+// 两步都是 O(n^2)，相对内核 O(n^3) 仍降一阶。
+//
+// 离线度量（experiments/abft_capability.py）给出的取舍：同样 2 个校验族、同样
+// 的定位能力下，经典加权校验和 w=j+1 会把阈值抬高 n 倍，所以这里用行+列而不是加权。
+//
+// rowpre/colpre 为 NULL 时表示初值是已知常量 init_c（归约前整矩阵都是 c）。
+// 返回 1 表示本函数已经完成检查（调用方不要再跑自己的行循环）。
+// ----------------------------------------------------------------------------
+static int atft_abft_rowcol_core(double *C, const double *A, const double *B,
+                                 int ni, int nj, int nk, long ldc, long lda,
+                                 long ldb, double alpha, double beta,
+                                 const double *rowpre, const double *colpre,
+                                 double init_c) {
+    double *vb = atft_abft_scratch(2, nk);
+    double *va = atft_abft_scratch(4, nk);
+    double *srow = atft_abft_scratch(5, ni);
+    double *scol = atft_abft_scratch(6, nj);
+    if (!vb || !va || !srow || !scol) return 0;
+
+    double nrm_a = 0.0, nrm_b = 0.0;
+    for (int k = 0; k < nk; k++) {
+        double s = 0.0, rmax = 0.0;
+        const double *row = B + (long)k * ldb;
+        for (int j = 0; j < nj; j++) {
+            s += row[j];
+            double t = fabs(row[j]);
+            if (t > rmax) rmax = t;
+        }
+        vb[k] = s;
+        if (rmax > nrm_b) nrm_b = rmax;
+    }
+    for (int k = 0; k < nk; k++) va[k] = 0.0;
+    for (int i = 0; i < ni; i++) {
+        const double *row = A + (long)i * lda;
+        double rmax = 0.0;
+        for (int k = 0; k < nk; k++) {
+            va[k] += row[k];
+            double t = fabs(row[k]);
+            if (t > rmax) rmax = t;
+        }
+        if (rmax > nrm_a) nrm_a = rmax;
+    }
+
+    double base_tol = ATFT_ABFT_KAPPA * ATFT_U_FP64 * (double)nk * nrm_a * nrm_b;
+    int bad_i = -1, bad_j = -1, n_bad_i = 0, n_bad_j = 0;
+
+    for (int i = 0; i < ni; i++) {
+        const double *crow = C + (long)i * ldc;
+        const double *arow = A + (long)i * lda;
+        double lhs = 0.0;
+        for (int j = 0; j < nj; j++) lhs += crow[j];
+        double acc = 0.0;
+        for (int k = 0; k < nk; k++) acc += arow[k] * vb[k];
+        double rhs = (rowpre ? beta * rowpre[i] : (double)nj * init_c) + alpha * acc;
+        double scale = fabs(rhs) > 1.0 ? fabs(rhs) : 1.0;
+        srow[i] = lhs - rhs;
+        g_atft_abft.checks++;
+        if (!(fabs(srow[i]) <= base_tol + ATFT_ABFT_KAPPA * ATFT_U_FP64 * scale * (double)nj)) {
+            n_bad_i++;
+            bad_i = i;
+        }
+    }
+    if (n_bad_i == 0) return 1;
+
+    // 列方向：lhs 与 rhs 都按**行**扫出来（列主序遍历在 2mm 上实测把周期倍率
+    // 从 1.40 推到 1.57，而换成行扫后代价回到 O(n^2) 应有的水平）
+    double *rcol = atft_abft_scratch(7, nj);
+    if (!rcol) return 0;
+    for (int j = 0; j < nj; j++) {
+        scol[j] = 0.0;
+        rcol[j] = colpre ? beta * colpre[j] : (double)ni * init_c;
+    }
+    for (int i = 0; i < ni; i++) {
+        const double *crow = C + (long)i * ldc;
+        for (int j = 0; j < nj; j++) scol[j] += crow[j];
+    }
+    for (int k = 0; k < nk; k++) {
+        const double *brow = B + (long)k * ldb;
+        double w = alpha * va[k];
+        for (int j = 0; j < nj; j++) rcol[j] += w * brow[j];
+    }
+    // 列方向只用来**定位**，不要求它自己越过阈值。
+    // 教训：第一版要求行、列都判为异常才修，结果近阈值的错误只触发行方向、
+    // 列方向够不到阈值 -> 拒修 -> 输出保持错误，gemm 的 SDC 从 0.00 变成 2.50。
+    // 既然行方向已经判定"这一行有错"，列方向最大的 syndrome 就是最优的列估计，
+    // 不需要它独立显著（与离线度量里的匹配滤波定位器一致）。
+    double best = -1.0;
+    for (int j = 0; j < nj; j++) {
+        scol[j] -= rcol[j];
+        g_atft_abft.checks++;
+        double a = fabs(scol[j]);
+        if (a > best) { best = a; bad_j = j; }
+    }
+
+    g_atft_abft.flagged++;
+    g_atft_state.detected_faults++;
+    // 两个方向对误差幅值的估计必须大致一致，否则单错模型不成立（多错、或者
+    // 校验自身被打坏），这时拒修 —— 乱改比不改危险（坑清单第 15 条）。
+    int consistent = (bad_j >= 0) &&
+                     (fabs(srow[bad_i] - scol[bad_j]) <= 0.5 * fabs(srow[bad_i]));
+    if (n_bad_i == 1 && consistent && g_atft_abft_repair) {
+        if (!colpre) {
+            // 初值是已知常量：单个元素可以按输入**精确重算**，不依赖 syndrome 的
+            // 数值，修复因此是自洽的（与整行重算同性质，只是只算一个元素）。
+            double s = 0.0;
+            const double *arow = A + (long)bad_i * lda;
+            for (int k = 0; k < nk; k++) s += arow[k] * B[(long)k * ldb + bad_j];
+            C[(long)bad_i * ldc + bad_j] = init_c + alpha * s;
+        } else {
+            // beta != 0 且没有快照：只能用 syndrome 修正，残差是两条通路的舍入差。
+            C[(long)bad_i * ldc + bad_j] -= srow[bad_i];
+        }
+        g_atft_abft.repaired++;
+        g_atft_state.recovered_by_reexec++;
+    } else if (!colpre && g_atft_abft_repair) {
+        // 定位失败的兜底：初值已知时整行都能按输入重算，不需要旧值。
+        // 这说明"O(n^2) 快照"的真实用途不是纠错本身，而是**定位失败时的兜底**。
+        const double *arow = A + (long)bad_i * lda;
+        double *crow = C + (long)bad_i * ldc;
+        for (int j = 0; j < nj; j++) {
+            double s = 0.0;
+            for (int k = 0; k < nk; k++) s += arow[k] * B[(long)k * ldb + j];
+            crow[j] = init_c + alpha * s;
+        }
+        g_atft_abft.repaired++;
+        g_atft_state.recovered_by_reexec++;
+    } else {
+        g_abft_rc_ambiguous++;
+    }
+    return 1;
 }
 
 void atft_abft_post_gemm(double *C, const double *A, const double *B,
@@ -650,11 +836,13 @@ void atft_abft_check_matvec(const double *y, const double *A, const double *x,
 // which: 0 = 行和（n 个 double），1 = 原数据副本（n 个 double）
 // ----------------------------------------------------------------------------
 // 三个槽位：0 = 行和，1 = 原数据副本，2 = B 的列和 vb
-static double *g_scratch[3] = {NULL, NULL, NULL};
-static size_t  g_scratch_cap[3] = {0, 0, 0};
+// 行列双向校验另用：3 = C 的列和快照，4 = A 的列和 va，5 = 行 syndrome，
+//                  6 = 列 syndrome，7 = 列 rhs 暂存
+static double *g_scratch[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+static size_t  g_scratch_cap[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 double *atft_abft_scratch(int which, long n) {
-    if (which < 0 || which > 2 || n <= 0) return NULL;
+    if (which < 0 || which > 7 || n <= 0) return NULL;
     size_t need = (size_t)n;
     if (g_scratch_cap[which] < need) {
         double *grown = (double *)realloc(g_scratch[which], sizeof(double) * need);
@@ -745,6 +933,10 @@ void atft_abft_check_matrix_const(double *C, const double *A, const double *B,
     if (!g_atft_abft_enabled) return;
     double *vb = atft_abft_scratch(2, nk);
     if (!vb) return;
+    if (g_atft_abft_colcheck &&
+        atft_abft_rowcol_core(C, A, B, ni, nj, nk, ldc, lda, ldb, alpha, 1.0,
+                              NULL, NULL, init_c))
+        return;
     for (int k = 0; k < nk; k++) {
         double s = 0.0;
         const double *row = B + (long)k * ldb;

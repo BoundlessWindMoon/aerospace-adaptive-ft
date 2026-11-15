@@ -89,6 +89,12 @@ static cl::opt<bool> AtftABFTInsert(
     cl::desc("Insert algebraic-check calls around recognized matmul-shaped reductions"),
     cl::init(false));
 
+static cl::opt<bool> AtftABFTColCheck(
+    "atft-abft-colcheck",
+    cl::desc("Add a column-direction algebraic check so single errors are locatable "
+             "(drops the O(n^2) snapshot; see docs/HANDOFF.md section 9)"),
+    cl::init(false));
+
 static cl::opt<std::string> AtftDumpSums(
     "atft-dump-sums",
     cl::desc("Extract reduction loop nests into a symbolic sum description (CSV path)"),
@@ -1020,12 +1026,25 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
       Value *niL = mk(P.CreateSExt(niv, I64));
       Value *njL = mk(P.CreateSExt(njv, I64));
       Value *rs = mk(P.CreateCall(ScratchFn, {ConstantInt::get(I32, 0), niL}));
-      Value *cp = mk(P.CreateCall(ScratchFn, {ConstantInt::get(I32, 1),
-                                              mk(P.CreateMul(niL, njL))}));
       mk(P.CreateCall(PreSumFn, {baseC, niv, njv, ldc, rs}));
-      mk(P.CreateCall(PreCopyFn, {baseC, niv, njv, ldc, cp}));
-      call = E2.CreateCall(PostFn, {baseC, baseA, bB, niv, njv, nkv, ldc, lda,
-                                    ldbv, alpha2, initScale, rs, cp});
+      if (AtftABFTColCheck) {
+        // 列方向预和取代原数据副本：O(n) 取代 O(n^2)，换来单错可定位。
+        FunctionCallee PreColFn = M->getOrInsertFunction(
+            "atft_abft_pre_colsum", Type::getVoidTy(Ctx), PtrTy, I32, I32, I64, PtrTy);
+        FunctionCallee PostRcFn = M->getOrInsertFunction(
+            "atft_abft_post_gemm_rc", Type::getVoidTy(Ctx), PtrTy, PtrTy, PtrTy,
+            I32, I32, I32, I64, I64, I64, F64, F64, PtrTy, PtrTy);
+        Value *cs = mk(P.CreateCall(ScratchFn, {ConstantInt::get(I32, 3), njL}));
+        mk(P.CreateCall(PreColFn, {baseC, niv, njv, ldc, cs}));
+        call = E2.CreateCall(PostRcFn, {baseC, baseA, bB, niv, njv, nkv, ldc, lda,
+                                        ldbv, alpha2, initScale, rs, cs});
+      } else {
+        Value *cp = mk(P.CreateCall(ScratchFn, {ConstantInt::get(I32, 1),
+                                                mk(P.CreateMul(niL, njL))}));
+        mk(P.CreateCall(PreCopyFn, {baseC, niv, njv, ldc, cp}));
+        call = E2.CreateCall(PostFn, {baseC, baseA, bB, niv, njv, nkv, ldc, lda,
+                                      ldbv, alpha2, initScale, rs, cp});
+      }
     }
     call->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
     errs() << "ATFT_ABFT_INSERTED," << F.getName() << ",matrix-level,region-depth="

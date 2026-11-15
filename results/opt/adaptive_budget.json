@@ -1,0 +1,162 @@
+{
+  "orbit": {
+    "saa_fraction": 0.1856,
+    "dwell_min": 13.1,
+    "passes_per_day": 20.3,
+    "b_nt": "26000"
+  },
+  "q": {
+    "native": {
+      "q": 0.1324,
+      "is_bound": false,
+      "k1": 0.1324,
+      "k2": 0.2446
+    },
+    "opt_i64": {
+      "q": 0.0001,
+      "is_bound": true,
+      "k1": 0.0,
+      "k2": 0.0001
+    },
+    "native_int": {
+      "q": 0.24100000000000002,
+      "is_bound": false,
+      "k1": 0.24100000000000002,
+      "k2": 0.2728
+    },
+    "opt_i64_int": {
+      "q": 0.0005,
+      "is_bound": true,
+      "k1": 0.0,
+      "k2": 0.0005
+    }
+  },
+  "check_unprotected_90d": 1691.1642402748032,
+  "always_high_90d": 1.2773143808722083,
+  "sweep": [
+    {
+      "sensor_gain_g": 1.0,
+      "kappa": "-",
+      "p_detect": 0.9588,
+      "delay_min": 3.563,
+      "recovery_lag_min": 108.556,
+      "quiet_per_orbit_min": 83.48,
+      "high_in_quiet_min": 80.04,
+      "low_exposure_min": 3.956,
+      "phi_high": 0.9234,
+      "exp_cost_x": 7.695,
+      "fail_per_90d": 497.98,
+      "fail_vs_always_high": 389.9,
+      "cost_saving_x": 1.072,
+      "mwtf_ratio_vs_always_high": 0.0028
+    },
+    {
+      "sensor_gain_g": 0.9925,
+      "kappa": "0.1",
+      "p_detect": 0.9578,
+      "delay_min": 3.581,
+      "recovery_lag_min": 107.906,
+      "quiet_per_orbit_min": 83.48,
+      "high_in_quiet_min": 79.96,
+      "low_exposure_min": 3.983,
+      "phi_high": 0.9223,
+      "exp_cost_x": 7.687,
+      "fail_per_90d": 501.38,
+      "fail_vs_always_high": 392.5,
+      "cost_saving_x": 1.073,
+      "mwtf_ratio_vs_always_high": 0.0027
+    },
+    {
+      "sensor_gain_g": 0.7875,
+      "kappa": "0.25",
+      "p_detect": 0.888,
+      "delay_min": 4.12,
+      "recovery_lag_min": 133.807,
+      "quiet_per_orbit_min": 83.48,
+      "high_in_quiet_min": 74.13,
+      "low_exposure_min": 5.126,
+      "phi_high": 0.8501,
+      "exp_cost_x": 7.163,
+      "fail_per_90d": 647.92,
+      "fail_vs_always_high": 507.3,
+      "cost_saving_x": 1.152,
+      "mwtf_ratio_vs_always_high": 0.0023
+    },
+    {
+      "sensor_gain_g": 0.68,
+      "kappa": "32",
+      "p_detect": 0.8288,
+      "delay_min": 4.477,
+      "recovery_lag_min": 154.048,
+      "quiet_per_orbit_min": 83.48,
+      "high_in_quiet_min": 69.19,
+      "low_exposure_min": 5.953,
+      "phi_high": 0.7904,
+      "exp_cost_x": 6.73,
+      "fail_per_90d": 754.46,
+      "fail_vs_always_high": 590.7,
+      "cost_saving_x": 1.226,
+      "mwtf_ratio_vs_always_high": 0.0021
+    }
+  ],
+  "lever_recovery": [
+    {
+      "recovery_lag_min": 154.0,
+      "scenario": "实测 κ=32",
+      "phi_high": 0.9234,
+      "exp_cost_x": 7.695,
+      "saving_vs_always_high_x": 1.072
+    },
+    {
+      "recovery_lag_min": 108.6,
+      "scenario": "实测 g=1",
+      "phi_high": 0.9234,
+      "exp_cost_x": 7.695,
+      "saving_vs_always_high_x": 1.072
+    },
+    {
+      "recovery_lag_min": 40.0,
+      "scenario": "半个平静段",
+      "phi_high": 0.4918,
+      "exp_cost_x": 4.565,
+      "saving_vs_always_high_x": 1.807
+    },
+    {
+      "recovery_lag_min": 10.0,
+      "scenario": "时间驱动降档",
+      "phi_high": 0.194,
+      "exp_cost_x": 2.406,
+      "saving_vs_always_high_x": 3.429
+    },
+    {
+      "recovery_lag_min": 0.0,
+      "scenario": "星历驱动（出 SAA 即降档）",
+      "phi_high": 0.0947,
+      "exp_cost_x": 1.686,
+      "saving_vs_always_high_x": 4.892
+    }
+  ],
+  "lever_breakeven": [
+    {
+      "scenario": "实测 κ=32",
+      "recovery_lag_min": 154.0,
+      "q_low_breakeven": 0.0001245452554020544,
+      "ratio_vs_q_high": 1.245452554020544,
+      "exp_cost_x": 7.695
+    },
+    {
+      "scenario": "时间驱动降档",
+      "recovery_lag_min": 10.0,
+      "q_low_breakeven": 0.0008589979780500607,
+      "ratio_vs_q_high": 8.589979780500606,
+      "exp_cost_x": 2.406
+    },
+    {
+      "scenario": "星历驱动",
+      "recovery_lag_min": 0.0,
+      "q_low_breakeven": 0.0013029736881056558,
+      "ratio_vs_q_high": 13.029736881056557,
+      "exp_cost_x": 1.686
+    }
+  ]
+}

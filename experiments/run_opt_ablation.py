@@ -36,7 +36,7 @@ OUT = ROOT / "results" / "opt"
 U_FP32 = 2.0 ** -24
 
 
-def profile_envelope():
+def profile_envelope(profile_scale="default", profile_variant="default", output_path=None):
     """构建剖析二进制并取每个负载的无故障近似误差包络。"""
     ssa_ll = H.build_infrastructure()
     tag = "deltaprof"
@@ -55,7 +55,12 @@ def profile_envelope():
         str(H.LIB_ATFT_RT), str(H.LIB_HARNESS_RT),
         *H.inc_flags(H.HARNESS_INCLUDE_DIRS), "-lm", "-o", str(sut_bin)
     ])
-    out = H.run_cmd([str(sut_bin), "--delta-profile"])
+    profile_env = os.environ.copy()
+    if profile_scale == "small":
+        profile_env["ATFT_PROFILE_SMALL"] = "1"
+    if profile_variant != "default":
+        profile_env["ATFT_PROFILE_VARIANT"] = profile_variant
+    out = H.run_cmd([str(sut_bin), "--delta-profile"], env=profile_env)
     rows = []
     for line in out.strip().splitlines():
         parts = line.split(",")
@@ -64,7 +69,8 @@ def profile_envelope():
                          "env_max_rel_dev": float(parts[1]),
                          "observations": int(parts[2])})
     OUT.mkdir(parents=True, exist_ok=True)
-    with open(OUT / "delta_profile.csv", "w", newline="") as f:
+    output_path = Path(output_path) if output_path else OUT / "delta_profile.csv"
+    with open(output_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["benchmark", "env_max_rel_dev", "observations"])
         w.writeheader()
         w.writerows(rows)
@@ -112,6 +118,12 @@ def ablation_matrix(delta_table, seed=None):
                                                                      "ATFT_ABFT_HARNESS": "1"})),
         # 编译期自动插桩（无 harness 接线）：粒度由归约区域推导、准入由代价判据判定
         ("abft_auto",          "native",       ["-atft-abft-insert"], mk({"ATFT_ABFT": "1"})),
+        # 行列双向校验：加一个校验族换单错可定位，修复改成按 syndrome 直接修正，
+        # 于此同时去掉 O(n^2) 原数据快照（见 docs/HANDOFF.md 第九节）
+        ("abft_auto_rc",       "native",       ["-atft-abft-insert",
+                                                "-atft-abft-colcheck"],
+                                                mk({"ATFT_ABFT": "1",
+                                                    "ATFT_ABFT_COLCHECK": "1"})),
         # D4 整数三模覆盖面扩到 i64（i32->i64 的下标扩展占 cast 注入点的 88%）
         ("opt_i64",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-tmr-i64"], mk(denv)),
@@ -180,6 +192,14 @@ def main():
     ap.add_argument("--categories", default="fp64,int_arith,cast,load,addr,cmp_branch")
     ap.add_argument("--seeds", type=int, default=1, help="重复的注错种子数（方差评估）")
     ap.add_argument("--profile-only", action="store_true")
+    ap.add_argument("--profile-scale", choices=["default", "small"], default="default",
+                    help="profile 工作集规模；small 用于独立 validation profile")
+    ap.add_argument("--profile-variant",
+                    choices=["default", "scaled", "scaled_safe"],
+                    default="default",
+                    help="profile 输入变体；scaled 是压力测试，scaled_safe 保持 Durbin 稳定域")
+    ap.add_argument("--profile-out", default=None,
+                    help="profile-only 的输出 CSV；默认写 results/opt/delta_profile.csv")
     ap.add_argument("--policies", default=None,
                     help="只跑这些 tag（逗号分隔），用于小范围的方差/敏感性实验")
     ap.add_argument("--origin-only", action="store_true",
@@ -188,13 +208,16 @@ def main():
                     help="保护预算；压开销的 Pareto 前沿用它扫")
     ap.add_argument("--seed-start", type=int, default=0,
                     help="种子编号起点；0 号种子与历史口径一致")
+    ap.add_argument("--out-suffix", default="",
+                    help="追加到输出文件名后缀，避免覆盖已有的同参数结果")
     args = ap.parse_args()
 
     cfg = H.load_config(None)
     H.apply_threshold_env(cfg)
 
     print("=== [1] 无故障近似误差包络剖析 ===")
-    ssa_ll, rows = profile_envelope()
+    ssa_ll, rows = profile_envelope(
+        args.profile_scale, args.profile_variant, args.profile_out)
     for r in rows:
         print(f"  {r['benchmark']:22s} E_f={r['env_max_rel_dev']:.3e}  obs={r['observations']}")
     if args.profile_only:
@@ -211,7 +234,8 @@ def main():
         suffix = (f"a{args.alpha:g}_t{args.trials}"
                   + ("_paired" if args.origin_only else "")
                   + (f"_b{int(args.budget * 100)}" if args.budget < 0.999 else "")
-                  + ("" if s == 0 else f"_s{s}"))
+                  + ("" if s == 0 else f"_s{s}")
+                  + args.out_suffix)
         print(f"=== [2] 消融 campaign (seed#{s}) ===")
         fi_rows, pmu_rows, fi_path, pmu_path = run_campaign(
             ssa_ll, [m for m in ablation_matrix(table, seed)
