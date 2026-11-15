@@ -183,8 +183,15 @@ void atft_abft_post_gemm(double *C, const double *A, const double *B,
                          const double *c_old);
 void atft_abft_pre_copy(const double *C, int ni, int nj, long ldc, double *dst);
 
-// 编译期插桩用的按需增长暂存缓冲（0 = 行和，1 = 原数据副本）
+// 编译期插桩用的按需增长暂存缓冲（0 = 行和，1 = 原数据副本，2 = B 的列和 vb）
 double *atft_abft_scratch(int which, long n);
+
+// 行级校验的分解形式：vb 在最外层算一次，每行只花 O(nj + nk)
+void   atft_abft_colsum_into(const double *B, int nk, int nj, long ldb, double *vb);
+double atft_abft_row_presum(const double *crow, int nj, double *crow_copy);
+void   atft_abft_check_row(double *crow, const double *arow, const double *B,
+                           const double *vb, const double *crow_old,
+                           int nj, int nk, long ldb, double alpha, double pre_sum);
 
 // 矩阵向量：y[j] (或 tmp[i]) 的全和校验。vec_len 给 y 的长度，
 // mode=0 表示 y[i] = sum_j A[i][j]*x[j]，mode=1 表示 y[j] = sum_i A[i][j]*x[i]

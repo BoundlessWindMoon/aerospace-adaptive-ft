@@ -95,6 +95,9 @@ static void eval_config_from_env(void) {
 //   ATFT_FI_SEED       : 注错随机种子基数。默认与历史一致，改它即可做多种子
 //                        重复实验，用来回答"单种子结论的方差有多大"。
 // ============================================================================
+// 1 = 用 harness 侧手工接线（对照组），0 = 只用编译期自动插桩
+static int g_abft_harness = 0;
+
 #define ATFT_MAX_DELTA_ROWS 64
 static struct { char name[64]; double delta; } g_delta_table[ATFT_MAX_DELTA_ROWS];
 static int g_delta_table_n = 0;
@@ -105,6 +108,8 @@ static void load_delta_table(void) {
     if (v && *v && atoi(v) != 0) atft_set_replica_exact(1);
     if ((v = getenv("ATFT_ABFT")) && *v && atoi(v) != 0)
         atft_abft_set(1, (v = getenv("ATFT_ABFT_REPAIR")) ? atoi(v) : 1);
+    // harness 侧的手工接线默认关闭：编译期插桩打通之后它只作为对照组存在
+    if ((v = getenv("ATFT_ABFT_HARNESS")) && *v && atoi(v) != 0) g_abft_harness = 1;
     if ((v = getenv("ATFT_FI_SEED")) && *v) g_fi_seed_base = strtoull(v, NULL, 0);
 
     const char *path = getenv("ATFT_DELTA_TABLE");
@@ -543,7 +548,7 @@ static size_t g_abft_cold_cap = 0;
 static void invoke_benchmark(suite_workspace_t *ws, int b) {
     reset_mutable_buffers(ws, b);
     int n = ws->n_mat;
-    if (g_atft_abft_enabled && (b == 0 || b == 1) && n <= 4096) {
+    if (g_abft_harness && g_atft_abft_enabled && (b == 0 || b == 1) && n <= 4096) {
         const double *src = (b == 0) ? ws->C : ws->tmp_2mm;
         atft_abft_pre_rowsum(src, n, n, n, g_abft_rowsum);
         if (b == 0) {
@@ -561,23 +566,31 @@ static void invoke_benchmark(suite_workspace_t *ws, int b) {
     switch (b) {
         case 0:
             bench_pb_gemm(n, n, n, 1.5, 1.2, ws->A, ws->B, ws->C);
+if (g_abft_harness) {
             atft_abft_post_gemm(ws->C, ws->A, ws->B, n, n, n, n, n, n,
                                 1.5, 1.2, g_abft_rowsum, g_abft_cold);
+            }
             break;
         case 1:
             bench_pb_2mm(n, n, n, n, 1.5, 1.2, ws->tmp_2mm, ws->A, ws->B, ws->A, ws->D);
+if (g_abft_harness) {
             atft_abft_post_gemm(ws->tmp_2mm, ws->A, ws->B, n, n, n, n, n, n,
                                 1.5, 0.0, g_abft_rowsum, NULL);
+            }
             break;
         case 2:
             bench_pb_atax(n, n, ws->A, ws->x, ws->y, ws->tmp_atax);
+if (g_abft_harness) {
             atft_abft_check_matvec(ws->tmp_atax, ws->A, ws->x, n, n, n, 0);
             atft_abft_check_matvec(ws->y, ws->A, ws->tmp_atax, n, n, n, 1);
+            }
             break;
         case 3:
             bench_pb_bicg(n, n, ws->A, ws->s_bicg, ws->q_bicg, ws->p_bicg, ws->r_bicg);
+if (g_abft_harness) {
             atft_abft_check_matvec(ws->q_bicg, ws->A, ws->p_bicg, n, n, n, 0);
             atft_abft_check_matvec(ws->s_bicg, ws->A, ws->r_bicg, n, n, n, 1);
+            }
             break;
         case 4: bench_pb_jacobi2d(4, ws->n_mat, ws->jac_A, ws->jac_B); break;
         case 5: bench_pb_ludcmp(ws->n_lu, ws->lu_A, ws->lu_b, ws->lu_x, ws->lu_y); break;

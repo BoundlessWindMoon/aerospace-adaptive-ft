@@ -23,6 +23,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -730,46 +731,130 @@ static Value *gepBasePtr(Value *P) {
   return P;
 }
 
-// 二维访问形如 gep(gep(base, mul(sext(i), sext(ld))), j)：取 mul 里**循环不变**
-// 的那个操作数。不能按"不是 sext 的那个"来挑 —— 行步长本身常常也是 sext 来的。
-static Value *rowStrideOf(Value *Ptr, Loop *L) {
-  auto *inner = dyn_cast<GetElementPtrInst>(Ptr->stripPointerCasts());
-  if (!inner) return nullptr;
-  auto *outer = dyn_cast<GetElementPtrInst>(
-      inner->getPointerOperand()->stripPointerCasts());
-  if (!outer || outer->getNumOperands() < 2) return nullptr;
-  auto *mul = dyn_cast<BinaryOperator>(outer->getOperand(outer->getNumOperands() - 1));
-  if (!mul || mul->getOpcode() != Instruction::Mul) return nullptr;
-  for (unsigned k = 0; k < 2; ++k) {
-    Value *cand = mul->getOperand(k);
-    if (L->isLoopInvariant(cand) && cand->getType()->isIntegerTy(64)) return cand;
+// 步长：取访问地址 SCEV 里关于循环 L 的 AddRec 步长，再除以元素字节数。
+// 这是 SCEV 的定义量，不是从 `mul` 的操作数里猜 —— 后者会被 sext/步长本身也是
+// sext 这类写法打败（第一版就栽在这里）。
+static Value *rowStrideSCEV(Value *Ptr, Loop *L, ScalarEvolution &SE,
+                            SCEVExpander &Exp, Instruction *InsertPt,
+                            unsigned elemBytes) {
+  if (!SE.isSCEVable(Ptr->getType())) return nullptr;
+  const SCEV *S = SE.getSCEV(Ptr);
+  const SCEVAddRecExpr *AR = nullptr;
+  // 找以 L 为循环的那一层 AddRec（地址 SCEV 可能是多层嵌套）
+  while (auto *cur = dyn_cast<SCEVAddRecExpr>(S)) {
+    if (cur->getLoop() == L) { AR = cur; break; }
+    S = cur->getStart();
+  }
+  if (!AR || !AR->isAffine()) return nullptr;
+  const SCEV *Step = AR->getStepRecurrence(SE);
+  if (!SE.isLoopInvariant(Step, L)) return nullptr;
+  // 字节步长 -> 元素步长
+  const SCEV *Elems = SE.getUDivExactExpr(
+      Step, SE.getConstant(Step->getType(), elemBytes));
+  if (isa<SCEVCouldNotCompute>(Elems)) return nullptr;
+  if (!Exp.isSafeToExpand(Elems)) return nullptr;
+  return Exp.expandCodeFor(Elems, Type::getInt64Ty(Ptr->getContext()), InsertPt);
+}
+
+// 迭代次数：backedge-taken count + 1，由 SCEVExpander 在插入点物化。
+static Value *tripCountSCEV(Loop *L, ScalarEvolution &SE, SCEVExpander &Exp,
+                            Instruction *InsertPt) {
+  const SCEV *BTC = SE.getBackedgeTakenCount(L);
+  if (isa<SCEVCouldNotCompute>(BTC)) return nullptr;
+  // 体执行次数与 backedge 次数的关系取决于判定在哪：
+  //   判定在 latch（底测）-> 体跑 BTC + 1 次
+  //   判定在 header（旋转后的常见形态）-> 体跑 BTC 次
+  // 按结构判，不按经验加一 —— 加错一位会让列和缓冲少一格、校验直接失效。
+  bool bottomTested = L->getExitingBlock() &&
+                      L->getExitingBlock() == L->getLoopLatch();
+  const SCEV *TC = bottomTested
+                       ? SE.getAddExpr(BTC, SE.getOne(BTC->getType()))
+                       : BTC;
+  if (!Exp.isSafeToExpand(TC)) return nullptr;
+  Value *v = Exp.expandCodeFor(TC, BTC->getType(), InsertPt);
+  IRBuilder<> B(InsertPt);
+  Type *I32 = Type::getInt32Ty(L->getHeader()->getContext());
+  if (v->getType() != I32) v = B.CreateTruncOrBitCast(v, I32);
+  return v;
+}
+
+// ---------------------------------------------------------------------------
+// 插桩：粒度由结构推导，准入由代价不等式判定，不含"形状"硬编码。
+//
+// 归约区域 L*：巢里最外层的那个循环，满足"累加器的内存在它内部除了归约语句
+// 之外没有别的写入"。不变量 post - pre == sum_K term 在 L* 上按归约的定义成立，
+// 不管 L* 外面发生过什么（gemm 的 C *= beta、2mm 的 tmp = 0 都在外面）。
+// 旧版本把"巢内有别的写入"当成拒绝条件，那是症状补丁；这里改成**往内找 L***，
+// 粒度随之确定。
+//
+// 准入判据（与离线搜索同一套口径）：校验要在 L* 外面每一组下标上各做一次，
+// 每次至少要读一遍归约维，所以
+//     deg(校验) >= (L* 外的循环层数) + 1
+// 取等号作为下界，当且仅当它严格小于内核的 deg（= 巢深度）时才插。
+//     gemm : L* = k 层，外面只剩 i，1 + 1 = 2 < 3  -> 插
+//     2mm  : L* = k 层，外面是 i 与 j，2 + 1 = 3 >= 3 -> 不插（判据自己拒掉）
+// ---------------------------------------------------------------------------
+// 某个访问相对循环 L 的 AddRec 步长（字节）。取不到返回 nullptr。
+static const SCEV *addrStepFor(Value *Ptr, Loop *L, ScalarEvolution &SE) {
+  if (!SE.isSCEVable(Ptr->getType())) return nullptr;
+  const SCEV *S = SE.getSCEV(Ptr);
+  while (auto *cur = dyn_cast<SCEVAddRecExpr>(S)) {
+    if (cur->getLoop() == L) return cur->getStepRecurrence(SE);
+    S = cur->getStart();
   }
   return nullptr;
 }
 
-static Value *tripCountOf(Loop *L) {
-  // 循环旋转后判定在 header、latch 只是无条件跳回，所以要取 exiting block
-  BasicBlock *Latch = L->getExitingBlock();
-  if (!Latch) Latch = L->getLoopLatch();
-  if (!Latch) return nullptr;
-  auto *Br = dyn_cast<BranchInst>(Latch->getTerminator());
-  if (!Br || !Br->isConditional()) return nullptr;
-  auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
-  if (!Cmp) return nullptr;
-  for (unsigned k = 0; k < 2; ++k) {
-    Value *op = Cmp->getOperand(k);
-    if (L->isLoopInvariant(op) && op->getType()->isIntegerTy(32)) return op;
+// 行维与列维：行主序二维数组里，**列维的步长等于元素大小**，行维不是。
+// 这是由数据布局决定的，不依赖项的收集顺序 —— 原来按 loads[0]/loads[1] 认 A/B，
+// 顺序一反，I/J 与 A/B 全部转置，步长与基址就全错了。
+static bool classifyRowCol(Value *AccPtr, const std::vector<Loop *> &nest,
+                           const std::set<unsigned> &accDeps, ScalarEvolution &SE,
+                           unsigned elemBytes, unsigned &rowIdx, unsigned &colIdx) {
+  bool haveRow = false, haveCol = false;
+  for (unsigned d : accDeps) {
+    const SCEV *St = addrStepFor(AccPtr, nest[d], SE);
+    if (!St) return false;
+    auto *C = dyn_cast<SCEVConstant>(St);
+    bool isElem = C && C->getAPInt().getSExtValue() == (int64_t)elemBytes;
+    if (isElem) {
+      if (haveCol) return false;
+      colIdx = d;
+      haveCol = true;
+    } else {
+      if (haveRow) return false;
+      rowIdx = d;
+      haveRow = true;
+    }
+  }
+  return haveRow && haveCol;
+}
+
+static Loop *reductionRegion(const std::vector<Loop *> &nest, StoreInst *SI) {
+  Value *accBase = gepBasePtr(SI->getPointerOperand());
+  for (Loop *L : nest) {           // 最外到最内
+    bool clean = true;
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        auto *OtherSI = dyn_cast<StoreInst>(&I);
+        if (OtherSI && OtherSI != SI &&
+            gepBasePtr(OtherSI->getPointerOperand()) == accBase) {
+          clean = false;
+          break;
+        }
+      }
+      if (!clean) break;
+    }
+    if (clean) return L;
   }
   return nullptr;
 }
 
-// 对一条矩阵乘形态的归约插桩。返回是否成功插入。
-// 插入的语义等价于把 beta 的影响吃进 pre 快照：
-//     post_rowsum[i] - pre_rowsum[i] == alpha * sum_k A[i][k] * (sum_j B[k][j])
-// 所以不需要知道 beta（它在更外层的另一个循环里完成），对 gemm 与 2mm 的两级都成立。
-static bool insertABFTForNest(Function &F, Loop *Outer, StoreInst *SI,
-                              Value *termA, Value *termB, Value *alphaVal,
-                              Loop *LoopI, Loop *LoopJ, Loop *LoopK) {
+static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
+                              StoreInst *SI, Value *termA, Value *termB,
+                              Value *alphaVal, Loop *LoopI, Loop *LoopJ,
+                              Loop *LoopK, ScalarEvolution &SE,
+                              const DataLayout &DL) {
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
   Type *F64 = Type::getDoubleTy(Ctx);
@@ -777,78 +862,112 @@ static bool insertABFTForNest(Function &F, Loop *Outer, StoreInst *SI,
   Type *I64 = Type::getInt64Ty(Ctx);
   Type *PtrTy = PointerType::getUnqual(Ctx);
 
-  BasicBlock *Pre = Outer->getLoopPreheader();
-  BasicBlock *Exit = Outer->getExitBlock();
+  Loop *Star = reductionRegion(nest, SI);
+  if (!Star) {
+    errs() << "ATFT_ABFT_SKIP," << F.getName() << ",no-reduction-region\n";
+    return false;
+  }
+  // L* 外面的循环层数
+  unsigned outerLevels = 0;
+  for (Loop *L : nest) {
+    if (L == Star) break;
+    outerLevels++;
+  }
+  if (outerLevels + 1 >= nest.size()) {
+    errs() << "ATFT_ABFT_SKIP," << F.getName() << ",no-order-reduction(deg "
+           << (outerLevels + 1) << ">=" << nest.size() << ")\n";
+    return false;
+  }
+  // 行级校验要求 L* 恰好把归约维包住、而输出的列维在 L* 内
+  if (Star != LoopK && Star != LoopJ) {
+    errs() << "ATFT_ABFT_SKIP," << F.getName() << ",region-not-row-level\n";
+    return false;
+  }
+
+  BasicBlock *Pre = Star->getLoopPreheader();
+  BasicBlock *Exit = Star->getExitBlock();
   if (!Pre || !Exit) {
     errs() << "ATFT_ABFT_SKIP," << F.getName() << ",no "
            << (Pre ? "exit-block" : "preheader") << "\n";
     return false;
   }
 
-  // 前置条件：循环巢里不能有**另一条**写同一个累加器数组的 store。
-  // PolyBench 的 gemm 在 i 层下挂着 `C[i][j] *= beta`、2mm 挂着 `tmp[i][j] = 0`，
-  // 它们都在同一个巢内、且在累加之前执行。而插在最外层 preheader 的快照拍不到
-  // 它们的效果，于是不变量 post - pre = alpha*sum_k A*B 不成立，校验会全行误报；
-  // 再叠上重算就会用错值覆盖正确数据（实测 2mm 的相对误差被打到 0.94）。
-  // 宁可不插也不能插错，所以这里直接放弃。
-  Value *accBase = gepBasePtr(SI->getPointerOperand());
-  for (BasicBlock *BB : Outer->blocks())
-    for (Instruction &I : *BB)
-      if (auto *OtherSI = dyn_cast<StoreInst>(&I))
-        if (OtherSI != SI && gepBasePtr(OtherSI->getPointerOperand()) == accBase) {
-          errs() << "ATFT_ABFT_SKIP," << F.getName()
-                 << ",accumulator-rewritten-in-nest\n";
-          return false;
-        }
-
-  Value *baseC = gepBasePtr(SI->getPointerOperand());
-  Value *baseA = gepBasePtr(termA);
-  Value *baseB = gepBasePtr(termB);
-  Value *ldc = rowStrideOf(SI->getPointerOperand(), Outer);
-  Value *lda = rowStrideOf(termA, Outer);
-  Value *ldb = rowStrideOf(termB, Outer);
-  Value *ni = tripCountOf(LoopI), *nj = tripCountOf(LoopJ), *nk = tripCountOf(LoopK);
-  if (!baseC || !baseA || !baseB || !ldc || !lda || !ldb || !ni || !nj || !nk) {
-    errs() << "ATFT_ABFT_SKIP," << F.getName() << ",missing:"
-           << (baseC ? "" : "baseC ") << (baseA ? "" : "baseA ")
-           << (baseB ? "" : "baseB ") << (ldc ? "" : "ldc ")
-           << (lda ? "" : "lda ") << (ldb ? "" : "ldb ")
-           << (ni ? "" : "ni ") << (nj ? "" : "nj ") << (nk ? "" : "nk ") << "\n";
+  SCEVExpander Exp(SE, DL, "atft.abft");
+  Instruction *IP = Pre->getTerminator();
+  Instruction *OuterIP = nest.front()->getLoopPreheader()
+                             ? nest.front()->getLoopPreheader()->getTerminator()
+                             : nullptr;
+  unsigned elemBytes = DL.getTypeAllocSize(F64);
+  if (!OuterIP) {
+    errs() << "ATFT_ABFT_SKIP," << F.getName() << ",no-outer-preheader\n";
     return false;
   }
-  for (Value *v : {baseC, baseA, baseB, ldc, lda, ldb, ni, nj, nk})
-    if (!Outer->isLoopInvariant(v)) return false;
+
+  // 行基址用 SCEV 构造，不靠"GEP 链上找循环不变的指针"：
+  // 未跑 LICM 时行 GEP 就在内层循环里算，按循环不变性去找会一路退到数组基址，
+  // 校验就永远在验第 0 行。正确做法是把沿本行变化的那一维的 AddRec 剥掉，
+  // 取其 start —— 那就是本行首元素的地址 —— 再在 L* 的 preheader 物化。
+  auto rowBaseSCEV = [&](Value *Ptr, Loop *VaryingLoop) -> Value * {
+    if (!SE.isSCEVable(Ptr->getType())) return nullptr;
+    const SCEV *S = SE.getSCEV(Ptr);
+    const SCEV *start = nullptr;
+    while (auto *cur = dyn_cast<SCEVAddRecExpr>(S)) {
+      if (cur->getLoop() == VaryingLoop) { start = cur->getStart(); break; }
+      S = cur->getStart();
+    }
+    if (!start || !Exp.isSafeToExpand(start)) return nullptr;
+    return Exp.expandCodeFor(start, Ptr->getType(), IP);
+  };
+
+  Value *cRow = rowBaseSCEV(SI->getPointerOperand(), LoopJ);
+  Value *aRow = rowBaseSCEV(termA, LoopK);
+  Value *baseB = gepBasePtr(termB);
+  Value *ldb = rowStrideSCEV(termB, LoopK, SE, Exp, OuterIP, elemBytes);
+  Value *nj = tripCountSCEV(LoopJ, SE, Exp, OuterIP);
+  Value *nk = tripCountSCEV(LoopK, SE, Exp, OuterIP);
+  if (!cRow || !aRow || !baseB || !ldb || !nj || !nk) {
+    errs() << "ATFT_ABFT_SKIP," << F.getName() << ",bind-missing:"
+           << (cRow ? "" : "cRow ") << (aRow ? "" : "aRow ")
+           << (ldb ? "" : "ldb ") << (nj ? "" : "nj ") << (nk ? "" : "nk ") << "\n";
+    return false;
+  }
 
   FunctionCallee ScratchFn = M->getOrInsertFunction("atft_abft_scratch", PtrTy, I32, I64);
+  FunctionCallee ColSumFn = M->getOrInsertFunction(
+      "atft_abft_colsum_into", Type::getVoidTy(Ctx), PtrTy, I32, I32, I64, PtrTy);
   FunctionCallee PreSumFn = M->getOrInsertFunction(
-      "atft_abft_pre_rowsum", Type::getVoidTy(Ctx), PtrTy, I32, I32, I64, PtrTy);
-  FunctionCallee PreCopyFn = M->getOrInsertFunction(
-      "atft_abft_pre_copy", Type::getVoidTy(Ctx), PtrTy, I32, I32, I64, PtrTy);
-  FunctionCallee PostFn = M->getOrInsertFunction(
-      "atft_abft_post_gemm", Type::getVoidTy(Ctx), PtrTy, PtrTy, PtrTy,
-      I32, I32, I32, I64, I64, I64, F64, F64, PtrTy, PtrTy);
+      "atft_abft_row_presum", F64, PtrTy, I32, PtrTy);
+  FunctionCallee CheckRowFn = M->getOrInsertFunction(
+      "atft_abft_check_row", Type::getVoidTy(Ctx), PtrTy, PtrTy, PtrTy, PtrTy,
+      PtrTy, I32, I32, I64, F64, F64);
 
-  IRBuilder<> B(Pre->getTerminator());
   auto mark = [&](Value *v) {
     if (auto *I = dyn_cast<Instruction>(v))
       I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
     return v;
   };
-  Value *niL = mark(B.CreateSExt(ni, I64));
-  Value *njL = mark(B.CreateSExt(nj, I64));
-  Value *rowsum = mark(B.CreateCall(ScratchFn, {ConstantInt::get(I32, 0), niL}));
-  Value *copyN = mark(B.CreateMul(niL, njL));
-  Value *cold = mark(B.CreateCall(ScratchFn, {ConstantInt::get(I32, 1), copyN}));
-  Value *ldcL = ldc, *ldaL = lda, *ldbL = ldb;   // 已是 i64 的循环不变量
-  mark(B.CreateCall(PreSumFn, {baseC, ni, nj, ldcL, rowsum}));
-  mark(B.CreateCall(PreCopyFn, {baseC, ni, nj, ldcL, cold}));
 
+  // 最外层：vb[k] = sum_j B[k][j]，只算一次（这就是 e-graph 提出来的那个内层求和）
+  IRBuilder<> O(OuterIP);
+  Value *nkL = mark(O.CreateSExt(nk, I64));
+  Value *vb = mark(O.CreateCall(ScratchFn, {ConstantInt::get(I32, 2), nkL}));
+  mark(O.CreateCall(ColSumFn, {baseB, nk, nj, ldb, vb}));
+
+  // L* 的 preheader：记录本行的行和与原值副本
+  IRBuilder<> B(IP);
+  Value *njL = mark(B.CreateSExt(nj, I64));
+  Value *rowCopy = mark(B.CreateCall(ScratchFn, {ConstantInt::get(I32, 1), njL}));
+  Value *vbHere = mark(B.CreateCall(ScratchFn, {ConstantInt::get(I32, 2), nkL}));
+  Value *preSum = mark(B.CreateCall(PreSumFn, {cRow, nj, rowCopy}));
+
+  // L* 的出口：校验本行（必要时重算）
   IRBuilder<> E(&*Exit->getFirstInsertionPt());
-  Value *alpha = alphaVal ? alphaVal : ConstantFP::get(F64, 1.0);
-  if (alpha->getType() != F64) alpha = ConstantFP::get(F64, 1.0);
-  mark(E.CreateCall(PostFn, {baseC, baseA, baseB, ni, nj, nk,
-                             ldcL, ldaL, ldbL, alpha,
-                             ConstantFP::get(F64, 1.0), rowsum, cold}));
+  Value *alpha = (alphaVal && alphaVal->getType() == F64) ? alphaVal
+                                                          : ConstantFP::get(F64, 1.0);
+  mark(E.CreateCall(CheckRowFn, {cRow, aRow, baseB, vbHere, rowCopy,
+                                 nj, nk, ldb, alpha, preSum}));
+  errs() << "ATFT_ABFT_INSERTED," << F.getName() << ",region-depth="
+         << (outerLevels + 1) << ",nest-depth=" << nest.size() << "\n";
   return true;
 }
 
@@ -915,7 +1034,9 @@ void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
 
                 // 编译期插桩：只认"矩阵乘形态"——三层巢、累加器二维、
                 // 两个二维项各与累加器共享一维。形态不符就不插，绝不猜。
-                if (AtftABFTInsert && nest.size() == 3 && accAcc.idxDeps.size() == 2) {
+                // 不再限定"三层巢的矩阵乘形状"：只要求累加器是二维、
+                // 两个数组项、角色唯一，深度与是否值得插由代价判据决定
+                if (AtftABFTInsert && nest.size() >= 2 && accAcc.idxDeps.size() == 2) {
                   std::vector<std::pair<LoadInst *, AccessInfo>> loads;
                   Value *scalarVal = nullptr;
                   std::vector<Value *> wl2{term};
@@ -947,24 +1068,28 @@ void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
                     int K = -1;
                     for (unsigned d = 0; d < nest.size(); ++d)
                       if (!accAcc.idxDeps.count(d)) { K = (int)d; break; }
-                    // A 与 B 的角色必须唯一确定：各自只与累加器共享一维，
-                    // 且共享的不是同一维。不满足就放弃 —— 角色搞反会让校验式
-                    // 算成另一个量，再加上重算就会把正确数据覆盖掉。
-                    std::vector<unsigned> share[2];
-                    for (int t = 0; t < 2; ++t)
-                      for (unsigned d : accAcc.idxDeps)
-                        if (loads[t].second.idxDeps.count(d)) share[t].push_back(d);
-                    bool roleOK = K >= 0 && share[0].size() == 1 && share[1].size() == 1 &&
-                                  share[0][0] != share[1][0] &&
-                                  loads[0].second.idxDeps.count((unsigned)K) &&
-                                  loads[1].second.idxDeps.count((unsigned)K);
-                    if (roleOK) {
-                      unsigned I = share[0][0], J = share[1][0];
-                      if (insertABFTForNest(F, nest.front(), SI,
-                                            loads[0].first->getPointerOperand(),
-                                            loads[1].first->getPointerOperand(),
-                                            scalarVal, nest[I], nest[J], nest[(unsigned)K]))
-                        errs() << "ATFT_ABFT_INSERTED," << F.getName() << "\n";
+                    unsigned rowIdx = 0, colIdx = 0;
+                    const DataLayout &DL = F.getParent()->getDataLayout();
+                    unsigned eb = DL.getTypeAllocSize(Type::getDoubleTy(F.getContext()));
+                    bool ok = K >= 0 &&
+                              classifyRowCol(SI->getPointerOperand(), nest,
+                                             accAcc.idxDeps, SE, eb, rowIdx, colIdx);
+                    // A 是含 row 维的那一项，B 是含 col 维的那一项，与收集顺序无关
+                    int ai = -1, bi = -1;
+                    if (ok)
+                      for (int t = 0; t < 2; ++t) {
+                        bool hasRow = loads[t].second.idxDeps.count(rowIdx);
+                        bool hasCol = loads[t].second.idxDeps.count(colIdx);
+                        bool hasK = loads[t].second.idxDeps.count((unsigned)K);
+                        if (hasRow && hasK && !hasCol) ai = t;
+                        else if (hasCol && hasK && !hasRow) bi = t;
+                      }
+                    if (ok && ai >= 0 && bi >= 0 && ai != bi) {
+                      insertABFTForNest(F, nest, SI,
+                                        loads[ai].first->getPointerOperand(),
+                                        loads[bi].first->getPointerOperand(),
+                                        scalarVal, nest[rowIdx], nest[colIdx],
+                                        nest[(unsigned)K], SE, DL);
                     } else {
                       errs() << "ATFT_ABFT_SKIP," << F.getName() << ",role-ambiguous\n";
                     }

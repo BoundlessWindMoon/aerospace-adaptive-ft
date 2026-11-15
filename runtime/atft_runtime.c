@@ -506,9 +506,18 @@ int g_atft_abft_repair = 1;
 #define ATFT_U_FP64 2.220446049250313e-16
 #define ATFT_ABFT_KAPPA 32.0
 
+static void atft_abft_report(void) {
+    fprintf(stderr, "ATFT_ABFT_STATS,checks=%llu,flagged=%llu,repaired=%llu\n",
+            (unsigned long long)g_atft_abft.checks,
+            (unsigned long long)g_atft_abft.flagged,
+            (unsigned long long)g_atft_abft.repaired);
+}
+
 void atft_abft_set(int enabled, int repair) {
     g_atft_abft_enabled = enabled ? 1 : 0;
     g_atft_abft_repair = repair ? 1 : 0;
+    // 诊断用：退出时报一次校验次数，用来确认插桩真的被执行到
+    if (g_atft_abft_enabled && getenv("ATFT_ABFT_VERBOSE")) atexit(atft_abft_report);
 }
 
 void atft_abft_pre_rowsum(const double *C, int ni, int nj, long ldc, double *rowsum) {
@@ -640,11 +649,12 @@ void atft_abft_check_matvec(const double *y, const double *A, const double *x,
 // Pass 不方便在 IR 里做内存管理，所以由运行时给两块按需增长的静态缓冲。
 // which: 0 = 行和（n 个 double），1 = 原数据副本（n 个 double）
 // ----------------------------------------------------------------------------
-static double *g_scratch[2] = {NULL, NULL};
-static size_t  g_scratch_cap[2] = {0, 0};
+// 三个槽位：0 = 行和，1 = 原数据副本，2 = B 的列和 vb
+static double *g_scratch[3] = {NULL, NULL, NULL};
+static size_t  g_scratch_cap[3] = {0, 0, 0};
 
 double *atft_abft_scratch(int which, long n) {
-    if (which < 0 || which > 1 || n <= 0) return NULL;
+    if (which < 0 || which > 2 || n <= 0) return NULL;
     size_t need = (size_t)n;
     if (g_scratch_cap[which] < need) {
         double *grown = (double *)realloc(g_scratch[which], sizeof(double) * need);
@@ -653,4 +663,69 @@ double *atft_abft_scratch(int which, long n) {
         g_scratch_cap[which] = need;
     }
     return g_scratch[which];
+}
+
+// ----------------------------------------------------------------------------
+// 行级校验的分解形式。与等价饱和搜到的式子**结构一致**：
+//     sum_j C[i][j] - pre == alpha * sum_k A[i][k] * vb[k],  vb[k] = sum_j B[k][j]
+// vb 与 i 无关，所以它被提到最外层只算一次（这正是 e-graph 把 sum_j 提出去的那一步），
+// 每行只花 O(nj + nk)，整体 O(n^2)，相对内核的 O(n^3) 降一阶。
+// ----------------------------------------------------------------------------
+void atft_abft_colsum_into(const double *B, int nk, int nj, long ldb, double *vb) {
+    static int once = 0;
+    if (!once && getenv("ATFT_ABFT_VERBOSE")) {
+        once = 1;
+        fprintf(stderr, "ATFT_ABFT_BIND,nk=%d,nj=%d,ldb=%ld,vb=%p,enabled=%d\n",
+                nk, nj, ldb, (void *)vb, g_atft_abft_enabled);
+    }
+    if (!g_atft_abft_enabled || !vb) return;
+    for (int k = 0; k < nk; k++) {
+        double s = 0.0;
+        const double *row = B + (long)k * ldb;
+        for (int j = 0; j < nj; j++) s += row[j];
+        vb[k] = s;
+    }
+}
+
+void atft_abft_check_row(double *crow, const double *arow, const double *B,
+                         const double *vb, const double *crow_old,
+                         int nj, int nk, long ldb, double alpha, double pre_sum) {
+    if (!g_atft_abft_enabled || !vb) return;
+    double lhs = 0.0;
+    for (int j = 0; j < nj; j++) lhs += crow[j];
+    double acc = 0.0, nrm_a = 0.0, nrm_v = 0.0;
+    for (int k = 0; k < nk; k++) {
+        acc += arow[k] * vb[k];
+        double a = fabs(arow[k]), v = fabs(vb[k]);
+        if (a > nrm_a) nrm_a = a;
+        if (v > nrm_v) nrm_v = v;
+    }
+    double rhs = pre_sum + alpha * acc;
+    double scale = fabs(rhs) > 1.0 ? fabs(rhs) : 1.0;
+    double tol = ATFT_ABFT_KAPPA * ATFT_U_FP64 *
+                 ((double)nk * nrm_a * nrm_v + scale * (double)nj);
+    g_atft_abft.checks++;
+    if (fabs(lhs - rhs) <= tol) return;
+
+    g_atft_abft.flagged++;
+    g_atft_state.detected_faults++;
+    if (g_atft_abft_repair && crow_old && B) {
+        for (int j = 0; j < nj; j++) {
+            double s = 0.0;
+            for (int k = 0; k < nk; k++) s += arow[k] * B[(long)k * ldb + j];
+            crow[j] = crow_old[j] + alpha * s;
+        }
+        g_atft_abft.repaired++;
+        g_atft_state.recovered_by_reexec++;
+    }
+}
+
+double atft_abft_row_presum(const double *crow, int nj, double *crow_copy) {
+    if (!g_atft_abft_enabled) return 0.0;
+    double s = 0.0;
+    for (int j = 0; j < nj; j++) {
+        s += crow[j];
+        if (crow_copy) crow_copy[j] = crow[j];
+    }
+    return s;
 }
