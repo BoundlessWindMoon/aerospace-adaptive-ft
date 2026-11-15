@@ -535,7 +535,10 @@ static void export_outputs(suite_workspace_t *ws, int b) {
 // 这里按 `-atft-dump-sums` + eqsat 合成出的式子为被识别的内核接上维度与步长。
 // 编译期自动插这几行调用是剩下的工程步，不影响下面测到的代价与检出数字。
 static double g_abft_rowsum[4096];
-static double *g_abft_cold = NULL;   // beta != 0 时重算整行需要的原数据副本
+// beta != 0 时重算整行需要的原数据副本。容量单独记，n 变大时必须重分配 ——
+// --scale 模式会在同一进程里换多个规模，只按第一次的 n 分配会越界写堆。
+static double *g_abft_cold = NULL;
+static size_t g_abft_cold_cap = 0;
 
 static void invoke_benchmark(suite_workspace_t *ws, int b) {
     reset_mutable_buffers(ws, b);
@@ -544,8 +547,15 @@ static void invoke_benchmark(suite_workspace_t *ws, int b) {
         const double *src = (b == 0) ? ws->C : ws->tmp_2mm;
         atft_abft_pre_rowsum(src, n, n, n, g_abft_rowsum);
         if (b == 0) {
-            if (!g_abft_cold) g_abft_cold = (double *)malloc(sizeof(double) * (size_t)n * n);
-            atft_abft_pre_copy(src, n, n, n, g_abft_cold);
+            size_t need = (size_t)n * (size_t)n;
+            if (g_abft_cold_cap < need) {
+                double *grown = (double *)realloc(g_abft_cold, sizeof(double) * need);
+                if (grown) {
+                    g_abft_cold = grown;
+                    g_abft_cold_cap = need;
+                }
+            }
+            if (g_abft_cold_cap >= need) atft_abft_pre_copy(src, n, n, n, g_abft_cold);
         }
     }
     switch (b) {

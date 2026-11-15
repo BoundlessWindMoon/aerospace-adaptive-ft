@@ -194,34 +194,97 @@ def saturate(eg, root, max_iters=12):
 
 
 # ---------------------------------------------------------------- 代价与提取
-def extract(eg, root, weight_mul=1.0, weight_add=1.0):
-    """最小代价提取。代价 = 乘法数 x weight_mul + 加法数 x weight_add，
-    求和把体内代价按迭代空间放大 N 倍并再加 N 次累加。"""
-    best = {}       # cid -> (cost, mults, adds, enode)
-    for _ in range(40):
+# ---------------------------------------------------------------- 多项式代价
+# 代价不是标量而是关于迭代空间 N 的多项式：系数表 [c0, c1, c2, ...] 表示 sum ci*N^i。
+# 这样"渐近阶"就成了可逐节点组合的局部量，标准的自底向上提取能直接用它
+# （对照 Suciu et al. 2025 指出的"非局部代价函数无法用于 top-k 提取"这一限制）。
+def p_zero():
+    return [0]
+
+
+def p_const(c):
+    return [c]
+
+
+def p_add(a, b):
+    n = max(len(a), len(b))
+    return [(a[i] if i < len(a) else 0) + (b[i] if i < len(b) else 0) for i in range(n)]
+
+
+def p_shift(a):
+    """乘 N：系数整体升一次。"""
+    return [0] + list(a)
+
+
+def p_deg(a):
+    d = 0
+    for i, c in enumerate(a):
+        if c:
+            d = i
+    return d
+
+
+def p_key(a):
+    """比较键：先比次数，再从高位到低位比系数。"""
+    d = p_deg(a)
+    return (d,) + tuple(reversed([a[i] if i < len(a) else 0 for i in range(d + 1)]))
+
+
+def p_eval(a, n):
+    return sum(c * (n ** i) for i, c in enumerate(a))
+
+
+def p_str(a):
+    d = p_deg(a)
+    if d == 0:
+        return str(a[0] if a else 0)
+    parts = []
+    for i in range(d, -1, -1):
+        c = a[i] if i < len(a) else 0
+        if not c:
+            continue
+        parts.append(f"{c}N^{i}" if i > 1 else (f"{c}N" if i == 1 else str(c)))
+    return "+".join(parts) if parts else "0"
+
+
+def kernel_cost(nest_depth, op_mix):
+    """内核自身的代价多项式：体内每个算子在 N^depth 个迭代点上各算一次。"""
+    mults = op_mix.count("*")
+    adds = op_mix.count("+") + 1          # +1 是累加本身
+    m = [0] * nest_depth + [max(mults, 0)]
+    a = [0] * nest_depth + [max(adds, 1)]
+    return m, a
+
+
+def extract(eg, root):
+    """最小代价提取。代价是 (乘法多项式, 加法多项式)，按总代价多项式比较。"""
+    best = {}       # cid -> (mults_poly, adds_poly, enode)
+    for _ in range(60):
         changed = False
         for cid in list(eg.classes):
             if eg.find(cid) != cid:
                 continue
             for en in eg.classes[cid]:
                 if en[0] == "var":
-                    cand = (0.0, 0, 0, en)
+                    cand = (p_zero(), p_zero(), en)
                 else:
                     kids = [eg.find(k) for k in en[2:]]
                     if any(k not in best for k in kids):
                         continue
                     if en[0] == "sum":
-                        c, m, a, _ = best[kids[0]]
-                        cand = (N * c + N * weight_add, N * m, N * a + N, en)
+                        m, a, _ = best[kids[0]]
+                        # sum: 体内代价 x N，再加 N 次累加
+                        cand = (p_shift(m), p_add(p_shift(a), [0, 1]), en)
                     elif en[0] == "mul":
-                        c0, m0, a0, _ = best[kids[0]]
-                        c1, m1, a1, _ = best[kids[1]]
-                        cand = (c0 + c1 + weight_mul, m0 + m1 + 1, a0 + a1, en)
-                    else:   # add / min：代价同级，都是一条算术指令
-                        c0, m0, a0, _ = best[kids[0]]
-                        c1, m1, a1, _ = best[kids[1]]
-                        cand = (c0 + c1 + weight_add, m0 + m1, a0 + a1 + 1, en)
-                if cid not in best or cand[0] < best[cid][0]:
+                        m0, a0, _ = best[kids[0]]
+                        m1, a1, _ = best[kids[1]]
+                        cand = (p_add(p_add(m0, m1), p_const(1)), p_add(a0, a1), en)
+                    else:   # add / min：一条算术指令
+                        m0, a0, _ = best[kids[0]]
+                        m1, a1, _ = best[kids[1]]
+                        cand = (p_add(m0, m1), p_add(p_add(a0, a1), p_const(1)), en)
+                key = lambda t: p_key(p_add(t[0], t[1]))
+                if cid not in best or key(cand) < key(best[cid]):
                     best[cid] = cand
                     changed = True
         if not changed:
@@ -230,7 +293,7 @@ def extract(eg, root, weight_mul=1.0, weight_add=1.0):
 
 
 def render(eg, best, cid):
-    cost, m, a, en = best[eg.find(cid)]
+    _m, _a, en = best[eg.find(cid)]
     if en[0] == "var":
         name, idxs = en[1]
         return name
@@ -303,18 +366,37 @@ def from_sums(path):
             for i in sorted(set(acc_idx)):
                 node = eg.add_enode(summ(i, node))
             root = node
-            red_idx = list(acc_idx)
+            # 映射形态没有归约下标，red_idx 保持为空（之前这里写成 acc_idx，
+            # 会把输出下标误当成归约下标，阶段循环数就算不对了）
 
-        before = extract(eg, root)
-        m0 = before[eg.find(root)][1]
+        after_pre = extract(eg, root)
+        m_pre, a_pre, _ = after_pre[eg.find(root)]
         saturate(eg, root)
         after = extract(eg, root)
-        m1, a1 = after[eg.find(root)][1], after[eg.find(root)][2]
-        out.append({"kind": r["kind"],
-                    "function": r["function"], "acc": "%s[%s]" % (acc_base, ",".join(acc_idx)),
+        m_chk, a_chk, _ = after[eg.find(root)]
+        km, ka = kernel_cost(int(r["nest_depth"]), r["op_mix"])
+
+        chk_tot = p_add(m_chk, a_chk)
+        ker_tot = p_add(km, ka)
+
+        # 阶段循环修正：循环巢里既不是输出下标、也不是校验式归约下标的那些层，
+        # 是**顺序阶段**（jacobi2d 的时间步就是这种）。中间结果会被下一阶段消费，
+        # 所以校验必须逐阶段做一次，校验代价要乘上这些层的迭代次数 —— 次数升一阶。
+        # 这条规则是 2mm 实测教训（检出 36.5% 但 SDC 不降）的一般化。
+        n_stage = max(0, int(r["nest_depth"]) - len(set(acc_idx)) - len(red_idx))
+        chk_deg_eff = p_deg(chk_tot) + n_stage
+        admit = chk_deg_eff < p_deg(ker_tot)
+        out.append({"kind": r["kind"], "function": r["function"],
+                    "acc": "%s[%s]" % (acc_base, ",".join(acc_idx)),
                     "check_dir": check_idx, "red": ",".join(red_idx),
-                    "m0": m0, "m1": m1, "a1": a1, "expr": render(eg, after, root),
-                    "layer": "代数校验层" if m1 < m0 else "回落指令冗余"})
+                    "kernel_cost": p_str(ker_tot), "kernel_deg": p_deg(ker_tot),
+                    "naive_chk": p_str(p_add(m_pre, a_pre)),
+                    "chk_cost": p_str(chk_tot), "chk_deg": chk_deg_eff,
+                    "n_stage": n_stage,
+                    "chk_mults": p_str(m_chk),
+                    "expr": render(eg, after, root),
+                    "admit": admit,
+                    "layer": "代数校验层" if admit else "回落指令冗余"})
     return out
 
 
@@ -351,45 +433,56 @@ def case_minplus(eg):
 
 
 def main():
-    cases = [("gemm 行校验", case_gemm), ("atax/bicg 全和", case_atax),
-             ("jacobi2d 常系数 stencil", case_stencil),
-             ("floyd-warshall (min-plus)", case_minplus)]
-    print(f"{'内核':>26}{'搜索前乘法':>12}{'搜索后乘法':>12}{'降幅':>8}{'等价类':>7}{'结论':>10}")
-    details = []
-    for name, build in cases:
+    """自带用例：四个人工编码的形态，用来回归规则集与代价模型本身。"""
+    cases = [("gemm 行校验", case_gemm, 3, "**"),
+             ("atax/bicg 全和", case_atax, 2, "*"),
+             ("jacobi2d 常系数 stencil", case_stencil, 2, "*+"),
+             ("floyd-warshall (min-plus)", case_minplus, 1, "+")]
+    print(f"{'内核':>26}{'内核代价':>10}{'朴素校验':>12}{'搜到的校验':>12}"
+          f"{'等价类':>7}{'判定':>12}")
+    results = []
+    for name, build, depth, opmix in cases:
         eg = EGraph()
         root = build(eg)
-        before = extract(eg, root)
-        m0 = before[eg.find(root)][1]
+        pre = extract(eg, root)
+        m0, a0, _ = pre[eg.find(root)]
         saturate(eg, root)
-        after = extract(eg, root)
-        m1, a1 = after[eg.find(root)][1], after[eg.find(root)][2]
+        post = extract(eg, root)
+        m1, a1, _ = post[eg.find(root)]
+        km, ka = kernel_cost(depth, opmix)
+        chk, ker = p_add(m1, a1), p_add(km, ka)
+        admit = p_deg(chk) < p_deg(ker)
         ncls = sum(1 for c in eg.classes if eg.find(c) == c)
-        verdict = "代数校验层" if m1 < m0 else "回落指令冗余"
-        ratio = f"{m0 / m1:.0f}x" if m1 and m1 < m0 else "-"
-        print(f"{name:>26}{m0:>12}{m1:>12}{ratio:>8}{ncls:>7}{verdict:>10}")
-        details.append((name, render(eg, after, root), m1, a1))
+        print(f"{name:>26}{p_str(ker):>10}{p_str(p_add(m0, a0)):>12}{p_str(chk):>12}"
+              f"{ncls:>7}{('代数校验层' if admit else '回落指令冗余'):>12}")
+        results.append((name, render(eg, post, root), admit))
     print()
-    for name, expr, m, a in details:
+    for name, expr, admit in results:
         print(f"  {name}: {expr}")
-        print(f"      乘法 {m}  加法 {a}")
-    print(f"\n（N = {N}；乘法数是 ABFT 省下的那一项，加法仍是 O(N^2)，"
-          f"与 Huang & Abraham 1984 的账本一致）")
+    return results
 
 
 def main_from_sums(path):
     rows = from_sums(path)
-    print(f"从 IR 抽到的归约 -> 自动合成校验式（N = {N}）\n")
-    print(f"{'形态':>11}{'函数':>18}{'输出':>14}{'下标':>9}"
-          f"{'搜索前乘法':>11}{'搜索后乘法':>11}{'降幅':>7}{'判定':>12}")
+    print("准入判据：校验式的代价多项式次数 < 内核自身的次数")
+    print("（代价是关于迭代空间 N 的多项式；搜索前后的比较不是判据 —— "
+          "matvec 搜索后乘法也降一阶，但总代价与内核同阶，所以不准入）\n")
+    print(f"{'形态':>11}{'函数':>18}{'内核代价':>10}{'朴素校验':>12}"
+          f"{'搜到的校验':>12}{'阶段层':>7}{'次数':>7}{'判定':>12}")
     for r in rows:
-        ratio = f"{r['m0'] / r['m1']:.0f}x" if r["m1"] and r["m1"] < r["m0"] else "-"
-        print(f"{r['kind']:>11}{r['function']:>18}{r['acc']:>14}{r['red']:>9}"
-              f"{r['m0']:>11}{r['m1']:>11}{ratio:>7}{r['layer']:>12}")
+        cmpstr = (f"{r['chk_deg']}<{r['kernel_deg']}" if r["admit"]
+                  else f"{r['chk_deg']}>={r['kernel_deg']}")
+        print(f"{r['kind']:>11}{r['function']:>18}{r['kernel_cost']:>10}{r['naive_chk']:>12}"
+              f"{r['chk_cost']:>12}{r['n_stage']:>7}{cmpstr:>7}{r['layer']:>12}")
     print()
     for r in rows:
+        if not r["admit"]:
+            continue
         print(f"  {r['function']}: {r['expr']}")
-        print(f"      乘法 {r['m1']}  加法 {r['a1']}")
+        print(f"      校验式乘法 {r['chk_mults']}，总代价 {r['chk_cost']}")
+    n_ad = sum(1 for r in rows if r["admit"])
+    print(f"\n准入 {n_ad} / {len(rows)} 条；"
+          f"涉及负载 {len({r['function'] for r in rows if r['admit']})} 个")
     return rows
 
 
