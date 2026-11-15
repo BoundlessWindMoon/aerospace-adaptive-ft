@@ -496,45 +496,65 @@ hashcons + union-find 的 e-graph。
 
 ### 端到端跑通：从 LLVM IR 自动抽取到自动合成校验式
 
-前端已落地（`-atft-dump-sums`，`dumpReductionSums`）。识别的是**结构**而不是函数名：
-从最内层循环沿父链收集归纳变量，匹配"store 的值是 fadd、且 fadd 的一个操作数是对同一
-地址的 load"这一归约形态，再对每个数组访问算出它依赖哪些循环下标 —— 后者正是 e-graph
-因子外提规则需要的 `free(·)`。
+前端落地在 `-atft-dump-sums`（`dumpReductionSums`），识别的是**结构**而不是函数名。
+复用的 LLVM 能力与自写部分分清：
 
-落地过程中有三个坑，都是"不看结构就会漏掉"的典型：
+| 环节 | 用什么 |
+|---|---|
+| 循环树、最内层判定、父链 | LLVM `LoopInfo` |
+| 下标依赖哪些循环 | **LLVM `ScalarEvolution`**：访问的 SCEV 里每个 `SCEVAddRecExpr` 对应一层循环，sext/步长乘法/多维线性化都被规范掉 |
+| 迭代次数 | `SE.getSmallConstantTripCount`（PolyBench 的 n 是运行期参数，实测全为未知，所以代价模型用符号 N —— 关键的比值 N²→N 与 N 无关） |
+| 循环不变量判定 | SCEV：表达式里不含本巢任何循环的 AddRec |
+| 同一元素判定 | 自写结构比较（没跑 GVN 时同地址 GEP 会算两遍，按 Value 身份比会判不相等） |
+| e-graph | 自写（hashcons + union-find，不依赖 egg，避开 Rust 工具链与外网） |
 
-- PolyBench 的 `C[i][j] += alpha*A[i][k]*B[k][j]` 在 IR 里是一条 `llvm.fmuladd` 内建，
-  不先展开成 fmul + fadd 就匹配不到归约形态
-- 没跑 GVN 时同一个 `C[i][j]` 在 load 与 store 各算一遍 GEP，按 Value 身份比地址会判不相等，
-  必须按"同 opcode + 操作数逐个结构相等"比（限深 5）
-- 要求"完美嵌套"会把 gemm 整个丢掉：它的外层 i 循环下挂着两个子循环（beta 缩放与 k 累加）
+两条识别模式，都不针对具体内核：
 
-抽出来的求和式直接喂给搜索（`eqsat_checker.py results/opt/sums.csv`），校验目标式按
-统一规则构造，不针对具体内核：累加数组的自由下标是结果下标、其余是归约下标，
-取一个结果下标作校验方向，目标式 = `sum_c sum_red prod(terms)`。
+- **REDUCTION**：store 的值是 fadd，且一个操作数是对同一地址的 load
+- **LINEAR_MAP**：store 的值是 fadd/fmul/fneg 构成的树且不含对同地址的 load
+  （stencil 类），循环不变的标量因子单独记成"自由下标为空"的项 ——
+  它正是因子外提规则的作用对象
 
-| 函数 | 累加器 | 归约下标 | 校验方向 | 搜索前乘法 | 搜索后乘法 | 降幅 | 合成的校验式 |
-|---|---|---|---|---|---|---|---|
-| bench_pb_gemm | C[i0,i2] | i1 | i2 | 4096 | 64 | **64×** | `sum_i1(sum_i2(B[i1,i2]) * A[i0,i1])` |
-| bench_pb_2mm | tmp[i0,i1] | i2 | i1 | 4096 | 64 | **64×** | `sum_i2(A[i0,i2] * sum_i1(B[i1,i2]))` |
-| bench_pb_2mm | D[i0,i1] | i2 | i1 | 4096 | 64 | **64×** | `sum_i2(tmp[i0,i2] * sum_i1(C[i1,i2]))` |
-| bench_pb_atax | tmp[i0] | i1 | i0 | 4096 | 64 | **64×** | `sum_i1(sum_i0(A[i0,i1]) * x[i1])` |
-| bench_pb_atax | y[i1] | i0 | i1 | 4096 | 64 | **64×** | `sum_i0(sum_i1(A[i0,i1]) * tmp[i0])` |
-| bench_pb_bicg | s[i1] | i0 | i1 | 4096 | 64 | **64×** | `sum_i0(r[i0] * sum_i1(A[i0,i1]))` |
-| bench_pb_bicg | q[i0] | i1 | i0 | 4096 | 64 | **64×** | `sum_i1(sum_i0(A[i0,i1]) * p[i1])` |
+踩过三个"不看结构就会漏"的坑：`llvm.fmuladd` 要先展开（否则 PolyBench 的
+`C += alpha*A*B` 匹配不到归约形态）；GEP 要按结构比；要求"完美嵌套"会把 gemm
+整个丢掉（外层 i 下挂 beta 缩放与 k 累加两个子循环）。
 
-**7 条归约全部自动合成成功，乘法 4096 → 64。** 全程没有一行针对具体内核的代码。
+### 合成结果与覆盖面
 
-前端覆盖面（17 个负载）：
+抽出的求和式直接喂给搜索（`eqsat_checker.py results/opt/sums.csv`），校验目标式按统一
+规则构造：归约形态取 `sum_c sum_red prod(terms)`，映射形态取"把输出沿所有下标求和"。
 
-- **命中 4 个**：gemm、2mm、atax、bicg（严格归约形态）
-- **结构命中但无用 13 条**：KissFFT 的蝶形算子（深度 1 的复数算术累加，不是对某个下标的归约）
-- **没命中、原因明确**：jacobi2d / deriche 是纯映射而非累加（`B[i][j] = c*(A[...]+...)`），
-  要加第二条模式（线性映射）才能收；ludcmp / durbin 有循环携带依赖；
-  floyd_warshall / nussinov 是 min-plus，**本来就该被排除**；crc16 / quicksort / sobel / obpmark 是
-  位运算与定点流水线
-- 结论：严格归约这一类覆盖 4/17，扩到"线性映射"可再收 2 个。**覆盖面本身就是分层比例的实测值**，
-  不是估计
+| 形态 | 函数 | 输出 | 搜索前乘法 | 搜索后乘法 | 降幅 | 判定 |
+|---|---|---|---|---|---|---|
+| REDUCTION | pb_gemm | C[i0,i2] | 4096 | 64 | **64×** | 代数校验层 |
+| REDUCTION | pb_2mm | tmp[i0,i1] | 4096 | 64 | **64×** | 代数校验层 |
+| REDUCTION | pb_2mm | D[i0,i1] | 4096 | 64 | **64×** | 代数校验层 |
+| REDUCTION | pb_atax | tmp[i0] | 4096 | 64 | **64×** | 代数校验层 |
+| REDUCTION | pb_atax | y[i1] | 4096 | 64 | **64×** | 代数校验层 |
+| REDUCTION | pb_bicg | s[i1] | 4096 | 64 | **64×** | 代数校验层 |
+| REDUCTION | pb_bicg | q[i0] | 4096 | 64 | **64×** | 代数校验层 |
+| LINEAR_MAP | pb_jacobi2d | B[i1,i2] | 4096 | **1** | **4096×** | 代数校验层 |
+| LINEAR_MAP | pb_jacobi2d | A[i1,i2] | 4096 | **1** | **4096×** | 代数校验层 |
+| LINEAR_MAP | pb_deriche | y[i0,i1] | 4096 | **1** | **4096×** | 代数校验层 |
+| LINEAR_MAP | pb_deriche | y[i0,i1] | 4096 | **1** | **4096×** | 代数校验层 |
+| LINEAR_MAP | pb_durbin | (标量) | 0 | 0 | — | 回落指令冗余 |
+
+**12 条里 11 条自动合成成功，覆盖 6 个负载**（gemm、2mm、atax、bicg、jacobi2d、deriche），
+全程没有一行针对具体内核的代码。durbin 的映射里没有乘法可省，搜索正确地判了回落。
+
+17 个负载的分层实测：
+
+- **代数校验层 6 个**：gemm、2mm、atax、bicg、jacobi2d、deriche
+- **回落指令冗余层 11 个**：durbin（无乘法可省）、ludcmp（循环携带依赖）、
+  floyd_warshall / nussinov（min-plus 半环，**本来就该排除**）、
+  crc16 / quicksort（位运算与比较排序）、sobel / obpmark ×2（定点流水线含掩码与截断）、
+  kissfft（蝶形是深度 1 的复数累加，结构命中但不是对某下标的归约）、blackscholes（超越函数）
+- 这个 6 : 11 不是估计，是搜索跑出来的
+
+**已知缺口（影响生成校验器、不影响上面的代价结论）**：当前抽取只记"访问依赖哪些下标"，
+不记常量偏移，所以 jacobi2d 的五个邻居都打印成 `A[i1,i2]`。做代价分析够用，但要生成
+**正确**的 stencil 校验器必须知道偏移（移位窗口的校验和差一圈边界项）。偏移在 SCEV 的
+`AddRec` 起始值里，是个明确可补的工程缺口。
 
 ### 这验到了什么、还没验什么
 

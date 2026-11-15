@@ -245,7 +245,8 @@ def from_sums(path):
     这就是"把结果沿 c 方向求和"的不变量，ABFT 的行/列校验和是它的特例。
     """
     import csv as _csv
-    rows = [r for r in _csv.DictReader(open(path)) if r["kind"] == "REDUCTION"]
+    rows = [r for r in _csv.DictReader(open(path))
+            if r["kind"] in ("REDUCTION", "LINEAR_MAP")]
     out = []
     for r in rows:
         if not r["function"].startswith("bench_"):
@@ -262,25 +263,45 @@ def from_sums(path):
             continue
         all_idx = sorted({i for _, ix in terms for i in ix} | set(acc_idx))
         red_idx = [i for i in all_idx if i not in acc_idx]
-        if not red_idx:
-            continue
         check_idx = acc_idx[-1]
 
         eg = EGraph()
-        node = None
-        for base, ix in terms:
-            v = eg.add_enode(var("%s[%s]" % (base, ",".join(ix)), ix))
-            node = v if node is None else eg.add_enode(mul(node, v))
-        for i in red_idx:
-            node = eg.add_enode(summ(i, node))
-        root = eg.add_enode(summ(check_idx, node))
+        if r["kind"] == "REDUCTION":
+            if not red_idx:
+                continue
+            # 归约：目标式 = sum_c sum_red prod(terms)
+            node = None
+            for base, ix in terms:
+                v = eg.add_enode(var("%s[%s]" % (base, ",".join(ix)), ix))
+                node = v if node is None else eg.add_enode(mul(node, v))
+            for i in red_idx:
+                node = eg.add_enode(summ(i, node))
+            root = eg.add_enode(summ(check_idx, node))
+        else:
+            # 线性映射（stencil 类）：没有归约下标，不变量是"把输出沿所有下标求和"。
+            # 带下标的项相加、循环不变的标量因子相乘 —— 后者正是因子外提的作用对象。
+            scal = [b for b, ix in terms if not ix]
+            arrs = [(b, ix) for b, ix in terms if ix]
+            if not arrs:
+                continue
+            node = None
+            for base, ix in arrs:
+                v = eg.add_enode(var("%s[%s]" % (base, ",".join(ix)), ix))
+                node = v if node is None else eg.add_enode(add(node, v))
+            for b in scal:
+                node = eg.add_enode(mul(eg.add_enode(var(b, set())), node))
+            for i in sorted(set(acc_idx)):
+                node = eg.add_enode(summ(i, node))
+            root = node
+            red_idx = list(acc_idx)
 
         before = extract(eg, root)
         m0 = before[eg.find(root)][1]
         saturate(eg, root)
         after = extract(eg, root)
         m1, a1 = after[eg.find(root)][1], after[eg.find(root)][2]
-        out.append({"function": r["function"], "acc": "%s[%s]" % (acc_base, ",".join(acc_idx)),
+        out.append({"kind": r["kind"],
+                    "function": r["function"], "acc": "%s[%s]" % (acc_base, ",".join(acc_idx)),
                     "check_dir": check_idx, "red": ",".join(red_idx),
                     "m0": m0, "m1": m1, "a1": a1, "expr": render(eg, after, root),
                     "layer": "代数校验层" if m1 < m0 else "回落指令冗余"})
@@ -349,11 +370,11 @@ def main():
 def main_from_sums(path):
     rows = from_sums(path)
     print(f"从 IR 抽到的归约 -> 自动合成校验式（N = {N}）\n")
-    print(f"{'函数':>18}{'累加器':>14}{'归约下标':>9}{'校验方向':>9}"
+    print(f"{'形态':>11}{'函数':>18}{'输出':>14}{'下标':>9}"
           f"{'搜索前乘法':>11}{'搜索后乘法':>11}{'降幅':>7}{'判定':>12}")
     for r in rows:
         ratio = f"{r['m0'] / r['m1']:.0f}x" if r["m1"] and r["m1"] < r["m0"] else "-"
-        print(f"{r['function']:>18}{r['acc']:>14}{r['red']:>9}{r['check_dir']:>9}"
+        print(f"{r['kind']:>11}{r['function']:>18}{r['acc']:>14}{r['red']:>9}"
               f"{r['m0']:>11}{r['m1']:>11}{ratio:>7}{r['layer']:>12}")
     print()
     for r in rows:

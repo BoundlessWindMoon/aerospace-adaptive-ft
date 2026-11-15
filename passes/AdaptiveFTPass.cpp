@@ -21,6 +21,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -521,15 +523,17 @@ struct AccessInfo {
   std::set<unsigned> idxDeps;   // 依赖的循环层号（0 = 最外层）
 };
 
-// 判断 V 是否（传递地）用到了第 d 层循环的归纳 PHI
-static bool usesIndVar(Value *V, PHINode *IV, std::set<Value *> &seen) {
-  if (!V || V == IV) return V == IV;
-  auto *I = dyn_cast<Instruction>(V);
-  if (!I || !seen.insert(V).second) return false;
-  for (Use &U : I->operands())
-    if (usesIndVar(U.get(), IV, seen)) return true;
-  return false;
-}
+// 下标依赖哪些循环：交给 ScalarEvolution。一个访问的 SCEV 里出现的每个
+// SCEVAddRecExpr 都对应一层循环，这比手写 use 链遍历鲁棒得多 ——
+// sext/zext、步长乘法、多维线性化都被 SCEV 规范掉了。
+struct AddRecLoopCollector {
+  std::set<const Loop *> loops;
+  bool follow(const SCEV *S) {
+    if (auto *AR = dyn_cast<SCEVAddRecExpr>(S)) loops.insert(AR->getLoop());
+    return true;
+  }
+  bool isDone() const { return false; }
+};
 
 static std::string baseName(Value *Ptr) {
   Value *P = Ptr->stripInBoundsConstantOffsets();
@@ -537,16 +541,11 @@ static std::string baseName(Value *Ptr) {
   while (auto *LD = dyn_cast<LoadInst>(P)) P = LD->getPointerOperand();
   P = P->stripPointerCasts();
   if (P->hasName() && !P->getName().startswith(".")) return P->getName().str();
-  // 数组多半是函数形参（IR 里是 %5/%6/%7 这种无名值），按形参序号给稳定名字
-  if (auto *Arg = dyn_cast<Argument>(P))
-    return "arg" + std::to_string(Arg->getArgNo());
+  if (auto *Arg = dyn_cast<Argument>(P)) return "arg" + std::to_string(Arg->getArgNo());
   return P->hasName() ? P->getName().str() : "anon";
 }
 
-// 地址是否指向同一个元素。不能用指针相等判断：没跑 GVN 时同一个
-// C[i][j] 在 load 与 store 各算一遍 GEP，是两条不同的指令。
-// 结构相等：没跑 GVN 时同一个下标表达式会被算多遍（两条 sext、两条 add），
-// 按 Value 身份比会判不相等，所以按"同 opcode + 操作数逐个结构相等"比，限深。
+// 结构相等：没跑 GVN 时同一个下标表达式会被算多遍，按 Value 身份比会判不相等
 static bool sameValueStructural(Value *A, Value *B, unsigned depth = 5) {
   if (A == B) return true;
   if (depth == 0) return false;
@@ -554,10 +553,9 @@ static bool sameValueStructural(Value *A, Value *B, unsigned depth = 5) {
     if (auto *CB = dyn_cast<ConstantInt>(B)) return CA->getValue() == CB->getValue();
   auto *IA = dyn_cast<Instruction>(A);
   auto *IB = dyn_cast<Instruction>(B);
-  if (!IA || !IB) return false;
-  if (IA->getOpcode() != IB->getOpcode()) return false;
+  if (!IA || !IB || IA->getOpcode() != IB->getOpcode()) return false;
   if (IA->getNumOperands() != IB->getNumOperands()) return false;
-  if (isa<PHINode>(IA)) return false;   // PHI 不展开比较，避免跨迭代误判
+  if (isa<PHINode>(IA)) return false;
   for (unsigned k = 0; k < IA->getNumOperands(); ++k)
     if (!sameValueStructural(IA->getOperand(k), IB->getOperand(k), depth - 1))
       return false;
@@ -577,44 +575,92 @@ static bool samePointer(Value *A, Value *B) {
   return true;
 }
 
-static bool describeAccess(Value *Ptr, const std::vector<PHINode *> &IVs,
-                           AccessInfo &out) {
-  auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
-  if (!GEP) return false;
+static bool describeAccessSCEV(Value *Ptr, ScalarEvolution &SE,
+                               const std::map<const Loop *, unsigned> &depthOf,
+                               AccessInfo &out) {
   out.base = baseName(Ptr);
-  for (unsigned d = 0; d < IVs.size(); ++d) {
-    std::set<Value *> seen;
-    bool dep = false;
-    for (Use &U : GEP->indices()) {
-      std::set<Value *> s2;
-      if (usesIndVar(U.get(), IVs[d], s2)) { dep = true; break; }
+  if (!SE.isSCEVable(Ptr->getType())) {
+    // 指针类型不可 SCEV 化时退回逐下标分析
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+      for (Use &U : GEP->indices()) {
+        if (!SE.isSCEVable(U.get()->getType())) continue;
+        AddRecLoopCollector C;
+        SCEVTraversal<AddRecLoopCollector> T(C);
+        T.visitAll(SE.getSCEV(U.get()));
+        for (const Loop *L : C.loops) {
+          auto it = depthOf.find(L);
+          if (it != depthOf.end()) out.idxDeps.insert(it->second);
+        }
+      }
+      AccessInfo inner;
+      if (describeAccessSCEV(GEP->getPointerOperand(), SE, depthOf, inner))
+        out.idxDeps.insert(inner.idxDeps.begin(), inner.idxDeps.end());
+      return true;
     }
-    // 基址本身可能是上一层 GEP（多维数组），同样要看
-    if (!dep) {
-      std::set<Value *> s3;
-      if (usesIndVar(GEP->getPointerOperand(), IVs[d], s3)) dep = true;
-    }
-    if (dep) out.idxDeps.insert(d);
+    return false;
+  }
+  AddRecLoopCollector C;
+  SCEVTraversal<AddRecLoopCollector> T(C);
+  T.visitAll(SE.getSCEV(Ptr));
+  for (const Loop *L : C.loops) {
+    auto it = depthOf.find(L);
+    if (it != depthOf.end()) out.idxDeps.insert(it->second);
   }
   return true;
 }
 
-// 把一层层嵌套的循环收集成"最外到最内"的归纳变量序列；要求每层只有一个子循环
-static bool collectPerfectNest(Loop *Outer, std::vector<Loop *> &nest) {
-  Loop *cur = Outer;
-  while (true) {
-    nest.push_back(cur);
-    const auto &subs = cur->getSubLoops();
-    if (subs.empty()) return true;
-    if (subs.size() != 1) return false;
-    cur = subs[0];
+// 收集累加项（或映射体）里的所有数组访问与算子构成
+static void collectTermAccesses(Value *root, ScalarEvolution &SE,
+                                const std::map<const Loop *, unsigned> &depthOf,
+                                std::vector<AccessInfo> &terms, std::string &opMix) {
+  std::vector<Value *> wl{root};
+  std::set<Value *> seen;
+  while (!wl.empty()) {
+    Value *v = wl.back();
+    wl.pop_back();
+    if (!seen.insert(v).second) continue;
+    if (auto *LD = dyn_cast<LoadInst>(v)) {
+      AccessInfo ai;
+      if (describeAccessSCEV(LD->getPointerOperand(), SE, depthOf, ai)) terms.push_back(ai);
+      continue;
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(v)) {
+      unsigned op = BO->getOpcode();
+      if (op == Instruction::FMul) opMix += "*";
+      else if (op == Instruction::FAdd || op == Instruction::FSub) opMix += "+";
+      else continue;   // 非线性算子（fdiv 等）不展开，映射判定会因此失败
+      wl.push_back(BO->getOperand(0));
+      wl.push_back(BO->getOperand(1));
+      continue;
+    }
+    if (auto *FN = dyn_cast<UnaryOperator>(v)) {
+      if (FN->getOpcode() == Instruction::FNeg) {
+        opMix += "+";
+        wl.push_back(FN->getOperand(0));
+      }
+      continue;
+    }
+    // 循环不变的标量因子（常系数、循环外算出的值）也要记下来：
+    // 它是因子外提规则的作用对象 —— stencil 的 0.2 * (u1+...+u5) 就靠它
+    // 把乘法从 N^2 次降到 1 次。记成"自由下标为空"的项。
+    if (isa<ConstantFP>(v)) {
+      terms.push_back({"const", {}});
+      continue;
+    }
+    if (SE.isSCEVable(v->getType())) {
+      AddRecLoopCollector C;
+      SCEVTraversal<AddRecLoopCollector> T(C);
+      T.visitAll(SE.getSCEV(v));
+      bool invariant = true;
+      for (const Loop *L : C.loops)
+        if (depthOf.count(L)) { invariant = false; break; }
+      if (invariant && !isa<LoadInst>(v)) terms.push_back({"scalar", {}});
+    }
   }
 }
 
-void dumpReductionSums(Function &F, LoopInfo &LI, std::ostream &OS) {
-  // 从**最内层**循环出发，沿父链向上收集下标。不要求完美嵌套 ——
-  // PolyBench 的 gemm 外层 i 循环下挂着两个子循环（beta 缩放 + k 累加），
-  // 按"完美嵌套"筛会把它整个丢掉。
+void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
+                       std::ostream &OS) {
   std::vector<Loop *> innermost;
   for (Loop *L : LI.getLoopsInPreorder())
     if (L->getSubLoops().empty()) innermost.push_back(L);
@@ -623,29 +669,16 @@ void dumpReductionSums(Function &F, LoopInfo &LI, std::ostream &OS) {
     std::vector<Loop *> nest;
     for (Loop *L = Inner; L; L = L->getParentLoop()) nest.push_back(L);
     std::reverse(nest.begin(), nest.end());
-    std::vector<PHINode *> IVs;
-    for (Loop *L : nest) {
-      PHINode *IV = L->getCanonicalInductionVariable();
-      if (!IV) {
-        // 回落：取 header 里"自增一个常量"的整数 PHI 作为归纳变量
-        for (PHINode &PN : L->getHeader()->phis()) {
-          if (!PN.getType()->isIntegerTy()) continue;
-          for (unsigned k = 0; k < PN.getNumIncomingValues(); ++k) {
-            auto *BO = dyn_cast<BinaryOperator>(PN.getIncomingValue(k));
-            if (BO && BO->getOpcode() == Instruction::Add &&
-                (BO->getOperand(0) == &PN || BO->getOperand(1) == &PN) &&
-                (isa<ConstantInt>(BO->getOperand(0)) || isa<ConstantInt>(BO->getOperand(1)))) {
-              IV = &PN;
-              break;
-            }
-          }
-          if (IV) break;
-        }
-      }
-      if (!IV) break;
-      IVs.push_back(IV);
+
+    std::map<const Loop *, unsigned> depthOf;
+    std::vector<unsigned> tripCounts;
+    for (unsigned d = 0; d < nest.size(); ++d) {
+      depthOf[nest[d]] = d;
+      tripCounts.push_back(SE.getSmallConstantTripCount(nest[d]));
     }
-    if (IVs.size() != nest.size()) continue;
+    auto emitTrips = [&]() {
+      for (unsigned t : tripCounts) OS << t << ";";
+    };
 
     for (BasicBlock *BB : Inner->blocks()) {
       for (Instruction &I : *BB) {
@@ -653,47 +686,64 @@ void dumpReductionSums(Function &F, LoopInfo &LI, std::ostream &OS) {
         if (!SI) continue;
         Value *val = SI->getValueOperand();
         if (!val->getType()->isDoubleTy() && !val->getType()->isFloatTy()) continue;
-        auto *Acc = dyn_cast<BinaryOperator>(val);
-        if (!Acc || Acc->getOpcode() != Instruction::FAdd) continue;
-        // 归约形态：fadd 的一个操作数是对同一地址的 load
-        LoadInst *selfLoad = nullptr;
-        Value *term = nullptr;
-        for (unsigned k = 0; k < 2; ++k) {
-          if (auto *LD = dyn_cast<LoadInst>(Acc->getOperand(k)))
-            if (samePointer(LD->getPointerOperand(), SI->getPointerOperand())) {
-              selfLoad = LD;
-              term = Acc->getOperand(1 - k);
-            }
-        }
-        if (!selfLoad || !term) continue;
 
         AccessInfo accAcc;
-        if (!describeAccess(SI->getPointerOperand(), IVs, accAcc)) continue;
+        if (!describeAccessSCEV(SI->getPointerOperand(), SE, depthOf, accAcc)) continue;
 
-        // 累加项里的所有数组访问
+        // --- 形态一：归约。store 的值是 fadd，且一个操作数是对同一地址的 load
+        if (auto *Acc = dyn_cast<BinaryOperator>(val)) {
+          if (Acc->getOpcode() == Instruction::FAdd) {
+            Value *term = nullptr;
+            for (unsigned k = 0; k < 2; ++k)
+              if (auto *LD = dyn_cast<LoadInst>(Acc->getOperand(k)))
+                if (samePointer(LD->getPointerOperand(), SI->getPointerOperand()))
+                  term = Acc->getOperand(1 - k);
+            if (term) {
+              std::vector<AccessInfo> terms;
+              std::string opMix;
+              collectTermAccesses(term, SE, depthOf, terms, opMix);
+              if (!terms.empty()) {
+                OS << "REDUCTION," << F.getName().str() << "," << nest.size() << ",";
+                emitTrips();
+                OS << "," << accAcc.base << ":";
+                for (unsigned d : accAcc.idxDeps) OS << "i" << d << ";";
+                OS << "," << (opMix.empty() ? "+" : opMix) << ",";
+                for (const AccessInfo &t : terms) {
+                  OS << t.base << ":";
+                  for (unsigned d : t.idxDeps) OS << "i" << d << ";";
+                  OS << "|";
+                }
+                OS << "\n";
+                continue;
+              }
+            }
+          }
+        }
+
+        // --- 形态二：线性映射。store 的值是 fadd/fmul 构成的树，且不含对同地址的 load
+        //     （jacobi2d / deriche / sobel 这类 stencil 就是这一类）
         std::vector<AccessInfo> terms;
         std::string opMix;
-        std::vector<Value *> wl{term};
+        collectTermAccesses(val, SE, depthOf, terms, opMix);
+        if (terms.size() < 2) continue;      // 单个 load 的拷贝不算映射
+        bool selfRef = false;
+        std::vector<Value *> wl{val};
         std::set<Value *> seen;
-        while (!wl.empty()) {
+        while (!wl.empty() && !selfRef) {
           Value *v = wl.back();
           wl.pop_back();
           if (!seen.insert(v).second) continue;
           if (auto *LD = dyn_cast<LoadInst>(v)) {
-            AccessInfo ai;
-            if (describeAccess(LD->getPointerOperand(), IVs, ai)) terms.push_back(ai);
+            if (samePointer(LD->getPointerOperand(), SI->getPointerOperand())) selfRef = true;
             continue;
           }
-          if (auto *BO = dyn_cast<BinaryOperator>(v)) {
-            opMix += (BO->getOpcode() == Instruction::FMul ? "*" : "+");
-            wl.push_back(BO->getOperand(0));
-            wl.push_back(BO->getOperand(1));
-          }
+          if (auto *I2 = dyn_cast<Instruction>(v))
+            for (Use &U : I2->operands()) wl.push_back(U.get());
         }
-        if (terms.empty()) continue;
-
-        OS << "REDUCTION," << F.getName().str() << "," << nest.size() << ","
-           << accAcc.base << ":";
+        if (selfRef) continue;
+        OS << "LINEAR_MAP," << F.getName().str() << "," << nest.size() << ",";
+        emitTrips();
+        OS << "," << accAcc.base << ":";
         for (unsigned d : accAcc.idxDeps) OS << "i" << d << ";";
         OS << "," << (opMix.empty() ? "+" : opMix) << ",";
         for (const AccessInfo &t : terms) {
@@ -2145,14 +2195,15 @@ public:
     if (!AtftDumpSums.empty()) {
       std::ofstream ofs(AtftDumpSums);
       if (ofs.is_open()) {
-        ofs << "kind,function,nest_depth,accumulator,op_mix,terms\n";
+        ofs << "kind,function,nest_depth,trip_counts,accumulator,op_mix,terms\n";
         for (Function *F : targetFuncs) {
           // 先把 llvm.fmuladd 展开成 fmul + fadd：PolyBench 的
           // C[i][j] += alpha*A*B 在 IR 里是一条 fmuladd 内建，
           // 不展开就匹配不到"fadd 的一个操作数是对同一地址的 load"这个归约形态
           expandFMulAddIntrinsics(*F);
           auto &LI = FAM.getResult<LoopAnalysis>(*F);
-          dumpReductionSums(*F, LI, ofs);
+          auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(*F);
+          dumpReductionSums(*F, LI, SE, ofs);
         }
       }
     }
