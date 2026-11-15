@@ -119,6 +119,14 @@ static cl::opt<bool> AtftIntTMRI64(
     cl::desc("Extend integer TMR coverage to i64 values (index extensions feeding GEPs)"),
     cl::init(false));
 
+// 诊断开关：关掉 CSE 屏障，用来**测量**屏障本身的代价（指令数与 IPC 损失）。
+// 关掉后 -O2 的 CSE/GVN 会把等价副本折叠，冗余不再成立，所以它只能用于测量，
+// 不能用于部署。测出的差值是"屏障税"的上界。
+static cl::opt<bool> AtftNoBarrier(
+    "atft-no-cse-barrier",
+    cl::desc("Measurement only: drop the CSE barriers (destroys redundancy, use for cost accounting)"),
+    cl::init(false));
+
 // D10 按通路分预算：整数通路与浮点近似通路的"单位开销收益"差一个量级，
 // 用同一个 -atft-budget 同时压两条通路必然在其中一条上做错决策。
 // < 0 表示沿用全局预算，保持原行为。
@@ -483,6 +491,7 @@ void markReplica(Value *V) {
 }
 
 Value *insertZeroCostCSEBarrier(IRBuilder<> &IRB, Value *val) {
+  if (AtftNoBarrier) return val;
   Type *ty = val->getType();
   InlineAsm *noop = InlineAsm::get(
       FunctionType::get(ty, {ty}, false), "", "=r,0", false);
@@ -556,10 +565,14 @@ void transformFunctionCmpTMR(Function &F, unsigned *outProtected) {
       return b;
     };
 
+    // 屏障只用来让三份副本在 CSE/GVN 眼里互不相同，**一个操作数上加就够了**。
+    // 原先每个操作数都加，屏障数翻倍 —— 而 asm 是调度屏障，会钉住活跃区间、
+    // 阻止 LICM 与展开，实测这部分占到周期开销的一大块。
+    int isoIdx = isa<Constant>(CI->getOperand(0)) ? 1 : 0;
     Value *rep[2];
     for (int k = 0; k < 2; ++k) {
-      Value *a = isolate(CI->getOperand(0));
-      Value *b = isolate(CI->getOperand(1));
+      Value *a = (isoIdx == 0) ? isolate(CI->getOperand(0)) : CI->getOperand(0);
+      Value *b = (isoIdx == 1) ? isolate(CI->getOperand(1)) : CI->getOperand(1);
       rep[k] = IRB.CreateCmp(CI->getPredicate(), a, b,
                              CI->getName() + ".tmr" + std::to_string(k + 1));
       markReplica(rep[k]);
@@ -1059,13 +1072,19 @@ void transformFunctionExactIntTMR(Function &F, LoopInfo &LI,
     Instruction *rep1 = inst->clone();
     Instruction *rep2 = inst->clone();
     std::set<Value *> itmrInternalUsers;
+    bool isolated = false;
     for (unsigned k = 0; k < inst->getNumOperands(); ++k) {
       Value *op = inst->getOperand(k);
       if (isa<BasicBlock>(op)) continue;
       Value *r1 = replica1Map.count(op) ? replica1Map[op] : op;
       Value *r2 = replica2Map.count(op) ? replica2Map[op] : op;
-      if (r1 == op && !isa<Constant>(op)) r1 = insertZeroCostCSEBarrier(IRB, op);
-      if (r2 == op && !isa<Constant>(op)) r2 = insertZeroCostCSEBarrier(IRB, op);
+      // 屏障只需一个操作数：有了它，两条副本与原件就已经互不相同，
+      // 后续 CSE/GVN 无法折叠。每个操作数都加等于白付调度代价。
+      if (r1 == op && r2 == op && !isa<Constant>(op) && !isolated) {
+        r1 = insertZeroCostCSEBarrier(IRB, op);
+        r2 = insertZeroCostCSEBarrier(IRB, op);
+        isolated = true;
+      }
       rep1->setOperand(k, r1);
       rep2->setOperand(k, r2);
     }
