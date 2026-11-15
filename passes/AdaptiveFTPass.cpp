@@ -95,6 +95,17 @@ static cl::opt<bool> AtftABFTColCheck(
              "(drops the O(n^2) snapshot; see docs/HANDOFF.md section 9)"),
     cl::init(false));
 
+static cl::opt<bool> AtftLayerExclusive(
+    "atft-layer-exclusive",
+    cl::desc("Make the layers mutually exclusive: functions that got an algebraic "
+             "check do NOT also get instruction redundancy (this is what the "
+             "layering criterion actually claims)"),
+    cl::init(false));
+
+// 记录哪些函数真的插上了代数校验。分层判据说"搜到就进代数校验层，搜不到就回落
+// 指令冗余层"，但实现里两层一直是**叠加**的 —— 这个集合是把它改成互斥所需的。
+static std::set<const Function *> g_abftInserted;
+
 static cl::opt<std::string> AtftDumpSums(
     "atft-dump-sums",
     cl::desc("Extract reduction loop nests into a symbolic sum description (CSV path)"),
@@ -1049,6 +1060,7 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
     call->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
     errs() << "ATFT_ABFT_INSERTED," << F.getName() << ",matrix-level,region-depth="
            << (outerLevels + 1) << ",nest-depth=" << nest.size() << "\n";
+    g_abftInserted.insert(&F);
     return true;
   }
 
@@ -1101,6 +1113,7 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
                                  nj, nk, ldb, alpha, preSum}));
   errs() << "ATFT_ABFT_INSERTED," << F.getName() << ",region-depth="
          << (outerLevels + 1) << ",nest-depth=" << nest.size() << "\n";
+  g_abftInserted.insert(&F);
   return true;
 }
 
@@ -2755,6 +2768,15 @@ public:
       for (Function *F : targetFuncs) {
         expandFMulAddIntrinsics(*F);
       }
+      // 整数通路三模可以在 native 模式下单独叠加：代数校验层只清 SDC，
+      // DUE（崩溃）要靠对 i32->i64 下标扩展表决来压。两层正交，必须能分开计量，
+      // 否则"分层到底省多少"永远只能估。默认关闭，native 基线行为不变。
+      if (AtftIntTMRWire) {
+        for (Function *F : targetFuncs) {
+          auto &LI = FAM.getResult<LoopAnalysis>(*F);
+          transformFunctionExactIntTMR(*F, LI, AtftRankMethod, AtftBudget);
+        }
+      }
       if (AtftCmpTMR) {
         unsigned nProtected = 0;
         for (Function *F : targetFuncs) transformFunctionCmpTMR(*F, &nProtected);
@@ -2767,6 +2789,22 @@ public:
       Function *F = targetFuncs[i];
       CritLevel clevel = critReports[i].level;
       auto &LI = FAM.getResult<LoopAnalysis>(*F);
+
+      // 分层互斥：这个函数已经有代数校验了，就不再叠加浮点近似三模。
+      // 判据本来就是这么说的（"搜到就进代数校验层，搜不到就回落"），
+      // 只是实现一直把两层叠加在一起算，于是开销被重复计了一遍。
+      //
+      // 但整数通路三模要保留：六类别实测显示代数校验把 gemm/2mm 六个类别的
+      // SDC 全清零，**DUE 却一点没动**（int_arith 54.5%、cast 73.75% 照旧），
+      // 因为校验和挡不住崩溃。压 DUE 的是对 i32->i64 下标扩展表决。
+      if (AtftLayerExclusive && g_abftInserted.count(F)) {
+        errs() << "ATFT_LAYER_SKIP," << F->getName() << ",has-algebraic-check"
+               << (AtftIntTMRWire ? ",keep-int-tmr" : "") << "\n";
+        if (AtftIntTMRWire)
+          transformFunctionExactIntTMR(*F, LI, AtftRankMethod, AtftBudget);
+        continue;
+      }
+
 
       if (AtftMode == "eddi") {
         transformFunctionEDDIOrSWIFT(*F, LI, true, AtftRankMethod, AtftBudget);
@@ -2799,6 +2837,9 @@ public:
         if (F.isDeclaration()) continue;
         StringRef n = F.getName();
         if (inClosure.count(&F) || n.endswith(".atft_low") || n.endswith(".atft_high")) {
+          // 分层互斥同样适用于控制平面：代数校验已把 cmp_branch 的 SDC 清零
+          // （gemm 18.0 -> 0.00、2mm 40.5 -> 0.00，六类别实测），再三模是重复付费。
+          if (AtftLayerExclusive && g_abftInserted.count(&F)) continue;
           transformFunctionCmpTMR(F, &nProtected);
         }
       }

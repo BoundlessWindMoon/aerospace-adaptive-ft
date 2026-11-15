@@ -124,6 +124,18 @@ def ablation_matrix(delta_table, seed=None):
                                                 "-atft-abft-colcheck"],
                                                 mk({"ATFT_ABFT": "1",
                                                     "ATFT_ABFT_COLCHECK": "1"})),
+        # 分层口径的实测：代数校验层（清 SDC）+ 整数通路三模（压 DUE），
+        # 不带浮点近似三模。用来量"该走哪层就走哪层"的真实期望开销。
+        ("abft_auto_int",      "native",       ["-atft-abft-insert",
+                                                "-atft-int-tmr-wire",
+                                                "-atft-int-tmr-i64"],
+                                                mk({"ATFT_ABFT": "1"})),
+        # 真·分层：代数校验层与指令冗余层互斥（判据本来就这么说，实现以前是叠加的）
+        ("opt_layered",        "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
+                                                                "-atft-int-tmr-i64",
+                                                                "-atft-abft-insert",
+                                                                "-atft-layer-exclusive"],
+                                                mk({**denv, "ATFT_ABFT": "1"})),
         # D4 整数三模覆盖面扩到 i64（i32->i64 的下标扩展占 cast 注入点的 88%）
         ("opt_i64",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-tmr-i64"], mk(denv)),
