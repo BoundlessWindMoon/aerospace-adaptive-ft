@@ -36,6 +36,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
@@ -68,6 +69,31 @@ static cl::opt<double> AtftBudget(
     "atft-budget",
     cl::desc("Selective protection budget ratio in [0.0, 1.0]"),
     cl::init(1.0));
+
+static cl::opt<std::string> AtftBudgetMode(
+    "atft-budget-mode",
+    cl::desc("Budget selector: count | dynamic-cost | risk-cost"),
+    cl::init("count"));
+
+static cl::opt<std::string> AtftProfileFile(
+    "atft-profile",
+    cl::desc("CSV site cost profile used by dynamic-cost/risk-cost selection"),
+    cl::init(""));
+
+static cl::opt<std::string> AtftSelectionFile(
+    "atft-selection",
+    cl::desc("CSV output for selected protection candidates"),
+    cl::init(""));
+
+static cl::opt<std::string> AtftFrontierSelectionFile(
+    "atft-frontier-selection",
+    cl::desc("CSV input containing selected path frontier member site IDs"),
+    cl::init(""));
+
+static cl::opt<double> AtftControlBudget(
+    "atft-control-budget",
+    cl::desc("Independent control-flow protection budget; negative follows total budget"),
+    cl::init(-1.0));
 
 static cl::opt<double> AtftDelta(
     "atft-delta",
@@ -120,6 +146,16 @@ static cl::opt<std::string> AtftDumpNests(
 static cl::opt<std::string> AtftReportFile(
     "atft-report",
     cl::desc("Output CSV file path for criticality analysis report"),
+    cl::init(""));
+
+static cl::opt<std::string> AtftSiteManifestFile(
+    "atft-site-manifest",
+    cl::desc("Output CSV file path for auditable protection candidate site manifest"),
+    cl::init(""));
+
+static cl::opt<std::string> AtftFrontierManifestFile(
+    "atft-frontier-manifest",
+    cl::desc("Output CSV file path for path frontier manifest"),
     cl::init(""));
 
 // --- 中期优化开关：三项都默认关闭，不改动已冻结基线的任何行为 ---
@@ -197,6 +233,23 @@ static cl::opt<bool> AtftIntTMRWire(
 static cl::opt<bool> AtftReplicaExact(
     "atft-replica-exact",
     cl::desc("Require bitwise-equal approximate replicas instead of a slack threshold"),
+    cl::init(false));
+
+// C4：在 SIMD 保护路径中保留 FP64 精度，把两份精确副本放入 <2 x double>。
+// 默认关闭，保持 approx-simd 的冻结行为；只在显式消融时启用。
+static cl::opt<bool> AtftSimdF64(
+    "atft-simd-f64",
+    cl::desc("Use two exact FP64 replicas in a <2 x double> SIMD channel"),
+    cl::init(false));
+
+// 计量旋钮：SIMD 通道里复制 Load 时，用单次 Load + broadcast 填满两条车道，
+// 取代"两次独立 Load + 两个零开销指针屏障"。省掉热循环里的屏障与第二次 Load，
+// 代价是 Load/访存故障会同时打中两条车道（共模，检不出）——因此这是开销换 Load 覆盖面的
+// 可测旋钮，不是无损优化。默认关闭，冻结行为不变。
+static cl::opt<bool> AtftSimdBcast(
+    "atft-simd-bcast",
+    cl::desc("SIMD channel: broadcast one load into both lanes instead of two "
+             "independent loads (trades load-fault coverage for fewer hot-loop ops)"),
     cl::init(false));
 
 enum CritLevel {
@@ -331,14 +384,33 @@ computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &r
       unsigned d = distMap.count(&I) ? distMap[&I] : 10;
       double closeness = 1.0 / (1.0 + (double)d);
 
-      // 计算直接扇出 (Fan-out) 与跨基本块活跃范围
+      // 计算直接扇出 (Fan-out)、跨基本块活跃范围和语义边界特征。
       unsigned fanOut = I.getNumUses();
       unsigned crossBBUses = 0;
       bool feedsStoreDirectly = false;
+      bool feedsBranch = false;
+      bool feedsStoreAddr = false;
+      bool feedsCall = false;
+      bool feedsGEP = false;
+      bool recurrentFeedback = false;
       for (const User *U : I.users()) {
         if (const auto *userInst = dyn_cast<Instruction>(U)) {
           if (userInst->getParent() != &BB) crossBBUses++;
-          if (isa<StoreInst>(userInst)) feedsStoreDirectly = true;
+          if (isa<BranchInst>(userInst) || isa<SelectInst>(userInst) ||
+              isa<SwitchInst>(userInst))
+            feedsBranch = true;
+          if (const auto *SI = dyn_cast<StoreInst>(userInst)) {
+            if (SI->getValueOperand() == &I) feedsStoreDirectly = true;
+            if (SI->getPointerOperand() == &I) feedsStoreAddr = true;
+          }
+          if (isa<CallBase>(userInst)) feedsCall = true;
+          if (isa<GetElementPtrInst>(userInst)) feedsGEP = true;
+          if (const auto *PN = dyn_cast<PHINode>(userInst)) {
+            Loop *userLoop = LI.getLoopFor(PN->getParent());
+            Loop *instLoop = LI.getLoopFor(&BB);
+            if (userLoop && instLoop && instLoop->contains(PN->getParent()))
+              recurrentFeedback = true;
+          }
         }
       }
 
@@ -360,6 +432,34 @@ computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &r
       } else if (rankMethod == "random") {
         uint64_t h = (uint64_t)idx * 11400714819323198485ULL;
         s = (double)((h >> 32) & 0xFFFF) / 65536.0;
+      } else if (rankMethod == "boundary-branch" ||
+                 rankMethod == "boundary-address" ||
+                 rankMethod == "boundary-store" ||
+                 rankMethod == "boundary-feedback") {
+        // 人工语义子集：一次只提升一种边界，作为机制上限消融。
+        // 低权重项只用于同组候选的稳定排序，不引入 benchmark/site 白名单。
+        bool focus = false;
+        if (rankMethod == "boundary-branch") focus = feedsBranch;
+        else if (rankMethod == "boundary-address") focus = feedsStoreAddr || feedsGEP;
+        else if (rankMethod == "boundary-store") focus = feedsStoreDirectly;
+        else focus = recurrentFeedback;
+        s = (focus ? 100.0 : 0.0) +
+            0.25 * (double)fanOut +
+            0.10 * (double)depth +
+            0.01 * closeness;
+      } else if (rankMethod == "semantic-boundary") {
+        // 人工语义上界：优先保护直接进入控制流、地址和外部可见边界的值。
+        // 该模式只使用 IR 数据流特征，不依赖 benchmark 名称或固定 site ID。
+        s = (feedsStoreAddr ? 5.0 : 0.0) +
+            (feedsGEP ? 5.0 : 0.0) +
+            (feedsBranch ? 4.0 : 0.0) +
+            (feedsStoreDirectly ? 4.0 : 0.0) +
+            (feedsCall ? 3.0 : 0.0) +
+            (recurrentFeedback ? 2.0 : 0.0) +
+            0.5 * (double)crossBBUses +
+            0.25 * (double)fanOut +
+            0.10 * (double)depth +
+            0.01 * closeness;
       } else {
         // 本课题方法 (semantic): 综合高扇出传播树 (Fan-out)、输出汇点紧密度 (Closeness)、
         // 循环嵌套深度 (LDepth)、跨迭代递归状态链 (inRecurrentCycle) 与算子放大因子 (opAmp)
@@ -505,29 +605,118 @@ FuncCriticalityInfo analyzeFunctionCriticality(Function &F, FunctionAnalysisMana
   return info;
 }
 
+struct AtftProfileEntry {
+  double dynamicCost = 1.0;
+  double boundarySensitivity = 0.0;
+  double riskPrior = 1.0;
+  std::string className;
+};
+
+static std::map<const Instruction *, uint64_t> g_atftSiteIds;
+static std::map<const Instruction *, std::string> g_atftSiteKeys;
+static std::map<uint64_t, AtftProfileEntry> g_atftProfile;
+static std::set<uint64_t> g_atftFrontierSelectedSites;
+static std::vector<std::string> g_atftSelectionRows;
+static bool g_atftProfileLoaded = false;
+static size_t g_atftProfileMissing = 0;
+
 std::set<Instruction *> selectInstructionsByBudget(
     const std::vector<Instruction *> &candidates,
     const std::map<const Instruction *, double> &scores,
     double budget) {
   std::set<Instruction *> selected;
   if (budget <= 0.0 || candidates.empty()) return selected;
-  if (budget >= 0.999) {
-    selected.insert(candidates.begin(), candidates.end());
+
+  if (AtftBudgetMode == "frontier") {
+    for (Instruction *inst : candidates) {
+      uint64_t siteId = g_atftSiteIds.count(inst) ? g_atftSiteIds.at(inst) : 0;
+      if (g_atftFrontierSelectedSites.count(siteId)) selected.insert(inst);
+    }
     return selected;
   }
 
-  std::vector<std::pair<double, Instruction *>> ranked;
-  ranked.reserve(candidates.size());
-  for (Instruction *inst : candidates) {
-    double sc = scores.count(inst) ? scores.at(inst) : 0.0;
-    ranked.push_back({sc, inst});
-  }
-  std::stable_sort(ranked.begin(), ranked.end(),
-                   [](const auto &a, const auto &b) { return a.first > b.first; });
+  if (AtftBudgetMode == "count") {
+    if (budget >= 0.999) {
+      selected.insert(candidates.begin(), candidates.end());
+      return selected;
+    }
 
-  size_t k = std::max<size_t>(1, (size_t)std::round(budget * (double)ranked.size()));
-  for (size_t i = 0; i < k && i < ranked.size(); ++i) {
-    selected.insert(ranked[i].second);
+    std::vector<std::pair<double, Instruction *>> ranked;
+    ranked.reserve(candidates.size());
+    for (Instruction *inst : candidates) {
+      double sc = scores.count(inst) ? scores.at(inst) : 0.0;
+      ranked.push_back({sc, inst});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const auto &a, const auto &b) { return a.first > b.first; });
+
+    size_t k = std::max<size_t>(1, (size_t)std::round(budget * (double)ranked.size()));
+    for (size_t i = 0; i < k && i < ranked.size(); ++i)
+      selected.insert(ranked[i].second);
+    return selected;
+  }
+
+  struct Ranked {
+    Instruction *inst;
+    uint64_t siteId;
+    double cost;
+    double boundary;
+    double risk;
+    double benefit;
+    std::string className;
+  };
+
+  std::vector<Ranked> ranked;
+  ranked.reserve(candidates.size());
+  double totalCost = 0.0;
+  for (Instruction *inst : candidates) {
+    uint64_t siteId = g_atftSiteIds.count(inst) ? g_atftSiteIds.at(inst) : 0;
+    auto profileIt = g_atftProfile.find(siteId);
+    double cost = 1.0;
+    double boundary = 0.0;
+    double riskPrior = 1.0;
+    std::string className = "unknown";
+    if (profileIt != g_atftProfile.end()) {
+      cost = profileIt->second.dynamicCost;
+      boundary = profileIt->second.boundarySensitivity;
+      riskPrior = profileIt->second.riskPrior;
+      className = profileIt->second.className;
+    } else {
+      ++g_atftProfileMissing;
+    }
+    if (!(cost > 0.0) || !std::isfinite(cost)) cost = 1.0;
+
+    double staticScore = scores.count(inst) ? scores.at(inst) : 0.0;
+    double risk = riskPrior * (1.0 + std::max(0.0, staticScore));
+    if (AtftBudgetMode == "risk-cost")
+      risk *= 1.0 + 0.10 * std::max(0.0, boundary);
+    double benefit = risk / cost;
+    ranked.push_back({inst, siteId, cost, boundary, risk, benefit, className});
+    totalCost += cost;
+  }
+
+  std::stable_sort(ranked.begin(), ranked.end(), [](const Ranked &a, const Ranked &b) {
+    if (a.benefit != b.benefit) return a.benefit > b.benefit;
+    return a.siteId < b.siteId;
+  });
+
+  double capacity = budget * totalCost;
+  double selectedCost = 0.0;
+  for (const Ranked &item : ranked) {
+    if (selected.empty() || selectedCost + item.cost <= capacity + 1e-12) {
+      selected.insert(item.inst);
+      selectedCost += item.cost;
+    }
+    if (!g_atftSelectionRows.empty() || !AtftSelectionFile.empty()) {
+      bool isSelected = selected.count(item.inst) != 0;
+      g_atftSelectionRows.push_back(
+          std::to_string(item.siteId) + "," +
+          (g_atftSiteKeys.count(item.inst) ? g_atftSiteKeys.at(item.inst) : "") + "," +
+          item.className + "," + std::to_string(item.cost) + "," +
+          std::to_string(item.boundary) + "," + std::to_string(item.risk) + "," +
+          std::to_string(item.benefit) + "," + (isSelected ? "1" : "0") + "," +
+          AtftBudgetMode);
+    }
   }
   return selected;
 }
@@ -783,7 +972,11 @@ static Value *rowStrideSCEV(Value *Ptr, Loop *L, ScalarEvolution &SE,
   const SCEV *Elems = SE.getUDivExactExpr(
       Step, SE.getConstant(Step->getType(), elemBytes));
   if (isa<SCEVCouldNotCompute>(Elems)) return nullptr;
-  if (!Exp.isSafeToExpand(Elems)) return nullptr;
+  // 点无关的 isSafeToExpand 只保证"能展开"，不保证展开出来的值在 InsertPt 支配。
+  // 对 3mm/syrk 这类巢，trip/stride 的 SCEV 会引用某个循环出口的 lcssa 值，在 preheader
+  // 物化会得到不支配的指令（"Instruction does not dominate all uses"）。用点相关的
+  // isSafeToExpandAt 兜住：不安全就返回 nullptr，让上层干净地 ABFT_SKIP 而不是产出坏模块。
+  if (!Exp.isSafeToExpand(Elems) || !Exp.isSafeToExpandAt(Elems, InsertPt)) return nullptr;
   return Exp.expandCodeFor(Elems, Type::getInt64Ty(Ptr->getContext()), InsertPt);
 }
 
@@ -801,7 +994,7 @@ static Value *tripCountSCEV(Loop *L, ScalarEvolution &SE, SCEVExpander &Exp,
   const SCEV *TC = bottomTested
                        ? SE.getAddExpr(BTC, SE.getOne(BTC->getType()))
                        : BTC;
-  if (!Exp.isSafeToExpand(TC)) return nullptr;
+  if (!Exp.isSafeToExpand(TC) || !Exp.isSafeToExpandAt(TC, InsertPt)) return nullptr;
   Value *v = Exp.expandCodeFor(TC, BTC->getType(), InsertPt);
   IRBuilder<> B(InsertPt);
   Type *I32 = Type::getInt32Ty(L->getHeader()->getContext());
@@ -992,7 +1185,8 @@ static bool insertABFTForNest(Function &F, const std::vector<Loop *> &nest,
       if (cur->getLoop() == VaryingLoop) { start = cur->getStart(); break; }
       S = cur->getStart();
     }
-    if (!start || !Exp.isSafeToExpand(start)) return nullptr;
+    if (!start || !Exp.isSafeToExpand(start) || !Exp.isSafeToExpandAt(start, IP))
+      return nullptr;
     return Exp.expandCodeFor(start, Ptr->getType(), IP);
   };
 
@@ -1430,7 +1624,9 @@ void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
 // 保护越多注入点越少，可靠性会被系统性虚高（见 FaultInjectorPass 的分类注释）。
 // 三副本都可注错时，随机单比特落到任一副本都被多数决掩盖，这才是真实的 TMR。
 // ============================================================================
-void transformFunctionCmpTMR(Function &F, unsigned *outProtected) {
+void transformFunctionCmpTMR(Function &F, unsigned *outProtected,
+                              double controlBudget,
+                              const std::string &rankMethod) {
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
 
@@ -1460,7 +1656,34 @@ void transformFunctionCmpTMR(Function &F, unsigned *outProtected) {
     }
   }
 
+  std::vector<Instruction *> controlCandidates;
+  std::map<const Instruction *, double> controlScores;
   for (CmpInst *CI : targets) {
+    controlCandidates.push_back(CI);
+    if (rankMethod != "semantic-boundary") {
+      controlScores[CI] = 1.0;
+      continue;
+    }
+    double score = 4.0; // every target already drives branch/select/switch
+    score += 0.25 * (double)CI->getNumUses();
+    for (User *U : CI->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI) continue;
+      if (const auto *SI = dyn_cast<StoreInst>(UI)) {
+        if (SI->getPointerOperand() == CI) score += 5.0;
+        if (SI->getValueOperand() == CI) score += 4.0;
+      }
+      if (isa<GetElementPtrInst>(UI)) score += 5.0;
+      if (isa<CallBase>(UI)) score += 3.0;
+      if (UI->getParent() != CI->getParent()) score += 0.5;
+    }
+    controlScores[CI] = score;
+  }
+  std::set<Instruction *> selectedControls =
+      selectInstructionsByBudget(controlCandidates, controlScores, controlBudget);
+
+  for (CmpInst *CI : targets) {
+    if (!selectedControls.count(CI)) continue;
     Instruction *insertPt = CI->getNextNode();
     if (!insertPt) continue;
     IRBuilder<> IRB(insertPt);
@@ -2323,7 +2546,7 @@ Value *createInlineFastApproxVote(IRBuilder<> &IRB, Module *M,
   // 两条近似副本是同一条 f32 链的复制，无故障时按位相同；AtftReplicaExact 下
   // 直接要求相等，不再给 1e-5 的无来源松弛量
   Value *a12Agree = nullptr;
-  if (AtftReplicaExact) {
+  if (AtftReplicaExact || a1_f32->getType()->isDoubleTy()) {
     a12Agree = markVoterInternal(IRB.CreateFCmpOEQ(a1_f32, a2_f32, "a12.ok"));
   } else {
     Value *diffA12 = markVoterInternal(IRB.CreateCall(FabsF32, {markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32))}));
@@ -2347,6 +2570,8 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
   Type *F32Ty = Type::getFloatTy(Ctx);
   Type *I32Ty = Type::getInt32Ty(Ctx);
   VectorType *V2F32Ty = FixedVectorType::get(F32Ty, 2);
+  VectorType *V2F64Ty = FixedVectorType::get(F64Ty, 2);
+  VectorType *ReplicaVecTy = (AtftSimdF64 && useSIMD) ? V2F64Ty : V2F32Ty;
 
   FunctionCallee VoterApproxFn = M->getOrInsertFunction(
       "atft_voter_approx_f64", F64Ty, F64Ty, F64Ty, F64Ty, F64Ty, I32Ty);
@@ -2402,14 +2627,22 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       return it->second;
     }
     if (auto *CFP = dyn_cast<ConstantFP>(v)) {
+      if (AtftSimdF64 && useSIMD) {
+        Constant *cF64 = ConstantFP::get(F64Ty, CFP->getValueAPF().convertToDouble());
+        return ConstantVector::get({cF64, cF64});
+      }
       float fval = (float)CFP->getValueAPF().convertToDouble();
       Constant *cF32 = ConstantFP::get(F32Ty, fval);
       return ConstantVector::get({cF32, cF32});
     }
-    Value *truncI = markInternal(IRB.CreateFPTrunc(v, F32Ty, "d2f"));
-    Value *undefVec = UndefValue::get(V2F32Ty);
-    Value *vec0 = markInternal(IRB.CreateInsertElement(undefVec, truncI, ConstantInt::get(I32Ty, 0)));
-    Value *vec1 = markInternal(IRB.CreateInsertElement(vec0, truncI, ConstantInt::get(I32Ty, 1), "approx.v2f32"));
+    Value *lane = (AtftSimdF64 && useSIMD)
+                      ? v
+                      : markInternal(IRB.CreateFPTrunc(v, F32Ty, "d2f"));
+    Value *undefVec = UndefValue::get(ReplicaVecTy);
+    Value *vec0 = markInternal(IRB.CreateInsertElement(undefVec, lane, ConstantInt::get(I32Ty, 0)));
+    Value *vec1 = markInternal(IRB.CreateInsertElement(
+        vec0, lane, ConstantInt::get(I32Ty, 1),
+        (AtftSimdF64 && useSIMD) ? "approx.v2f64" : "approx.v2f32"));
     return vec1;
   };
 
@@ -2428,6 +2661,16 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
     }
     if (usedBySelected) {
       IRBuilder<> IRB(LD->getNextNode());
+      // 计量旋钮：单次 Load + broadcast 填满两条 f64 车道，省掉第二次 Load 与两个指针屏障。
+      // 两条车道共享同一个 Load 值 => Load/访存故障共模、检不出；寄存器级故障仍逐车道可检。
+      if (AtftSimdBcast && AtftSimdF64 && useSIMD) {
+        Value *uVec = UndefValue::get(ReplicaVecTy);
+        Value *v0 = markInternal(IRB.CreateInsertElement(uVec, LD, ConstantInt::get(I32Ty, 0)));
+        Value *v1 = markInternal(IRB.CreateInsertElement(
+            v0, LD, ConstantInt::get(I32Ty, 1), "ld.bcast.v2f64"));
+        simdApproxMap[LD] = v1;
+        continue;
+      }
       Value *ptr = LD->getPointerOperand();
       InlineAsm *ptrBar = InlineAsm::get(
           FunctionType::get(ptr->getType(), {ptr->getType()}, false), "", "=r,0", true);
@@ -2437,18 +2680,26 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
       LoadInst *ld2 = IRB.CreateLoad(F64Ty, p2, LD->getName() + ".ld.a2");
       markReplica(ld1);
       markReplica(ld2);
-      Value *f1 = markInternal(IRB.CreateFPTrunc(ld1, F32Ty, "ld1.f32"));
-      Value *f2 = markInternal(IRB.CreateFPTrunc(ld2, F32Ty, "ld2.f32"));
-      Value *uVec = UndefValue::get(V2F32Ty);
+      Value *f1 = (AtftSimdF64 && useSIMD)
+                      ? static_cast<Value *>(ld1)
+                      : markInternal(IRB.CreateFPTrunc(ld1, F32Ty, "ld1.f32"));
+      Value *f2 = (AtftSimdF64 && useSIMD)
+                      ? static_cast<Value *>(ld2)
+                      : markInternal(IRB.CreateFPTrunc(ld2, F32Ty, "ld2.f32"));
+      Value *uVec = UndefValue::get(ReplicaVecTy);
       Value *v0 = markInternal(IRB.CreateInsertElement(uVec, f1, ConstantInt::get(I32Ty, 0)));
-      Value *v1 = markInternal(IRB.CreateInsertElement(v0, f2, ConstantInt::get(I32Ty, 1), "ld.v2f32"));
+      Value *v1 = markInternal(IRB.CreateInsertElement(
+          v0, f2, ConstantInt::get(I32Ty, 1),
+          (AtftSimdF64 && useSIMD) ? "ld.v2f64" : "ld.v2f32"));
       simdApproxMap[LD] = v1;
     }
   }
 
   for (PHINode *PN : phiNodes) {
     IRBuilder<> IRB(PN);
-    PHINode *vPhi = IRB.CreatePHI(V2F32Ty, PN->getNumIncomingValues(), PN->getName() + ".v2f32_phi");
+    PHINode *vPhi = IRB.CreatePHI(
+        ReplicaVecTy, PN->getNumIncomingValues(),
+        PN->getName() + ((AtftSimdF64 && useSIMD) ? ".v2f64_phi" : ".v2f32_phi"));
     simdApproxMap[PN] = vPhi;
   }
 
@@ -2469,34 +2720,52 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
     if (auto *CI = dyn_cast<CallInst>(inst)) {
       Value *arg0 = CI->getArgOperand(0);
       Value *vArg = getOrCreateApproxVec(arg0, IRB);
-      Value *argF32_1 = markInternal(IRB.CreateExtractElement(vArg, ConstantInt::get(I32Ty, 0), "math.a1.arg"));
-      Value *argF32_2 = markInternal(IRB.CreateExtractElement(vArg, ConstantInt::get(I32Ty, 1), "math.a2.arg"));
-      StringRef cname = CI->getCalledFunction()->getName();
-
+      Value *arg1 = markInternal(IRB.CreateExtractElement(
+          vArg, ConstantInt::get(I32Ty, 0), "math.a1.arg"));
+      Value *arg2 = markInternal(IRB.CreateExtractElement(
+          vArg, ConstantInt::get(I32Ty, 1), "math.a2.arg"));
       Value *res1 = nullptr;
       Value *res2 = nullptr;
-      if (cname.contains("sin")) {
-        res1 = IRB.CreateCall(ApproxSinFn, {argF32_1}, "approx.sin1");
-        res2 = IRB.CreateCall(ApproxSinFn, {argF32_2}, "approx.sin2");
-      } else if (cname.contains("cos")) {
-        res1 = IRB.CreateCall(ApproxCosFn, {argF32_1}, "approx.cos1");
-        res2 = IRB.CreateCall(ApproxCosFn, {argF32_2}, "approx.cos2");
-      } else if (cname.contains("exp")) {
-        res1 = IRB.CreateCall(ApproxExpFn, {argF32_1}, "approx.exp1");
-        res2 = IRB.CreateCall(ApproxExpFn, {argF32_2}, "approx.exp2");
-      } else if (cname.contains("log")) {
-        FunctionCallee LogF32 = M->getOrInsertFunction("logf", F32Ty, F32Ty);
-        res1 = IRB.CreateCall(LogF32, {argF32_1}, "approx.log1");
-        res2 = IRB.CreateCall(LogF32, {argF32_2}, "approx.log2");
+      if (AtftSimdF64 && useSIMD) {
+        CallInst *c1 = cast<CallInst>(CI->clone());
+        c1->setArgOperand(0, arg1);
+        IRB.Insert(c1, "exact.simd.call1");
+        markReplica(c1);
+        CallInst *c2 = cast<CallInst>(CI->clone());
+        c2->setArgOperand(0, arg2);
+        IRB.Insert(c2, "exact.simd.call2");
+        markReplica(c2);
+        res1 = c1;
+        res2 = c2;
       } else {
-        FunctionCallee SqrtF32 = M->getOrInsertFunction("sqrtf", F32Ty, F32Ty);
-        res1 = IRB.CreateCall(SqrtF32, {argF32_1}, "approx.sqrt1");
-        res2 = IRB.CreateCall(SqrtF32, {argF32_2}, "approx.sqrt2");
+        Value *argF32_1 = arg1;
+        Value *argF32_2 = arg2;
+        StringRef cname = CI->getCalledFunction()->getName();
+        if (cname.contains("sin")) {
+          res1 = IRB.CreateCall(ApproxSinFn, {argF32_1}, "approx.sin1");
+          res2 = IRB.CreateCall(ApproxSinFn, {argF32_2}, "approx.sin2");
+        } else if (cname.contains("cos")) {
+          res1 = IRB.CreateCall(ApproxCosFn, {argF32_1}, "approx.cos1");
+          res2 = IRB.CreateCall(ApproxCosFn, {argF32_2}, "approx.cos2");
+        } else if (cname.contains("exp")) {
+          res1 = IRB.CreateCall(ApproxExpFn, {argF32_1}, "approx.exp1");
+          res2 = IRB.CreateCall(ApproxExpFn, {argF32_2}, "approx.exp2");
+        } else if (cname.contains("log")) {
+          FunctionCallee LogF32 = M->getOrInsertFunction("logf", F32Ty, F32Ty);
+          res1 = IRB.CreateCall(LogF32, {argF32_1}, "approx.log1");
+          res2 = IRB.CreateCall(LogF32, {argF32_2}, "approx.log2");
+        } else {
+          FunctionCallee SqrtF32 = M->getOrInsertFunction("sqrtf", F32Ty, F32Ty);
+          res1 = IRB.CreateCall(SqrtF32, {argF32_1}, "approx.sqrt1");
+          res2 = IRB.CreateCall(SqrtF32, {argF32_2}, "approx.sqrt2");
+        }
       }
 
-      Value *undefVec = UndefValue::get(V2F32Ty);
-      Value *vec0 = markInternal(IRB.CreateInsertElement(undefVec, res1, ConstantInt::get(I32Ty, 0)));
-      Value *vec1 = markInternal(IRB.CreateInsertElement(vec0, res2, ConstantInt::get(I32Ty, 1)));
+      Value *undefVec = UndefValue::get(ReplicaVecTy);
+      Value *vec0 = markInternal(IRB.CreateInsertElement(
+          undefVec, res1, ConstantInt::get(I32Ty, 0)));
+      Value *vec1 = markInternal(IRB.CreateInsertElement(
+          vec0, res2, ConstantInt::get(I32Ty, 1)));
       if (isProtectionBoundary && !pureApproxOutput && budget < 0.999) {
         Value *boundaryVoted = createInlineFastApproxVote(IRB, M, CI, vec1, delta * 2.0);
         CI->replaceUsesWithIf(boundaryVoted, [&](Use &U) {
@@ -2542,7 +2811,7 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
         markReplica(b_a2);
         Value *r_a1 = insertZeroCostCSEBarrier(IRB, b_a1);
         Value *r_a2 = insertZeroCostCSEBarrier(IRB, b_a2);
-        Value *uVec = UndefValue::get(V2F32Ty);
+        Value *uVec = UndefValue::get(ReplicaVecTy);
         Value *t0 = markInternal(IRB.CreateInsertElement(uVec, r_a1, ConstantInt::get(I32Ty, 0)));
         Value *t1 = markInternal(IRB.CreateInsertElement(t0, r_a2, ConstantInt::get(I32Ty, 1)));
         vRes = t1;
@@ -2596,8 +2865,11 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
     if (simdApproxMap.count(val)) {
       IRBuilder<> IRB(SI);
       Value *vApprox = simdApproxMap[val];
-      Value *a1_f32 = IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 0), "a1.f32");
-      Value *a1_f64 = IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64");
+      Value *a1_f32 = IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 0),
+                                               (AtftSimdF64 && useSIMD) ? "a1.f64" : "a1.f32");
+      Value *a1_f64 = (AtftSimdF64 && useSIMD)
+                          ? a1_f32
+                          : IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64");
 
       if (pureApproxOutput) {
         SI->setOperand(0, a1_f64);
@@ -2610,8 +2882,12 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
           }
           return V;
         };
-        Value *a2_f32 = markVoterInternal(IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 1), "a2.f32"));
-        Value *a2_f64 = markVoterInternal(IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64"));
+        Value *a2_f32 = markVoterInternal(IRB.CreateExtractElement(
+            vApprox, ConstantInt::get(I32Ty, 1),
+            (AtftSimdF64 && useSIMD) ? "a2.f64" : "a2.f32"));
+        Value *a2_f64 = (AtftSimdF64 && useSIMD)
+                            ? a2_f32
+                            : markVoterInternal(IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64"));
         markVoterInternal(a1_f32);
         markVoterInternal(a1_f64);
         Function *FabsF64 = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F64Ty});
@@ -2643,7 +2919,7 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
         Value *diffRA1 = markVoterInternal(IRB.CreateCall(FabsF64, {subRA1}));
         Value *rIsOk = markVoterInternal(IRB.CreateFCmpOLE(diffRA1, effDelta, "r.ok"));
         Value *a12Ok = nullptr;
-        if (AtftReplicaExact) {
+        if (AtftReplicaExact || (AtftSimdF64 && useSIMD)) {
           a12Ok = markVoterInternal(IRB.CreateFCmpOEQ(a1_f32, a2_f32, "a12.ok"));
         } else {
           Value *subA12 = markVoterInternal(IRB.CreateFSub(a1_f32, a2_f32));
@@ -2703,8 +2979,12 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
         mergedVal->addIncoming(coldVoted, ColdBB);
         SI->setOperand(0, mergedVal);
       } else {
-        Value *a2_f32 = IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 1), "a2.f32");
-        Value *a2_f64 = IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64");
+        Value *a2_f32 = IRB.CreateExtractElement(
+            vApprox, ConstantInt::get(I32Ty, 1),
+            (AtftSimdF64 && useSIMD) ? "a2.f64" : "a2.f32");
+        Value *a2_f64 = (AtftSimdF64 && useSIMD)
+                            ? a2_f32
+                            : IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64");
 
         Value *voted = IRB.CreateCall(
             VoterApproxFn,
@@ -2796,6 +3076,465 @@ void transformFunctionAdaptiveMultiVersion(Function &F, FunctionAnalysisManager 
   else LowBuilder.CreateRet(lowCall);
 }
 
+static uint64_t atftFNV1a(StringRef text, uint64_t hash = 1469598103934665603ULL) {
+  for (unsigned char c : text) {
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+static std::string atftCsvField(const std::string &value) {
+  if (value.find_first_of(",\"\n") == std::string::npos) return value;
+  std::string escaped = "\"";
+  for (char c : value) {
+    if (c == '\"') escaped += '\"';
+    escaped += c;
+  }
+  escaped += '\"';
+  return escaped;
+}
+
+static std::string atftCandidateClass(Instruction *I) {
+  if (isTargetFP64Op(I) || isTargetMathCall(I)) return "fp64";
+  if (isa<ICmpInst>(I)) return "control";
+  if (isReplicableIntInst(I)) return "integer";
+  return "";
+}
+
+static uint64_t computeAtftIRFingerprint(ArrayRef<Function *> targetFuncs) {
+  uint64_t irFingerprint = 1469598103934665603ULL;
+  for (Function *F : targetFuncs) {
+    unsigned bbIndex = 0;
+    for (BasicBlock &BB : *F) {
+      unsigned instIndex = 0;
+      for (Instruction &I : BB) {
+        std::string token = F->getName().str() + "|" + std::to_string(bbIndex) +
+                            "|" + std::to_string(instIndex) + "|" +
+                            I.getOpcodeName() + "|" +
+                            std::to_string((unsigned)I.getType()->getTypeID());
+        irFingerprint = atftFNV1a(token, irFingerprint);
+        ++instIndex;
+      }
+      ++bbIndex;
+    }
+  }
+  return irFingerprint;
+}
+
+static void assignAtftSiteIds(ArrayRef<Function *> targetFuncs) {
+  g_atftSiteIds.clear();
+  g_atftSiteKeys.clear();
+  for (Function *F : targetFuncs) {
+    unsigned bbIndex = 0;
+    for (BasicBlock &BB : *F) {
+      std::string bbName = BB.hasName() ? BB.getName().str()
+                                        : ("bb" + std::to_string(bbIndex));
+      unsigned instIndex = 0;
+      for (Instruction &I : BB) {
+        std::string candidateClass = atftCandidateClass(&I);
+        if (candidateClass.empty()) {
+          ++instIndex;
+          continue;
+        }
+        std::string siteKey = F->getName().str() + "|" + bbName + "|" +
+                              std::to_string(bbIndex) + "|" +
+                              std::to_string(instIndex) + "|" +
+                              I.getOpcodeName() + "|" + candidateClass;
+        g_atftSiteIds[&I] = atftFNV1a(siteKey);
+        g_atftSiteKeys[&I] = siteKey;
+        I.setMetadata("atft.site.key",
+                      MDNode::get(F->getContext(), MDString::get(F->getContext(), siteKey)));
+        ++instIndex;
+      }
+      ++bbIndex;
+    }
+  }
+}
+
+static std::vector<std::string> splitAtftCsv(const std::string &line) {
+  std::vector<std::string> fields;
+  std::string field;
+  bool quoted = false;
+  for (size_t i = 0; i < line.size(); ++i) {
+    char c = line[i];
+    if (c == '\"') {
+      if (quoted && i + 1 < line.size() && line[i + 1] == '\"') {
+        field += '\"';
+        ++i;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (c == ',' && !quoted) {
+      fields.push_back(field);
+      field.clear();
+    } else {
+      field += c;
+    }
+  }
+  fields.push_back(field);
+  return fields;
+}
+
+static void loadAtftProfile(ArrayRef<Function *> targetFuncs, StringRef path) {
+  std::ifstream in(path.str());
+  if (!in.is_open())
+    report_fatal_error("cannot open -atft-profile");
+
+  std::string line;
+  if (!std::getline(in, line))
+    report_fatal_error("empty -atft-profile");
+  auto header = splitAtftCsv(line);
+  if (header.size() < 10 || header[0] != "site_id" ||
+      header[5] != "dynamic_count_proxy" || header[9] != "boundary_sensitivity")
+    report_fatal_error("invalid selective protection profile header");
+
+  uint64_t fingerprint = computeAtftIRFingerprint(targetFuncs);
+  g_atftProfile.clear();
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    auto fields = splitAtftCsv(line);
+    if (fields.size() < 10)
+      report_fatal_error("malformed selective protection profile row");
+    uint64_t siteId = 0;
+    uint64_t rowFingerprint = 0;
+    double cost = 0.0;
+    double boundary = 0.0;
+    double riskPrior = 1.0;
+    try {
+      siteId = std::stoull(fields[0]);
+      rowFingerprint = std::stoull(fields[2]);
+      cost = std::stod(fields[5]);
+      boundary = std::stod(fields[9]);
+      if (fields.size() > 10) riskPrior = std::stod(fields[10]);
+    } catch (const std::exception &) {
+      report_fatal_error("invalid numeric field in selective protection profile");
+    }
+    if (rowFingerprint != fingerprint)
+      report_fatal_error("selective protection profile IR fingerprint mismatch");
+    if (!(cost > 0.0) || !std::isfinite(cost) || boundary < 0.0 ||
+        !std::isfinite(boundary) || !(riskPrior > 0.0) ||
+        !std::isfinite(riskPrior))
+      report_fatal_error("invalid cost, boundary, or risk prior in selective protection profile");
+    if (!g_atftProfile.emplace(siteId, AtftProfileEntry{cost, boundary, riskPrior, fields[3]}).second)
+      report_fatal_error("duplicate site_id in selective protection profile");
+  }
+  g_atftProfileLoaded = true;
+  errs() << "ATFT_PROFILE," << path << ",sites=" << g_atftProfile.size()
+         << ",ir_fingerprint=" << fingerprint << "\n";
+}
+
+static void loadAtftFrontierSelection(ArrayRef<Function *> targetFuncs,
+                                         StringRef path) {
+  std::ifstream in(path.str());
+  if (!in.is_open()) report_fatal_error("cannot open -atft-frontier-selection");
+
+  std::string line;
+  if (!std::getline(in, line)) report_fatal_error("empty -atft-frontier-selection");
+  auto header = splitAtftCsv(line);
+  auto column = [&](StringRef name) -> int {
+    for (size_t i = 0; i < header.size(); ++i)
+      if (header[i] == name) return (int)i;
+    return -1;
+  };
+  int fingerprintCol = column("ir_fingerprint");
+  int selectedCol = column("selected");
+  int membersCol = column("member_site_ids");
+  if (fingerprintCol < 0 || selectedCol < 0 || membersCol < 0)
+    report_fatal_error("invalid frontier selection header");
+
+  const uint64_t fingerprint = computeAtftIRFingerprint(targetFuncs);
+  g_atftFrontierSelectedSites.clear();
+  size_t selectedFrontiers = 0;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    auto fields = splitAtftCsv(line);
+    if ((size_t)std::max({fingerprintCol, selectedCol, membersCol}) >= fields.size())
+      report_fatal_error("malformed frontier selection row");
+    try {
+      if (std::stoull(fields[fingerprintCol]) != fingerprint)
+        report_fatal_error("frontier selection IR fingerprint mismatch");
+    } catch (const std::exception &) {
+      report_fatal_error("invalid frontier selection fingerprint");
+    }
+    if (fields[selectedCol] != "1") continue;
+    ++selectedFrontiers;
+    std::stringstream members(fields[membersCol]);
+    std::string member;
+    while (std::getline(members, member, ';')) {
+      if (member.empty()) continue;
+      try {
+        g_atftFrontierSelectedSites.insert(std::stoull(member));
+      } catch (const std::exception &) {
+        report_fatal_error("invalid frontier member site ID");
+      }
+    }
+  }
+  errs() << "ATFT_FRONTIER_SELECTION," << path
+         << ",frontiers=" << selectedFrontiers
+         << ",sites=" << g_atftFrontierSelectedSites.size()
+         << ",ir_fingerprint=" << fingerprint << "\n";
+}
+
+static void writeAtftSelectionFile(StringRef path) {
+  if (path.empty()) return;
+  std::ofstream out(path.str());
+  if (!out.is_open()) {
+    errs() << "ATFT_SELECTION_ERROR," << path << "\n";
+    return;
+  }
+  out << "site_id,site_key,class,dynamic_cost,boundary_sensitivity,risk,benefit,selected,budget_mode\n";
+  for (const std::string &row : g_atftSelectionRows) out << row << "\n";
+  errs() << "ATFT_SELECTION," << path << ",rows=" << g_atftSelectionRows.size()
+         << ",missing_profile_sites=" << g_atftProfileMissing << "\n";
+}
+
+static void writeAtftFrontierManifest(
+    ArrayRef<Function *> targetFuncs,
+    FunctionAnalysisManager &FAM,
+    StringRef path) {
+  std::ofstream out(path.str());
+  if (!out.is_open()) {
+    errs() << "ATFT_FRONTIER_MANIFEST_ERROR," << path << "\n";
+    return;
+  }
+
+  const unsigned kMaxPathDepth = 16;
+  const uint64_t irFingerprint = computeAtftIRFingerprint(targetFuncs);
+  std::set<uint64_t> emitted;
+  std::map<uint64_t, std::string> seen;
+
+  out << "frontier_id,ir_fingerprint,function,source_site_id,source_site_key,"
+         "source_class,sink_kind,sink_site_id,sink_key,member_count,member_site_ids,"
+         "path_depth,static_cost_proxy,closure_complete,match_status\n";
+
+  for (Function *F : targetFuncs) {
+    auto &LI = FAM.getResult<LoopAnalysis>(*F);
+    auto instructionKey = [&](const Instruction *I, StringRef role) {
+      unsigned bbIndex = 0;
+      for (const BasicBlock &BB : *F) {
+        unsigned instIndex = 0;
+        for (const Instruction &Candidate : BB) {
+          if (&Candidate == I) {
+            std::string className = atftCandidateClass(const_cast<Instruction *>(I));
+            if (className.empty()) className = role.str();
+            return F->getName().str() + "|bb" + std::to_string(bbIndex) + "|" +
+                   std::to_string(instIndex) + "|" + I->getOpcodeName() + "|" +
+                   className;
+          }
+          ++instIndex;
+        }
+        ++bbIndex;
+      }
+      return F->getName().str() + "|unknown|" + I->getOpcodeName() + "|" + role.str();
+    };
+
+    auto sinkKind = [&](const Instruction *from, const Instruction *user) {
+      if (isa<BranchInst>(user) || isa<SelectInst>(user) || isa<SwitchInst>(user))
+        return std::string("branch");
+      if (const auto *SI = dyn_cast<StoreInst>(user)) {
+        if (SI->getPointerOperand() == from) return std::string("address");
+        if (SI->getValueOperand() == from) return std::string("store");
+      }
+      if (isa<GetElementPtrInst>(user)) return std::string("address");
+      if (isa<CallBase>(user)) return std::string("call");
+      if (isa<ReturnInst>(user)) return std::string("return");
+      if (const auto *PN = dyn_cast<PHINode>(user)) {
+        Loop *userLoop = LI.getLoopFor(PN->getParent());
+        Loop *fromLoop = LI.getLoopFor(from->getParent());
+        if (userLoop && fromLoop && fromLoop->contains(PN->getParent()))
+          return std::string("feedback");
+      }
+      return std::string();
+    };
+
+    std::vector<Instruction *> sources;
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+        if (!atftCandidateClass(&I).empty()) sources.push_back(&I);
+      }
+    }
+
+    for (Instruction *source : sources) {
+      std::map<const Instruction *, const Instruction *> parent;
+      std::map<const Instruction *, unsigned> depth;
+      std::queue<const Instruction *> queue;
+      parent[source] = nullptr;
+      depth[source] = 0;
+      queue.push(source);
+
+      while (!queue.empty()) {
+        const Instruction *current = queue.front();
+        queue.pop();
+        unsigned currentDepth = depth[current];
+        if (currentDepth >= kMaxPathDepth) continue;
+
+        for (const User *U : current->users()) {
+          const auto *user = dyn_cast<Instruction>(U);
+          if (!user || parent.count(user)) continue;
+          parent[user] = current;
+          depth[user] = currentDepth + 1;
+
+          std::string kind = sinkKind(current, user);
+          if (kind.empty()) {
+            queue.push(user);
+            continue;
+          }
+
+          std::vector<const Instruction *> members;
+          for (const Instruction *I = user; I; I = parent[I]) members.push_back(I);
+          std::reverse(members.begin(), members.end());
+          std::set<const Instruction *> uniqueMembers(members.begin(), members.end());
+
+          std::vector<uint64_t> memberSiteIds;
+          double staticCost = 0.0;
+          for (const Instruction *I : uniqueMembers) {
+            auto siteIt = g_atftSiteIds.find(I);
+            if (siteIt != g_atftSiteIds.end()) memberSiteIds.push_back(siteIt->second);
+            unsigned loopDepth = LI.getLoopDepth(I->getParent());
+            staticCost += std::pow(10.0, (double)std::min(loopDepth, 6U));
+          }
+          std::sort(memberSiteIds.begin(), memberSiteIds.end());
+
+          const std::string sourceKey = g_atftSiteKeys.count(source)
+                                            ? g_atftSiteKeys.at(source)
+                                            : instructionKey(source, "source");
+          const std::string sinkKey = g_atftSiteKeys.count(user)
+                                          ? g_atftSiteKeys.at(user)
+                                          : instructionKey(user, "sink");
+          std::string token = sourceKey + "|" + kind + "|" + sinkKey + "|";
+          for (uint64_t id : memberSiteIds) token += std::to_string(id) + ";";
+          uint64_t frontierId = atftFNV1a(token);
+          std::string matchStatus = "ok";
+          auto prior = seen.find(frontierId);
+          if (prior != seen.end() && prior->second != token) {
+            matchStatus = "hash_collision";
+          } else {
+            seen.emplace(frontierId, token);
+          }
+          if (!emitted.insert(frontierId).second) continue;
+
+          std::string ids;
+          for (size_t i = 0; i < memberSiteIds.size(); ++i) {
+            if (i) ids += ";";
+            ids += std::to_string(memberSiteIds[i]);
+          }
+          out << frontierId << "," << irFingerprint << ","
+              << atftCsvField(F->getName().str()) << ","
+              << (g_atftSiteIds.count(source) ? g_atftSiteIds.at(source) : 0) << ","
+              << atftCsvField(sourceKey) << ","
+              << atftCandidateClass(source) << "," << kind << ","
+              << (g_atftSiteIds.count(user) ? g_atftSiteIds.at(user) : 0) << ","
+              << atftCsvField(sinkKey) << "," << uniqueMembers.size() << ","
+              << atftCsvField(ids) << "," << depth[user] << "," << staticCost
+              << ",1," << matchStatus << "\n";
+        }
+      }
+    }
+  }
+
+  errs() << "ATFT_FRONTIER_MANIFEST," << path << ",frontiers=" << emitted.size()
+         << ",ir_fingerprint=" << irFingerprint << "\n";
+}
+
+static void writeAtftSiteManifest(Module &M,
+                                   ArrayRef<Function *> targetFuncs,
+                                   FunctionAnalysisManager &FAM,
+                                   StringRef path) {
+  std::ofstream out(path.str());
+  if (!out.is_open()) {
+    errs() << "ATFT_SITE_MANIFEST_ERROR," << path << "\n";
+    return;
+  }
+
+  assignAtftSiteIds(targetFuncs);
+  uint64_t irFingerprint = computeAtftIRFingerprint(targetFuncs);
+
+  out << "site_id,site_key,ir_fingerprint,function,basic_block,bb_index,inst_index,"
+         "opcode,class,loop_depth,fanout,cross_bb_uses,feeds_branch,feeds_store,"
+         "feeds_store_addr,feeds_call,feeds_gep,recurrent_feedback,boundary_sensitivity,"
+         "match_status\n";
+
+  std::map<uint64_t, std::string> seen;
+  for (Function *F : targetFuncs) {
+    auto &LI = FAM.getResult<LoopAnalysis>(*F);
+    unsigned bbIndex = 0;
+    for (BasicBlock &BB : *F) {
+      std::string bbName = BB.hasName() ? BB.getName().str()
+                                        : ("bb" + std::to_string(bbIndex));
+      unsigned instIndex = 0;
+      for (Instruction &I : BB) {
+        std::string candidateClass = atftCandidateClass(&I);
+        if (candidateClass.empty()) {
+          ++instIndex;
+          continue;
+        }
+
+        unsigned fanout = I.getNumUses();
+        unsigned crossBBUses = 0;
+        bool feedsBranch = false;
+        bool feedsStore = false;
+        bool feedsStoreAddr = false;
+        bool feedsCall = false;
+        bool feedsGEP = false;
+        bool recurrentFeedback = false;
+
+        for (const User *U : I.users()) {
+          const auto *UI = dyn_cast<Instruction>(U);
+          if (!UI) continue;
+          if (UI->getParent() != &BB) ++crossBBUses;
+          if (isa<BranchInst>(UI) || isa<SwitchInst>(UI)) feedsBranch = true;
+          if (const auto *SI = dyn_cast<StoreInst>(UI)) {
+            if (SI->getValueOperand() == &I) feedsStore = true;
+            if (SI->getPointerOperand() == &I) feedsStoreAddr = true;
+          }
+          if (isa<CallBase>(UI)) feedsCall = true;
+          if (isa<GetElementPtrInst>(UI)) feedsGEP = true;
+          if (const auto *PN = dyn_cast<PHINode>(UI)) {
+            Loop *userLoop = LI.getLoopFor(PN->getParent());
+            Loop *instLoop = LI.getLoopFor(&BB);
+            if (userLoop && instLoop && instLoop->contains(PN->getParent()))
+              recurrentFeedback = true;
+          }
+        }
+
+        std::string siteKey = F->getName().str() + "|" + bbName + "|" +
+                              std::to_string(bbIndex) + "|" +
+                              std::to_string(instIndex) + "|" +
+                              I.getOpcodeName() + "|" + candidateClass;
+        uint64_t siteId = atftFNV1a(siteKey);
+        std::string matchStatus = "ok";
+        auto prior = seen.find(siteId);
+        if (prior != seen.end() && prior->second != siteKey)
+          matchStatus = "hash_collision";
+        else
+          seen.emplace(siteId, siteKey);
+
+        double boundarySensitivity =
+            (feedsBranch ? 4.0 : 0.0) + (feedsStore ? 4.0 : 0.0) +
+            (feedsStoreAddr ? 5.0 : 0.0) + (feedsCall ? 3.0 : 0.0) +
+            (feedsGEP ? 5.0 : 0.0) + 0.5 * (double)crossBBUses +
+            (recurrentFeedback ? 2.0 : 0.0);
+
+        out << siteId << "," << atftCsvField(siteKey) << "," << irFingerprint
+            << "," << atftCsvField(F->getName().str()) << ","
+            << atftCsvField(bbName) << "," << bbIndex << "," << instIndex << ","
+            << I.getOpcodeName() << "," << candidateClass << ","
+            << LI.getLoopDepth(&BB) << "," << fanout << "," << crossBBUses << ","
+            << (feedsBranch ? 1 : 0) << "," << (feedsStore ? 1 : 0) << ","
+            << (feedsStoreAddr ? 1 : 0) << "," << (feedsCall ? 1 : 0) << ","
+            << (feedsGEP ? 1 : 0) << "," << (recurrentFeedback ? 1 : 0) << ","
+            << boundarySensitivity << "," << matchStatus << "\n";
+        ++instIndex;
+      }
+      ++bbIndex;
+    }
+  }
+
+  errs() << "ATFT_SITE_MANIFEST," << path << ",sites=" << seen.size()
+         << ",ir_fingerprint=" << irFingerprint << "\n";
+}
+
 class AdaptiveFTModulePass : public PassInfoMixin<AdaptiveFTModulePass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
@@ -2846,6 +3585,29 @@ public:
     // 按 Module 内顺序输出，保证变换顺序可复现
     for (Function &F : M) {
       if (inClosure.count(&F)) targetFuncs.push_back(&F);
+    }
+
+    if (!AtftSiteManifestFile.empty() || !AtftFrontierManifestFile.empty() ||
+        AtftBudgetMode != "count") {
+      for (Function *F : targetFuncs) expandFMulAddIntrinsics(*F);
+    }
+    assignAtftSiteIds(targetFuncs);
+    if (!AtftFrontierManifestFile.empty())
+      writeAtftFrontierManifest(targetFuncs, FAM, AtftFrontierManifestFile);
+    if (AtftBudgetMode != "count" && AtftBudgetMode != "dynamic-cost" &&
+        AtftBudgetMode != "risk-cost" && AtftBudgetMode != "frontier")
+      report_fatal_error("invalid -atft-budget-mode");
+    if (AtftBudgetMode == "frontier") {
+      if (AtftFrontierSelectionFile.empty())
+        report_fatal_error("-atft-frontier-selection is required for frontier budget mode");
+      loadAtftFrontierSelection(targetFuncs, AtftFrontierSelectionFile);
+    } else if (AtftBudgetMode != "count") {
+      if (AtftProfileFile.empty())
+        report_fatal_error("-atft-profile is required for non-count budget mode");
+      loadAtftProfile(targetFuncs, AtftProfileFile);
+    }
+    if (!AtftSiteManifestFile.empty()) {
+      writeAtftSiteManifest(M, targetFuncs, FAM, AtftSiteManifestFile);
     }
 
     std::vector<FuncCriticalityInfo> critReports;
@@ -2929,9 +3691,14 @@ public:
       }
       if (AtftCmpTMR) {
         unsigned nProtected = 0;
-        for (Function *F : targetFuncs) transformFunctionCmpTMR(*F, &nProtected);
+        double controlBudget = AtftControlBudget >= 0.0
+                                   ? AtftControlBudget
+                                   : AtftBudget;
+        for (Function *F : targetFuncs)
+          transformFunctionCmpTMR(*F, &nProtected, controlBudget, AtftRankMethod);
         errs() << "ATFT_CMP_TMR_SITES," << nProtected << "\n";
       }
+      writeAtftSelectionFile(AtftSelectionFile);
       return PreservedAnalyses::none();
     }
 
@@ -2990,12 +3757,16 @@ public:
           // 分层互斥同样适用于控制平面：代数校验已把 cmp_branch 的 SDC 清零
           // （gemm 18.0 -> 0.00、2mm 40.5 -> 0.00，六类别实测），再三模是重复付费。
           if (AtftLayerExclusive && g_abftInserted.count(&F)) continue;
-          transformFunctionCmpTMR(F, &nProtected);
+          double controlBudget = AtftControlBudget >= 0.0
+                                     ? AtftControlBudget
+                                     : AtftBudget;
+          transformFunctionCmpTMR(F, &nProtected, controlBudget, AtftRankMethod);
         }
       }
       errs() << "ATFT_CMP_TMR_SITES," << nProtected << "\n";
     }
 
+    writeAtftSelectionFile(AtftSelectionFile);
     return PreservedAnalyses::none();
   }
 };

@@ -83,7 +83,16 @@ PASS_FI_SO = BUILD_DIR / "libFaultInjectorPass.so"
 LIB_ATFT_RT = BUILD_DIR / "libatft_rt.a"
 LIB_HARNESS_RT = BUILD_DIR / "libharness_rt.a"
 
-CFLAGS = ["-O2", "-fno-unroll-loops", "-fno-vectorize", "-fno-slp-vectorize"]
+CFLAGS = ["-O3", "-march=native"]
+
+# 规范评测子集：12 个代表性 HPC 内核。eval_suite 启动时读取 ATFT_BENCH_SUBSET
+# （逗号分隔的 benchmark name），只在 --fi-one / --pmu-perf 的运行循环里跳过不在
+# 列表中的负载；--list-benchmarks 仍列全部 37 个。用户显式设置该环境变量时以其为准。
+ATFT_CANONICAL_SUBSET = (
+    "pb_gemm,pb_2mm,pb_3mm,pb_cholesky,pb_lu,pb_jacobi2d,pb_heat3d,"
+    "pb_seidel2d,pb_covariance,pb_floyd_warshall,pb_nussinov,obpmark_image_proc"
+)
+os.environ.setdefault("ATFT_BENCH_SUBSET", ATFT_CANONICAL_SUBSET)
 
 # 被测负载的头文件搜索路径：新增一个上游套件只需在这里加一行
 BENCH_INCLUDE_DIRS = [
@@ -272,7 +281,7 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
                                 fi_trials=600, dump_golden=False, run_fi=True,
                                 fi_target_type="fp64", arch="x86_64",
                                 static_sites_out=None, pass_flags=None,
-                                env_extra=None, fi_flags=None):
+                                env_extra=None, fi_flags=None, fi_site_map_out=None):
     sut_ll = BUILD_DIR / f"sut_{tag}.ll"
     sut_bin = BUILD_DIR / f"bin_{tag}_{arch}"
 
@@ -347,11 +356,26 @@ def compile_and_evaluate_policy(ssa_ll, tag, mode, rank="semantic", budget=1.0,
             *(fi_flags or []),
             "-S", str(sut_ll), "-o", str(sut_fi_ll)
         ], want_stderr=True)
-        if static_sites_out is not None:
-            for line in fi_stderr.splitlines():
-                if line.startswith("FI_STATIC_SITES,"):
-                    _, cat, cnt = line.split(",")
-                    static_sites_out[cat] = int(cnt)
+        for line in fi_stderr.splitlines():
+            if line.startswith("FI_STATIC_SITES,") and static_sites_out is not None:
+                _, cat, cnt = line.split(",")
+                static_sites_out[cat] = int(cnt)
+            if line.startswith("FI_SITE_MAP,") and fi_site_map_out is not None:
+                parts = line.split(",")
+                fi_site_map_out.append({
+                    "site_id": int(parts[1]),
+                    "category": parts[2],
+                    "function": parts[3],
+                    "basic_block": parts[4],
+                    "opcode": parts[5],
+                    "feeds_branch": int(parts[6]),
+                    "feeds_store": int(parts[7]),
+                    "feeds_store_addr": int(parts[8]),
+                    "feeds_call": int(parts[9]),
+                    "feeds_gep": int(parts[10]),
+                    "feeds_phi": int(parts[11]),
+                    "site_key": parts[12] if len(parts) > 12 else "",
+                })
         if arch == "riscv64":
             fi_cc_cmd = [
                 CLANG, f"--target={RISCV_TRIPLE}", "-march=rv64gc",

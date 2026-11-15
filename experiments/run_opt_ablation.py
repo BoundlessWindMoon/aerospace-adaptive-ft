@@ -36,7 +36,8 @@ OUT = ROOT / "results" / "opt"
 U_FP32 = 2.0 ** -24
 
 
-def profile_envelope(profile_scale="default", profile_variant="default", output_path=None):
+def profile_envelope(profile_scale="default", profile_variant="default", output_path=None,
+                     rank="semantic"):
     """构建剖析二进制并取每个负载的无故障近似误差包络。"""
     ssa_ll = H.build_infrastructure()
     tag = "deltaprof"
@@ -45,7 +46,7 @@ def profile_envelope(profile_scale="default", profile_variant="default", output_
     H.run_cmd([
         H.OPT, f"-load-pass-plugin={H.PASS_POLICY_SO}",
         "-passes=adaptive-ft,verify",
-        "-atft-mode=approx-simd", "-atft-rank=semantic",
+        "-atft-mode=approx-simd", f"-atft-rank={rank}",
         "-atft-budget=1.0", "-atft-delta=5e-5",
         "-atft-delta-profile",
         "-S", str(ssa_ll), "-o", str(sut_ll)
@@ -77,13 +78,14 @@ def profile_envelope(profile_scale="default", profile_variant="default", output_
     return ssa_ll, rows
 
 
-def write_delta_table(rows, alpha, kappa):
+def write_delta_table(rows, alpha, kappa, output_suffix=""):
     """delta_f = max(alpha * E_f, kappa * u_fp32)。
 
-    地板量取 fp32 单位舍入的 kappa 倍：精确 fp64 链与 f32 副本之间的分歧不可能
-    低于这个量级，所以它是由数制而非调参决定的下界。
+    地板量取 fp32 单位舍入的 kappa 倍：精确 fp64 链与 f32 近似副本之间可能出现的分歧不可能
+    低于这个量级，所以它是由数制而非调参决定的下界。输出后缀用于隔离 profile/validation
+    和不同参数网格的结果，避免覆盖已有校准表。
     """
-    path = OUT / f"delta_table_a{alpha:g}_k{kappa:g}.csv"
+    path = OUT / f"delta_table_a{alpha:g}_k{kappa:g}{output_suffix}.csv"
     with open(path, "w") as f:
         for r in rows:
             d = max(alpha * r["env_max_rel_dev"], kappa * U_FP32)
@@ -91,16 +93,22 @@ def write_delta_table(rows, alpha, kappa):
     return path
 
 
+
 # 消融矩阵：tag -> (pass_flags, env)
-def ablation_matrix(delta_table, seed=None):
+def ablation_matrix(delta_table, seed=None, pgsp_profile=None, pgsp_control_budget=None,
+                    pgsp_budget_mode="risk-cost", pgsp_frontier_selection=None):
     base = ["-atft-cmp-tmr"]
     dflags = ["-atft-delta-runtime", "-atft-replica-exact"]
     denv = {"ATFT_DELTA_TABLE": str(delta_table), "ATFT_REPLICA_EXACT": "1"}
     seed_env = {"ATFT_FI_SEED": str(seed)} if seed is not None else {}
     mk = lambda e: {**e, **seed_env}
-    return [
+    matrix = [
         # tag,                 mode,           pass_flags,       env
         ("native",             "native",       [],               mk({})),
+        # 标准 HPC 容错基线（供论文横比）：SWIFT 纯软冗余、精确 TMR、SIMD 双精确副本
+        ("swift",              "swift",        [],               mk({})),
+        ("exact-tmr",          "exact-tmr",    [],               mk({})),
+        ("simd_tmr",           "approx-simd",  ["-atft-simd-f64", "-atft-replica-exact"], mk({})),
         ("opt_base",           "approx-simd",  [],               mk({})),
         ("opt_cmptmr",         "approx-simd",  base,             mk({})),
         ("opt_delta",          "approx-simd",  dflags,           mk(denv)),
@@ -108,6 +116,14 @@ def ablation_matrix(delta_table, seed=None):
         ("native_cmptmr",      "native",       base,             mk({})),
         ("opt_intwire",        "approx-simd",  ["-atft-int-tmr-wire"], mk({})),
         ("opt_all",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire"], mk(denv)),
+        # C4：保留 FP64 精度，把两份精确副本放入 <2 x double>；不与近似向量路径混淆。
+        ("opt_simd_f64",       "approx-simd",  base + dflags + ["-atft-simd-f64"], mk(denv)),
+        ("opt_simd_f64_layered", "approx-simd", base + dflags + ["-atft-simd-f64",
+                                                                  "-atft-int-tmr-wire",
+                                                                  "-atft-int-tmr-i64",
+                                                                  "-atft-abft-insert",
+                                                                  "-atft-layer-exclusive"],
+                                                mk({**denv, "ATFT_ABFT": "1"})),
         ("opt_bnd",            "approx-simd",  base + dflags + ["-atft-int-tmr-boundary"], mk(denv)),
         ("opt_bnd_only",       "approx-simd",  ["-atft-int-tmr-boundary"], mk({})),
         # 代数校验层：零指令冗余，只跑等价饱和合成出的 O(n^2) 校验式
@@ -157,9 +173,29 @@ def ablation_matrix(delta_table, seed=None):
         ("opt_split",          "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-budget=1.0"], mk(denv)),
     ]
+    if pgsp_profile or pgsp_frontier_selection:
+        pgsp_flags = base + dflags + ["-atft-int-tmr-wire",
+                                      "-atft-int-tmr-i64",
+                                      "-atft-abft-insert",
+                                      "-atft-layer-exclusive",
+                                      f"-atft-budget-mode={pgsp_budget_mode}"]
+        if pgsp_budget_mode == "frontier":
+            if not pgsp_frontier_selection:
+                raise ValueError("frontier budget mode requires --pgsp-frontier-selection")
+            pgsp_flags.append(f"-atft-frontier-selection={pgsp_frontier_selection}")
+        else:
+            if not pgsp_profile:
+                raise ValueError("non-frontier PGSP mode requires --pgsp-profile")
+            pgsp_flags.append(f"-atft-profile={pgsp_profile}")
+        if pgsp_control_budget is not None:
+            pgsp_flags.append(f"-atft-control-budget={pgsp_control_budget:g}")
+        matrix.append(("opt_pgsp_risk", "approx-simd", pgsp_flags,
+                       mk({**denv, "ATFT_ABFT": "1"})))
+    return matrix
 
 
-def run_campaign(ssa_ll, matrix, categories, trials, suffix, budget=1.0, fi_flags=None):
+def run_campaign(ssa_ll, matrix, categories, trials, suffix, budget=1.0,
+                 fi_flags=None, rank="semantic"):
     pmu_all, fi_all = [], []
     native_inst = {}
     for tag, mode, pflags, penv in matrix:
@@ -167,7 +203,7 @@ def run_campaign(ssa_ll, matrix, categories, trials, suffix, budget=1.0, fi_flag
         for cat in categories:
             print(f"  -> [{tag}/{cat}] flags={' '.join(pflags) or '-'} trials={trials}")
             pmu_rows, fi_rows = H.compile_and_evaluate_policy(
-                ssa_ll, tag, mode, rank="semantic",
+                ssa_ll, tag, mode, rank=rank,
                 budget=(1.0 if tag == "native" else budget), delta=5e-5,
                 fi_trials=trials, dump_golden=False, run_fi=True,
                 fi_target_type=cat, arch="x86_64",
@@ -218,6 +254,11 @@ def main():
                     choices=["default", "scaled", "scaled_safe"],
                     default="default",
                     help="profile 输入变体；scaled 是压力测试，scaled_safe 保持 Durbin 稳定域")
+    ap.add_argument("--rank", default="semantic",
+                    choices=["semantic", "semantic-boundary", "boundary-branch",
+                             "boundary-address", "boundary-store", "boundary-feedback",
+                             "hotpath", "shoestring", "sdctune", "random"],
+                    help="instruction ranking method for explicit selector experiments")
     ap.add_argument("--profile-out", default=None,
                     help="profile-only 的输出 CSV；默认写 results/opt/delta_profile.csv")
     ap.add_argument("--policies", default=None,
@@ -230,20 +271,33 @@ def main():
                     help="种子编号起点；0 号种子与历史口径一致")
     ap.add_argument("--out-suffix", default="",
                     help="追加到输出文件名后缀，避免覆盖已有的同参数结果")
+    ap.add_argument("--pgsp-profile", default=None,
+                    help="profile CSV for the explicit risk-cost selective policy")
+    ap.add_argument("--pgsp-control-budget", type=float, default=None,
+                    help="optional independent control-flow budget for the risk-cost policy")
+    ap.add_argument("--pgsp-budget-mode", choices=["count", "dynamic-cost", "risk-cost", "frontier"],
+                    default="risk-cost",
+                    help="budget mode for the explicit PGSP policy")
+    ap.add_argument("--pgsp-frontier-selection", default=None,
+                    help="selected frontier CSV for frontier budget mode")
     args = ap.parse_args()
 
     cfg = H.load_config(None)
     H.apply_threshold_env(cfg)
+    # 规范 12 内核子集：与 benchmark_harness 口径一致，运行循环按名字过滤。
+    os.environ.setdefault("ATFT_BENCH_SUBSET", H.ATFT_CANONICAL_SUBSET)
+    # full campaign 使用大规模 FI 工作集（scale_small=0），与 PMU/profile 口径一致。
+    os.environ.setdefault("ATFT_FI_LARGE", "1")
 
     print("=== [1] 无故障近似误差包络剖析 ===")
     ssa_ll, rows = profile_envelope(
-        args.profile_scale, args.profile_variant, args.profile_out)
+        args.profile_scale, args.profile_variant, args.profile_out, args.rank)
     for r in rows:
         print(f"  {r['benchmark']:22s} E_f={r['env_max_rel_dev']:.3e}  obs={r['observations']}")
     if args.profile_only:
         return
 
-    table = write_delta_table(rows, args.alpha, args.kappa)
+    table = write_delta_table(rows, args.alpha, args.kappa, args.out_suffix)
     print(f"  -> 阈值表 {table}")
 
     categories = [c.strip() for c in args.categories.split(",") if c.strip()]
@@ -258,10 +312,13 @@ def main():
                   + args.out_suffix)
         print(f"=== [2] 消融 campaign (seed#{s}) ===")
         fi_rows, pmu_rows, fi_path, pmu_path = run_campaign(
-            ssa_ll, [m for m in ablation_matrix(table, seed)
+            ssa_ll, [m for m in ablation_matrix(
+                         table, seed, args.pgsp_profile, args.pgsp_control_budget,
+                         args.pgsp_budget_mode, args.pgsp_frontier_selection)
                      if want is None or m[0] in want or m[0] == "native"],
             categories, args.trials, suffix, budget=args.budget,
-            fi_flags=(["-fi-origin-only"] if args.origin_only else None))
+            fi_flags=(["-fi-origin-only"] if args.origin_only else None),
+            rank=args.rank)
         agg = aggregate([{k: str(v) for k, v in r.items()} for r in fi_rows],
                         [{k: str(v) for k, v in r.items()} for r in pmu_rows], meta)
         print("\n=== 等权聚合 ===")

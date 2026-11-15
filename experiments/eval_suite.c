@@ -238,6 +238,52 @@ static int bench_index_by_name(const char *name) {
     abort();
 }
 
+// ----------------------------------------------------------------------------
+// 评测子集过滤 (ATFT_BENCH_SUBSET)
+//
+// 环境变量给出逗号分隔的 benchmark name 列表。设置后，--fi-one / --pmu-perf 的
+// 运行循环只处理列表中的负载（其余 continue 跳过）；未设置时行为不变（全部跑）。
+// 目录（--list-benchmarks）始终列全部 37 个，不受本过滤影响。所有负载的缓冲区
+// 无论是否在子集中都照常分配（calloc 侧不变），这里只收窄"跑哪些"。
+// ----------------------------------------------------------------------------
+#define ATFT_MAX_SUBSET 64
+static int         g_subset_active = 0;
+static int         g_subset_parsed = 0;
+static char        g_subset_buf[1024];
+static const char *g_subset_names[ATFT_MAX_SUBSET];
+static int         g_subset_count = 0;
+
+static void init_bench_subset(void) {
+    if (g_subset_parsed) return;
+    g_subset_parsed = 1;
+    const char *env = getenv("ATFT_BENCH_SUBSET");
+    if (!env || !*env) { g_subset_active = 0; return; }
+    g_subset_active = 1;
+    strncpy(g_subset_buf, env, sizeof(g_subset_buf) - 1);
+    g_subset_buf[sizeof(g_subset_buf) - 1] = '\0';
+    g_subset_count = 0;
+    char *save = NULL;
+    char *tok = strtok_r(g_subset_buf, ",", &save);
+    while (tok && g_subset_count < ATFT_MAX_SUBSET) {
+        while (*tok == ' ' || *tok == '\t') tok++;          // 去前导空白
+        size_t len = strlen(tok);
+        while (len > 0 && (tok[len-1]==' '||tok[len-1]=='\t'||tok[len-1]=='\n'||tok[len-1]=='\r'))
+            tok[--len] = '\0';                               // 去尾随空白
+        if (*tok) g_subset_names[g_subset_count++] = tok;
+        tok = strtok_r(NULL, ",", &save);
+    }
+}
+
+// 1 = 该负载应当运行（无子集，或在子集中）；0 = 被子集过滤掉
+static int bench_in_subset(int b) {
+    init_bench_subset();
+    if (!g_subset_active) return 1;
+    const char *nm = bench_name(b);
+    for (int i = 0; i < g_subset_count; i++)
+        if (strcmp(g_subset_names[i], nm) == 0) return 1;
+    return 0;
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -253,8 +299,14 @@ static uint64_t splitmix64(uint64_t *state) {
 
 // PolyBench/C 4.2.1 MINI_DATASET 维度（与各内核头文件 MINI 分支逐一核对，
 // 缓冲区按此精确分配，欠配即为静默堆越界）
-#define PBM_CORR_M 28
+#define PBM_CORR_M 28    /* correlation (非子集)，固定小规模 */
 #define PBM_CORR_N 32
+// ---- SUBSET 子集内核的运行时维度（scale_small ? 小 : 大），在 alloc_and_init_workspace 中赋值 ----
+static int PBM_COV_M, PBM_COV_N;            // pb_covariance
+static int PBM_CHOLESKY_N;                  // pb_cholesky
+static int PBM_LU_N;                        // pb_lu
+static int PBM_HEAT_TSTEPS, PBM_HEAT_N;     // pb_heat3d
+static int PBM_SEIDEL_TSTEPS, PBM_SEIDEL_N; // pb_seidel2d
 #define PBM_GEMVER_N 40
 #define PBM_GESUMMV_N 30
 #define PBM_SYMM_M 20
@@ -265,31 +317,21 @@ static uint64_t splitmix64(uint64_t *state) {
 #define PBM_SYRK_N 30
 #define PBM_TRMM_M 20
 #define PBM_TRMM_N 30
-#define PBM_3MM_NI 16
-#define PBM_3MM_NJ 18
-#define PBM_3MM_NK 20
-#define PBM_3MM_NL 22
-#define PBM_3MM_NM 24
+static int PBM_3MM_NI, PBM_3MM_NJ, PBM_3MM_NK, PBM_3MM_NL, PBM_3MM_NM;  /* SUBSET pb_3mm：运行时维度 */
 #define PBM_DOITGEN_NR 10
 #define PBM_DOITGEN_NQ 8
 #define PBM_DOITGEN_NP 12
 #define PBM_MVT_N 40
-#define PBM_CHOLESKY_N 40
 #define PBM_GS_M 20
 #define PBM_GS_N 30
-#define PBM_LU_N 40
 #define PBM_TRISOLV_N 40
 #define PBM_ADI_TSTEPS 20
 #define PBM_ADI_N 20
 #define PBM_FDTD_TMAX 20
 #define PBM_FDTD_NX 20
 #define PBM_FDTD_NY 30
-#define PBM_HEAT_TSTEPS 20
-#define PBM_HEAT_N 10
 #define PBM_JAC1D_TSTEPS 20
 #define PBM_JAC1D_N 30
-#define PBM_SEIDEL_TSTEPS 20
-#define PBM_SEIDEL_N 40
 
 typedef struct {
     int n_mat;
@@ -365,19 +407,39 @@ static void workspace_selfcheck(const suite_workspace_t *ws);
 
 static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     memset(ws, 0, sizeof(*ws));
-    ws->n_mat      = scale_small ? 24  : 48;
+    // 规范评测子集 (ATFT_BENCH_SUBSET) 的工作集维度朝 PolyBench LARGE 方向放大，
+    // 按运行时预算标定（Change 3/4）。scale_small=1 分支即故障注入 (--fi-one) 路径，
+    // 是 campaign 的主导成本，取放大值；scale_small=0 分支（--pmu-perf / profile）
+    // 仅每策略跑一次且带 perf_iters 迭代，取适度放大值以限制 PMU 墙钟。
+    // 子集涉及的 ws-> 维度：n_mat(gemm/2mm/jacobi2d)、n_fw(floyd)、n_nus(nussinov)、
+    // obp_w/h(image_proc)。非子集维度保持原样以限制内存（全部缓冲区无论是否在子集都分配）。
+    ws->n_mat      = scale_small ? 56  : 70;   // gemm/2mm/jacobi2d, O(n^3)/O(n^2) [SUBSET]
     ws->n_lu       = scale_small ? 24  : 40;
     ws->n_dur      = scale_small ? 24  : 40;
     ws->der_w      = scale_small ? 16  : 32;
     ws->der_h      = scale_small ? 16  : 32;
-    ws->n_fw       = scale_small ? 24  : 48;
-    ws->n_nus      = scale_small ? 24  : 48;
+    ws->n_fw       = scale_small ? 56  : 70;   // floyd_warshall, O(n^3) [SUBSET]
+    ws->n_nus      = scale_small ? 56  : 70;   // nussinov, O(n^3) [SUBSET]
     ws->n_fft      = scale_small ? 32  : 64;
     ws->img_h      = scale_small ? 24  : 48;
     ws->img_w      = scale_small ? 24  : 48;
     ws->n_crc      = scale_small ? 100 : 200; // 上游 crc16() 的 length 参数为 unsigned char，上限 255
     ws->n_qs       = scale_small ? 290 : 580; // 上游 quicksort.c array_elements
     ws->n_opts     = scale_small ? 256 : 512;
+
+    // SUBSET 子集中由 PolyBench 维度参数驱动的内核：运行时维度按 scale_small 放缩
+    // （scale_small=1 即 smoke/小规模，0 即 full/大规模）。缓冲区、初始化、调用、
+    // out_sizes、reset 全部一致使用这些全局量，故 smoke/full 各自分配恰好大小。
+    PBM_COV_M       = scale_small ? 48 : 62;   // pb_covariance, O(M^2*N)
+    PBM_COV_N       = scale_small ? 52 : 66;
+    PBM_3MM_NI = PBM_3MM_NJ = PBM_3MM_NK = PBM_3MM_NL = PBM_3MM_NM =
+                      scale_small ? 40 : 52;   // pb_3mm, ~3*n^3
+    PBM_CHOLESKY_N  = scale_small ? 56 : 74;   // pb_cholesky, O(n^3/3)
+    PBM_LU_N        = scale_small ? 56 : 74;   // pb_lu, O(n^3/3)
+    PBM_HEAT_TSTEPS = scale_small ? 20 : 24;   // pb_heat3d, O(tsteps*n^3)
+    PBM_HEAT_N      = scale_small ? 14 : 16;
+    PBM_SEIDEL_TSTEPS = scale_small ? 20 : 24; // pb_seidel2d, O(tsteps*n^2)
+    PBM_SEIDEL_N    = scale_small ? 56 : 70;
 
     int nm2 = ws->n_mat * ws->n_mat;
     ws->A        = calloc(nm2, sizeof(double));
@@ -441,8 +503,8 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     ws->crc_data  = calloc(ws->n_crc + 1, sizeof(unsigned char));
     ws->crc_out_d = calloc(1, sizeof(double));
 
-    ws->obp_w = scale_small ? 16 : 32;
-    ws->obp_h = scale_small ? 16 : 32;
+    ws->obp_w = scale_small ? 48 : 56;   // obpmark_image_proc, O(w*h)（须为偶数）[SUBSET]
+    ws->obp_h = scale_small ? 48 : 56;
     ws->obp_nframes = 5;
     ws->obp_frame_i = 2;
     int obp_px = ws->obp_w * ws->obp_h;
@@ -564,10 +626,10 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     ws->corr_corr=calloc(PBM_CORR_M*PBM_CORR_M,sizeof(double));
     ws->corr_mean=calloc(PBM_CORR_M,sizeof(double));
     ws->corr_stddev=calloc(PBM_CORR_M,sizeof(double));
-    ws->cov_data=calloc(PBM_CORR_N*PBM_CORR_M,sizeof(double));
-    ws->cov_data0=calloc(PBM_CORR_N*PBM_CORR_M,sizeof(double));
-    ws->cov_cov=calloc(PBM_CORR_M*PBM_CORR_M,sizeof(double));
-    ws->cov_mean=calloc(PBM_CORR_M,sizeof(double));
+    ws->cov_data=calloc(PBM_COV_N*PBM_COV_M,sizeof(double));
+    ws->cov_data0=calloc(PBM_COV_N*PBM_COV_M,sizeof(double));
+    ws->cov_cov=calloc(PBM_COV_M*PBM_COV_M,sizeof(double));
+    ws->cov_mean=calloc(PBM_COV_M,sizeof(double));
     ws->gmv_A=calloc(PBM_GEMVER_N*PBM_GEMVER_N,sizeof(double));
     ws->gmv_A0=calloc(PBM_GEMVER_N*PBM_GEMVER_N,sizeof(double));
     ws->gmv_u1=calloc(PBM_GEMVER_N,sizeof(double));
@@ -655,8 +717,8 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
       for (i=0;i<PBM_CORR_N;i++) for (j=0;j<PBM_CORR_M;j++)
         ws->corr_data0[i*PBM_CORR_M+j]=(double)(i*j)/PBM_CORR_M + i;
       // covariance: data[N][M]=((DATA_TYPE)i*j)/M ; float_n=n
-      for (i=0;i<PBM_CORR_N;i++) for (j=0;j<PBM_CORR_M;j++)
-        ws->cov_data0[i*PBM_CORR_M+j]=((double)i*j)/PBM_CORR_M;
+      for (i=0;i<PBM_COV_N;i++) for (j=0;j<PBM_COV_M;j++)
+        ws->cov_data0[i*PBM_COV_M+j]=((double)i*j)/PBM_COV_M;
       // gemver
       { double fn=(double)PBM_GEMVER_N;
         for (i=0;i<PBM_GEMVER_N;i++){
@@ -777,7 +839,7 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     }
 // 补齐内核的 live-out / QoR 配置（输出直接是 double 缓冲，无需 export 转换）
     ws->out_ptrs[17]=ws->corr_corr; ws->out_sizes[17]=PBM_CORR_M*PBM_CORR_M; ws->peak_vals[17]=1.0;    ws->perf_iters[17]=300;
-    ws->out_ptrs[18]=ws->cov_cov;   ws->out_sizes[18]=PBM_CORR_M*PBM_CORR_M; ws->peak_vals[18]=50.0;   ws->perf_iters[18]=300;
+    ws->out_ptrs[18]=ws->cov_cov;   ws->out_sizes[18]=PBM_COV_M*PBM_COV_M; ws->peak_vals[18]=50.0;   ws->perf_iters[18]=300;
     ws->out_ptrs[19]=ws->gmv_w;     ws->out_sizes[19]=PBM_GEMVER_N;          ws->peak_vals[19]=50.0;   ws->perf_iters[19]=500;
     ws->out_ptrs[20]=ws->gsv_y;     ws->out_sizes[20]=PBM_GESUMMV_N;         ws->peak_vals[20]=50.0;   ws->perf_iters[20]=800;
     ws->out_ptrs[21]=ws->symm_C;    ws->out_sizes[21]=PBM_SYMM_M*PBM_SYMM_N; ws->peak_vals[21]=50.0;   ws->perf_iters[21]=400;
@@ -834,7 +896,7 @@ static void reset_mutable_buffers(suite_workspace_t *ws, int b) {
     } else if (b == 17) {
         memcpy(ws->corr_data, ws->corr_data0, (size_t)PBM_CORR_N*PBM_CORR_M*sizeof(double));
     } else if (b == 18) {
-        memcpy(ws->cov_data, ws->cov_data0, (size_t)PBM_CORR_N*PBM_CORR_M*sizeof(double));
+        memcpy(ws->cov_data, ws->cov_data0, (size_t)PBM_COV_N*PBM_COV_M*sizeof(double));
     } else if (b == 19) {
         memcpy(ws->gmv_A, ws->gmv_A0, (size_t)PBM_GEMVER_N*PBM_GEMVER_N*sizeof(double));
         memset(ws->gmv_x, 0, (size_t)PBM_GEMVER_N*sizeof(double));
@@ -985,7 +1047,7 @@ if (g_abft_harness) {
                                           ws->obp_gains, ws->obp_binned, ws->obp_out); break;
         case 17: bench_pb_correlation(PBM_CORR_M, PBM_CORR_N, (double)PBM_CORR_N,
                                       ws->corr_data, ws->corr_corr, ws->corr_mean, ws->corr_stddev); break;
-        case 18: bench_pb_covariance(PBM_CORR_M, PBM_CORR_N, (double)PBM_CORR_N,
+        case 18: bench_pb_covariance(PBM_COV_M, PBM_COV_N, (double)PBM_COV_N,
                                      ws->cov_data, ws->cov_cov, ws->cov_mean); break;
         case 19: bench_pb_gemver(PBM_GEMVER_N, 1.5, 1.2, ws->gmv_A, ws->gmv_u1, ws->gmv_v1,
                                  ws->gmv_u2, ws->gmv_v2, ws->gmv_w, ws->gmv_x, ws->gmv_y, ws->gmv_z); break;
@@ -1098,6 +1160,7 @@ static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir,
     harness_pmu_init(&pmu);
 
     for (int b = 0; b < NUM_BENCHES; b++) {
+        if (!bench_in_subset(b)) continue;   // ATFT_BENCH_SUBSET 过滤
         atft_init(10000.0, 4.0, 3, 4, 3);
         apply_delta_for_bench(bench_name(b));
         if (strcmp(policy_name, "adaptive_high") == 0) {
@@ -1334,10 +1397,18 @@ static void pick_uniform_single_bit(uint64_t *rng, uint64_t total_dyn,
 static int run_standard_one_fault_fi(const char *policy_name, const char *golden_dir, int trials) {
     (void)golden_dir;
     suite_workspace_t ws;
-    alloc_and_init_workspace(&ws, 1);
+    // 工作集规模：默认 scale_small=1（smoke/小规模）。full campaign 通过
+    // ATFT_FI_LARGE=1 切到 scale_small=0（大规模），与 PMU/profile 的大规模口径一致。
+    // 未设置时保持历史行为（小规模），不影响已冻结 RQ 的复现口径。
+    {
+        const char *big = getenv("ATFT_FI_LARGE");
+        int ss = (big && *big && atoi(big) != 0) ? 0 : 1;
+        alloc_and_init_workspace(&ws, ss);
+    }
     install_crash_handlers();
 
     for (int b = 0; b < NUM_BENCHES; b++) {
+        if (!bench_in_subset(b)) continue;   // ATFT_BENCH_SUBSET 过滤
         fi_stats_t st;
         uint64_t seed = g_fi_seed_base ^ ((uint64_t)(b + 1) << 32);
         fi_run_campaign(&ws, b, policy_name, trials, seed,
