@@ -345,7 +345,7 @@ typedef struct {
 
     double *A, *B, *C, *D, *tmp_2mm;
     double *x, *y, *tmp_atax, *s_bicg, *q_bicg, *p_bicg, *r_bicg;
-    double *jac_A, *jac_B;
+    double *jac_A, *jac_B, *jac_A0, *jac_B0;
     double *lu_A, *lu_A0, *lu_b, *lu_x, *lu_y;
     double *dur_r, *dur_y;
     double *der_in, *der_out, *der_y1, *der_y2;
@@ -456,6 +456,14 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     ws->r_bicg   = calloc(ws->n_mat, sizeof(double));
     ws->jac_A    = calloc(nm2, sizeof(double));
     ws->jac_B    = calloc(nm2, sizeof(double));
+    // jacobi2d 的输入快照：一次算好 sin/cos，之后 reset 走 memcpy，
+    // 避免把超越函数重算摊进计时/粗粒度窗口（见 reset_mutable_buffers）。
+    ws->jac_A0   = calloc(nm2, sizeof(double));
+    ws->jac_B0   = calloc(nm2, sizeof(double));
+    for (int i = 0; i < nm2; i++) {
+        ws->jac_A0[i] = 0.5 + 0.3 * sin(0.1 * (double)i);
+        ws->jac_B0[i] = 0.5 + 0.3 * cos(0.1 * (double)i);
+    }
 
     int nlu2 = ws->n_lu * ws->n_lu;
     ws->lu_A  = calloc(nlu2, sizeof(double));
@@ -869,10 +877,9 @@ static void reset_mutable_buffers(suite_workspace_t *ws, int b) {
     } else if (b == 1) {
         for (int i = 0; i < nm2; i++) ws->D[i] = 0.05 * (double)(i % 13);
     } else if (b == 4) {
-        for (int i = 0; i < nm2; i++) {
-            ws->jac_A[i] = 0.5 + 0.3 * sin(0.1 * (double)i);
-            ws->jac_B[i] = 0.5 + 0.3 * cos(0.1 * (double)i);
-        }
+        // 从快照恢复（O(n) memcpy），不再每次重算 sin/cos
+        memcpy(ws->jac_A, ws->jac_A0, (size_t)nm2 * sizeof(double));
+        memcpy(ws->jac_B, ws->jac_B0, (size_t)nm2 * sizeof(double));
     } else if (b == 5) {
         // ludcmp 原地分解 A，每次从未分解副本恢复
         memcpy(ws->lu_A, ws->lu_A0, (size_t)ws->n_lu * ws->n_lu * sizeof(double));
@@ -1112,7 +1119,7 @@ static void free_workspace(suite_workspace_t *ws) {
     free(ws->A); free(ws->B); free(ws->C); free(ws->D); free(ws->tmp_2mm);
     free(ws->x); free(ws->y); free(ws->tmp_atax); free(ws->s_bicg);
     free(ws->q_bicg); free(ws->p_bicg); free(ws->r_bicg);
-    free(ws->jac_A); free(ws->jac_B);
+    free(ws->jac_A); free(ws->jac_B); free(ws->jac_A0); free(ws->jac_B0);
     free(ws->lu_A); free(ws->lu_A0); free(ws->lu_b); free(ws->lu_x); free(ws->lu_y);
     free(ws->dur_r); free(ws->dur_y);
     free(ws->der_in); free(ws->der_out); free(ws->der_y1); free(ws->der_y2);
@@ -1812,6 +1819,8 @@ static int run_delta_profile(void) {
                 ws.D[i] *= scale;
                 ws.jac_A[i] *= scale;
                 ws.jac_B[i] *= scale;
+                ws.jac_A0[i] *= scale;   // reset 从快照恢复，缩放须落到快照上
+                ws.jac_B0[i] *= scale;
             }
             for (int i = 0; i < ws.n_mat; i++) {
                 ws.x[i] *= scale;
