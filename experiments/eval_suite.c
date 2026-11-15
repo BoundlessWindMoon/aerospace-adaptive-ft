@@ -1152,9 +1152,52 @@ static void free_workspace(suite_workspace_t *ws) {
     free(ws->sd_A); free(ws->sd_A0);
 }
 
+// ============================================================================
+// 自动粗粒度（整内核）冗余：复用注册表元数据（reset_mutable_buffers + invoke_benchmark
+// + export_outputs + out_ptrs/out_sizes），对**任意已注册内核**做 N-way 整内核复制 +
+// 逐元素多数决。零逐内核新代码——这就是"自动捕捉"：驱动它的全是已有的 per-kernel 元数据，
+// 一个 pass 要做的只是把这套元数据（哪个是输出、多大、怎么复位输入）从指针属性/区域分析里
+// 自动导出。开销来自把满速向量化内核整跑 N 遍（零软件税），由 ATFT_COARSE=N 打开（默认关）。
+// ============================================================================
+static int g_coarse_n = 0;
+static double *g_coarse_shadow[3] = {0, 0, 0};
+static size_t g_coarse_cap = 0;
+static void coarse_ensure(size_t need) {
+    if (need <= g_coarse_cap) return;
+    for (int i = 0; i < 3; i++) { free(g_coarse_shadow[i]); g_coarse_shadow[i] = (double *)malloc(need * sizeof(double)); }
+    g_coarse_cap = need;
+}
+// N-way 整内核复制 + 多数决写回 out_ptrs[b]；返回 1 表示 N 份间检出不一致。
+static int coarse_invoke(suite_workspace_t *ws, int b) {
+    int N = g_coarse_n;
+    if (N < 2) { invoke_benchmark(ws, b); return 0; }
+    if (N > 3) N = 3;
+    size_t n = (size_t)ws->out_sizes[b];
+    coarse_ensure(n);
+    for (int i = 0; i < N; i++) {
+        reset_mutable_buffers(ws, b);      // 还原输入状态（原地内核必需）
+        invoke_benchmark(ws, b);           // 满速向量化内核整跑一遍
+        export_outputs(ws, b);             // 归一化输出到 out_ptrs[b]
+        memcpy(g_coarse_shadow[i], ws->out_ptrs[b], n * sizeof(double));
+    }
+    int mismatch = 0;
+    double *out = ws->out_ptrs[b];
+    for (size_t k = 0; k < n; k++) {
+        double v0 = g_coarse_shadow[0][k];
+        if (N == 2) { if (v0 != g_coarse_shadow[1][k]) mismatch = 1; out[k] = v0; }
+        else {
+            double v1 = g_coarse_shadow[1][k], v2 = g_coarse_shadow[2][k];
+            out[k] = (v0 == v1 || v0 == v2) ? v0 : (v1 == v2 ? v1 : v0);
+            if (!(v0 == v1 && v1 == v2)) mismatch = 1;
+        }
+    }
+    return mismatch;
+}
+
 static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir, int dump_golden) {
     suite_workspace_t ws;
     alloc_and_init_workspace(&ws, 0);
+    { const char *cs = getenv("ATFT_COARSE"); g_coarse_n = cs ? atoi(cs) : 0; }
 
     harness_pmu_t pmu;
     harness_pmu_init(&pmu);
@@ -1180,7 +1223,8 @@ static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir,
         double t0 = now_sec();
         harness_pmu_start(&pmu);
         for (int it = 0; it < iters; it++) {
-            invoke_benchmark(&ws, b);
+            if (g_coarse_n >= 2) coarse_invoke(&ws, b);
+            else invoke_benchmark(&ws, b);
         }
         harness_pmu_stop(&pmu, &total_hw_insts, &total_hw_cycles);
         double t1 = now_sec();
