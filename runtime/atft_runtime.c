@@ -4,6 +4,16 @@
 #include <string.h>
 #include <math.h>
 
+// 计量变体（-DATFT_STATS_NOCOUNT）：关掉纯统计用的 total_votes / fault_free_votes
+// 两个全局计数器在表决热路径上的 read-modify-write。它们只为出实验报告
+// （votes_per_iter），不参与任何保护判定；检出/恢复/不可恢复计数与 SPRT 事件流保持不变。
+// 用于隔离"插桩开销"与"冗余计算开销"两根杠杆。默认未定义时逐位等价于原来的 x++。
+#ifdef ATFT_STATS_NOCOUNT
+#define ATFT_STAT_INC(field) ((void)0)
+#else
+#define ATFT_STAT_INC(field) (g_atft_state.field++)
+#endif
+
 // 时间驱动降档（ATFT_SPRT_TIME_DRIVEN）：无事件流逝的时间也作为 H0 的证据。
 // 默认关闭，关闭时判决规则与冻结基线逐位一致。
 static int g_atft_sprt_time_driven = 0;
@@ -254,10 +264,10 @@ void atft_step_window(void) {
 // 无法像三模冗余那样判定哪一路正确并在线恢复
 // ============================================================================
 double atft_eddi_swift_check_f64(double r_master, double r_shadow) {
-    g_atft_state.total_votes++;
+    ATFT_STAT_INC(total_votes);
     const double eps = 1e-11 * (1.0 + fabs(r_master));
     if (isfinite(r_master) && isfinite(r_shadow) && fabs(r_master - r_shadow) <= eps) {
-        g_atft_state.fault_free_votes++;
+        ATFT_STAT_INC(fault_free_votes);
         return r_master;
     }
     g_atft_state.detected_faults++;
@@ -269,10 +279,10 @@ double atft_eddi_swift_check_f64(double r_master, double r_shadow) {
 // LLTFI 的 compareFloatValues: 当两路副本不一致时，对 IEEE-754 的 sign, exponent, mantissa 分别做按位与 (&)，
 // 从而把 0->1 的高位指数爆炸翻回 0（无需重算即可抑制 NaN/Inf 尖峰，但对 1->0 的翻转会产生偏小近似误差）
 double atft_lltfi_sid_compare_f64(double val1, double val2) {
-    g_atft_state.total_votes++;
+    ATFT_STAT_INC(total_votes);
     union { double d; uint64_t u; } f1 = {.d = val1}, f2 = {.d = val2}, ret;
     if (f1.u == f2.u) {
-        g_atft_state.fault_free_votes++;
+        ATFT_STAT_INC(fault_free_votes);
         return val1;
     }
     g_atft_state.detected_faults++;
@@ -285,14 +295,14 @@ double atft_lltfi_sid_compare_f64(double val1, double val2) {
 // 传统精确 TMR 表决器 (COAST Baseline, IEEE TNS'19)
 // ============================================================================
 double atft_voter_exact_f64(double r1, double r2, double r3) {
-    g_atft_state.total_votes++;
+    ATFT_STAT_INC(total_votes);
     const double eps = 1e-12;
     int c12 = (fabs(r1 - r2) <= eps);
     int c13 = (fabs(r1 - r3) <= eps);
     int c23 = (fabs(r2 - r3) <= eps);
 
     if (c12 && c13) {
-        g_atft_state.fault_free_votes++;
+        ATFT_STAT_INC(fault_free_votes);
         return r1;
     }
     g_atft_state.detected_faults++;
@@ -310,9 +320,9 @@ double atft_voter_exact_f64(double r1, double r2, double r3) {
 }
 
 int32_t atft_voter_exact_i32(int32_t r1, int32_t r2, int32_t r3) {
-    g_atft_state.total_votes++;
+    ATFT_STAT_INC(total_votes);
     if (r1 == r2 && r1 == r3) {
-        g_atft_state.fault_free_votes++;
+        ATFT_STAT_INC(fault_free_votes);
         return r1;
     }
     g_atft_state.detected_faults++;
@@ -339,7 +349,7 @@ double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
 double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
                                     double a1_approx, double a2_approx,
                                     double delta, int32_t crit_level) {
-    g_atft_state.total_votes++;
+    ATFT_STAT_INC(total_votes);
 
     // D3: 逐负载阈值优先于编译期常数；地板量取 fp32 单位舍入的 kappa 倍，
     // 不再用 2e-6 这个无来源的硬下限
@@ -364,7 +374,7 @@ double atft_voter_approx_reexec_f64(double r_exact, double r_reexec,
 
     // Fast-path: 无软错误直接返回 r_exact
     if (__builtin_expect((diff_r_a1 <= eff_delta) && (diff_a1_a2 <= agree_fast), 1)) {
-        g_atft_state.fault_free_votes++;
+        ATFT_STAT_INC(fault_free_votes);
         return r_exact;
     }
 
@@ -451,13 +461,13 @@ double atft_voter_approx_f64(double r_exact, double a1_approx, double a2_approx,
 
 int32_t atft_voter_approx_i32(int32_t r_exact, int32_t a1_approx, int32_t a2_approx,
                               int32_t delta, int32_t crit_level) {
-    g_atft_state.total_votes++;
+    ATFT_STAT_INC(total_votes);
     int64_t d1 = llabs((int64_t)r_exact - (int64_t)a1_approx);
     int64_t d2 = llabs((int64_t)r_exact - (int64_t)a2_approx);
     int64_t d12 = llabs((int64_t)a1_approx - (int64_t)a2_approx);
 
     if (d1 <= delta && d2 <= delta && d12 == 0) {
-        g_atft_state.fault_free_votes++;
+        ATFT_STAT_INC(fault_free_votes);
         return r_exact;
     }
 

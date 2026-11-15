@@ -130,7 +130,8 @@ static bool isHookableTy(Type *T) {
   if (T->isDoubleTy() || T->isFloatTy()) return true;
   if (T->isIntegerTy(16) || T->isIntegerTy(32) || T->isIntegerTy(64)) return true;
   if (auto *vecTy = dyn_cast<FixedVectorType>(T)) {
-    return vecTy->getElementType()->isFloatTy() && vecTy->getNumElements() == 2;
+    return vecTy->getNumElements() == 2 &&
+           (vecTy->getElementType()->isFloatTy() || vecTy->getElementType()->isDoubleTy());
   }
   return false;
 }
@@ -188,8 +189,10 @@ FiCategory classifyFaultSite(Instruction *I) {
     if (ty->isDoubleTy()) return FIC_FP64;
     if (ty->isFloatTy())  return FIC_FP32;
     if (auto *vecTy = dyn_cast<FixedVectorType>(ty)) {
-      if (vecTy->getElementType()->isFloatTy() && vecTy->getNumElements() == 2)
+      if (vecTy->getNumElements() == 2 && vecTy->getElementType()->isFloatTy())
         return FIC_FP32;
+      if (vecTy->getNumElements() == 2 && vecTy->getElementType()->isDoubleTy())
+        return FIC_FP64;
     }
     if (ty->isIntegerTy(16) || ty->isIntegerTy(32) || ty->isIntegerTy(64))
       return FIC_INT_ARITH;
@@ -241,8 +244,11 @@ public:
     Type *I32Ty = Type::getInt32Ty(Ctx);
     Type *I64Ty = Type::getInt64Ty(Ctx);
     VectorType *V2F32Ty = FixedVectorType::get(F32Ty, 2);
+    VectorType *V2F64Ty = FixedVectorType::get(F64Ty, 2);
 
     FunctionCallee HookF64 = M.getOrInsertFunction("__harness_fi_hook_f64", F64Ty, F64Ty, I32Ty);
+    FunctionCallee HookV2F64 = M.getOrInsertFunction(
+        "__harness_fi_hook_v2f64", V2F64Ty, V2F64Ty, I32Ty);
     FunctionCallee HookF32 = M.getOrInsertFunction("__harness_fi_hook_f32", F32Ty, F32Ty, I32Ty);
     FunctionCallee HookI16 = M.getOrInsertFunction("__harness_fi_hook_i16", I16Ty, I16Ty, I32Ty);
     FunctionCallee HookI32 = M.getOrInsertFunction("__harness_fi_hook_i32", I32Ty, I32Ty, I32Ty);
@@ -258,6 +264,43 @@ public:
 
     // 先收集再改写：注入会插入新指令，边遍历边改写会把新指令也当成候选
     std::vector<std::pair<Instruction *, FiCategory>> sites;
+    auto allocateSiteId = [&](Instruction *inst, FiCategory cat) {
+      int32_t id = staticSiteId++;
+      bool feedsBranch = false;
+      bool feedsStore = false;
+      bool feedsStoreAddr = false;
+      bool feedsCall = false;
+      bool feedsGEP = false;
+      bool feedsPhi = false;
+      for (User *U : inst->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI) continue;
+        if (isa<BranchInst>(UI) || isa<SelectInst>(UI) || isa<SwitchInst>(UI))
+          feedsBranch = true;
+        if (auto *SI = dyn_cast<StoreInst>(UI)) {
+          if (SI->getValueOperand() == inst) feedsStore = true;
+          if (SI->getPointerOperand() == inst) feedsStoreAddr = true;
+        }
+        if (isa<CallBase>(UI)) feedsCall = true;
+        if (isa<GetElementPtrInst>(UI)) feedsGEP = true;
+        if (isa<PHINode>(UI)) feedsPhi = true;
+      }
+      std::string siteKey;
+      if (MDNode *N = inst->getMetadata("atft.site.key")) {
+        if (N->getNumOperands() > 0) {
+          if (auto *S = dyn_cast<MDString>(N->getOperand(0)))
+            siteKey = S->getString().str();
+        }
+      }
+      errs() << "FI_SITE_MAP," << id << "," << FI_CATEGORY_NAMES[cat]
+             << "," << inst->getFunction()->getName() << ","
+             << inst->getParent()->getName() << "," << inst->getOpcodeName()
+             << "," << (feedsBranch ? 1 : 0) << "," << (feedsStore ? 1 : 0)
+             << "," << (feedsStoreAddr ? 1 : 0) << "," << (feedsCall ? 1 : 0)
+             << "," << (feedsGEP ? 1 : 0) << "," << (feedsPhi ? 1 : 0)
+             << "," << siteKey << "\n";
+      return ConstantInt::get(I32Ty, id);
+    };
     for (Function &F : M) {
       if (F.isDeclaration()) continue;
       if (!injectionScope.count(&F)) continue;
@@ -285,7 +328,7 @@ public:
         bool is64 = idxVal->getType()->isIntegerTy(64);
         Value *idx32 = is64 ? IRB.CreateTrunc(idxVal, I32Ty, "gep.idx32") : idxVal;
         Value *hooked32 = IRB.CreateCall(
-            HookI32, {idx32, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.addr");
+            HookI32, {idx32, allocateSiteId(inst, cat)}, "fi.addr");
         Value *diff = IRB.CreateXor(idx32, hooked32);
         Value *boundedDiff = IRB.CreateAnd(diff, ConstantInt::get(I32Ty, 0x3));
         Value *safeIdx32 = IRB.CreateXor(idx32, boundedDiff);
@@ -301,7 +344,7 @@ public:
         IRBuilder<> IRB(nextNode);
         Value *zext32 = IRB.CreateZExt(inst, I32Ty, "br.i32");
         Value *hooked32 = IRB.CreateCall(
-            HookI32, {zext32, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.br");
+            HookI32, {zext32, allocateSiteId(inst, cat)}, "fi.br");
         Value *diff = IRB.CreateXor(zext32, hooked32);
         Value *wasInjected = IRB.CreateICmpNE(diff, ConstantInt::get(I32Ty, 0), "fi.was_inj");
         Value *flippedCond = IRB.CreateXor(inst, wasInjected, "fi.cond");
@@ -319,20 +362,23 @@ public:
       Value *hooked = nullptr;
 
       if (ty->isDoubleTy()) {
-        hooked = IRB.CreateCall(HookF64, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.f64");
+        hooked = IRB.CreateCall(HookF64, {inst, allocateSiteId(inst, cat)}, "fi.f64");
+      } else if (ty == V2F64Ty) {
+        hooked = IRB.CreateCall(
+            HookV2F64, {inst, allocateSiteId(inst, cat)}, "fi.v2f64");
       } else if (ty->isFloatTy()) {
-        hooked = IRB.CreateCall(HookF32, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.f32");
+        hooked = IRB.CreateCall(HookF32, {inst, allocateSiteId(inst, cat)}, "fi.f32");
       } else if (ty->isIntegerTy(16)) {
-        hooked = IRB.CreateCall(HookI16, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i16");
+        hooked = IRB.CreateCall(HookI16, {inst, allocateSiteId(inst, cat)}, "fi.i16");
       } else if (ty->isIntegerTy(32)) {
-        hooked = IRB.CreateCall(HookI32, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i32");
+        hooked = IRB.CreateCall(HookI32, {inst, allocateSiteId(inst, cat)}, "fi.i32");
       } else if (ty->isIntegerTy(64)) {
-        hooked = IRB.CreateCall(HookI64, {inst, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.i64");
+        hooked = IRB.CreateCall(HookI64, {inst, allocateSiteId(inst, cat)}, "fi.i64");
       } else if (ty == V2F32Ty) {
         // <2 x float> 近似副本：按 64 位整体翻转一个比特，等价于打中其中一路
         Value *asF64 = IRB.CreateBitCast(inst, F64Ty, "v2f32.as.f64");
         Value *hookedF64 = IRB.CreateCall(
-            HookF64, {asF64, ConstantInt::get(I32Ty, staticSiteId++)}, "fi.v2f32.f64");
+            HookF64, {asF64, allocateSiteId(inst, cat)}, "fi.v2f32.f64");
         Value *hookedVec = IRB.CreateBitCast(hookedF64, V2F32Ty, "fi.v2f32");
         inst->replaceUsesWithIf(hookedVec, [&](Use &U) { return U.getUser() != asF64; });
         continue;

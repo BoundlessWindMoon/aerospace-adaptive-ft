@@ -116,15 +116,17 @@ void atft_report_ecc_event(void);
 void atft_step_window(void);
 
 // EDDI (Oh et al., IEEE TR'02) / SWIFT (Reis et al., CGO'05) 双模校验器 (DMR: 仅检错触发 DUE，无法三模自恢复)
-double  atft_eddi_swift_check_f64(double r_master, double r_shadow);
+// always_inline 仅在表决器体对调用方可见时（计量变体里 llvm-link 进被测模块后）生效；
+// 冻结路径走 libatft_rt.a 的跨 TU 调用，属性无副作用、行为逐位不变。
+double  atft_eddi_swift_check_f64(double r_master, double r_shadow) __attribute__((always_inline));
 
 // LLTFI-SID (third_party/LLTFI/llvm_passes/instruction_duplication/shared_lib/SIDHelperFunctions.cpp)
 // 按位与抑制高位指数尖峰的近似双模修复器
 double  atft_lltfi_sid_compare_f64(double val1, double val2);
 
 // 传统精确 TMR 多数表决器 (Baseline: 3次精确计算, COAST IEEE TNS'19)
-double  atft_voter_exact_f64(double r1, double r2, double r3);
-int32_t atft_voter_exact_i32(int32_t r1, int32_t r2, int32_t r3);
+double  atft_voter_exact_f64(double r1, double r2, double r3) __attribute__((always_inline));
+int32_t atft_voter_exact_i32(int32_t r1, int32_t r2, int32_t r3) __attribute__((always_inline));
 
 // 混合近似 TMR 动态阈值投票器 (核心创新点 3.4.4: 1次精确 R + 2次近似 A1, A2 + 关键代码段冷路径精确重执行 R_reexec)
 // 若 |R - A1| <= delta 且 |R - A2| <= delta -> 返回 R

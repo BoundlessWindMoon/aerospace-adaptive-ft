@@ -92,6 +92,15 @@ static int      g_fi_injected = 0;
 // 直接计数：一旦超出预算就主动 raise(SIGALRM)，由 eval_suite 的保护区归类为
 // DUE。钩子位于热循环内部，因此任何执行被插桩指令的死循环都会被捕获。
 static uint64_t g_fi_step_budget = 0;
+static int g_fi_target_site = -1;
+
+static inline int fi_should_apply(int32_t static_site_id, int event_index) {
+    if (g_fi_target_site < 0)
+        return g_fi_dyn_step == g_fi_steps[event_index];
+    if (static_site_id != g_fi_target_site || g_fi_injected != 0)
+        return 0;
+    return event_index == 0;
+}
 
 void harness_fi_set_step_budget(uint64_t budget) {
     g_fi_step_budget = budget;
@@ -105,6 +114,8 @@ static inline void fi_check_budget(void) {
 }
 
 void harness_fi_reset_profile(void) {
+    const char *target = getenv("ATFT_FI_STATIC_SITE");
+    g_fi_target_site = target ? (int)strtol(target, NULL, 10) : -1;
     g_fi_dyn_step = 0;
     g_fi_num_events = 0;
     g_fi_mbu_width = 1;
@@ -148,7 +159,7 @@ double __harness_fi_hook_f64(double val, int32_t static_site_id) {
     g_fi_dyn_step++;
     fi_check_budget();
     for (int i = 0; i < g_fi_num_events; i++) {
-        if (g_fi_dyn_step == g_fi_steps[i]) {
+        if (fi_should_apply(static_site_id, i)) {
             union { double d; uint64_t u; } conv;
             conv.d = val;
             conv.u ^= make_mbu_mask64(g_fi_bits[i], g_fi_mbu_width);
@@ -159,12 +170,30 @@ double __harness_fi_hook_f64(double val, int32_t static_site_id) {
     return val;
 }
 
+harness_v2f64_t __harness_fi_hook_v2f64(harness_v2f64_t val, int32_t static_site_id) {
+    // 一个向量故障点只推进一次动态步；用静态点编号交替选择 lane，
+    // 保留 f64 的完整 64-bit 故障域，同时让同一套 harness 覆盖两个 lane。
+    int lane = static_site_id & 1;
+    g_fi_dyn_step++;
+    fi_check_budget();
+    for (int i = 0; i < g_fi_num_events; i++) {
+        if (fi_should_apply(static_site_id, i)) {
+            union { double d; uint64_t u; } conv;
+            conv.d = val[lane];
+            conv.u ^= make_mbu_mask64(g_fi_bits[i], g_fi_mbu_width);
+            g_fi_injected++;
+            val[lane] = conv.d;
+        }
+    }
+    return val;
+}
+
 float __harness_fi_hook_f32(float val, int32_t static_site_id) {
     (void)static_site_id;
     g_fi_dyn_step++;
     fi_check_budget();
     for (int i = 0; i < g_fi_num_events; i++) {
-        if (g_fi_dyn_step == g_fi_steps[i]) {
+        if (fi_should_apply(static_site_id, i)) {
             union { float f; uint32_t u; } conv;
             conv.f = val;
             conv.u ^= make_mbu_mask32(g_fi_bits[i], g_fi_mbu_width);
@@ -180,7 +209,7 @@ int32_t __harness_fi_hook_i32(int32_t val, int32_t static_site_id) {
     g_fi_dyn_step++;
     fi_check_budget();
     for (int i = 0; i < g_fi_num_events; i++) {
-        if (g_fi_dyn_step == g_fi_steps[i]) {
+        if (fi_should_apply(static_site_id, i)) {
             uint32_t u = (uint32_t)val ^ make_mbu_mask32(g_fi_bits[i], g_fi_mbu_width);
             g_fi_injected++;
             val = (int32_t)u;
@@ -194,7 +223,7 @@ int64_t __harness_fi_hook_i64(int64_t val, int32_t static_site_id) {
     g_fi_dyn_step++;
     fi_check_budget();
     for (int i = 0; i < g_fi_num_events; i++) {
-        if (g_fi_dyn_step == g_fi_steps[i]) {
+        if (fi_should_apply(static_site_id, i)) {
             uint64_t u = (uint64_t)val ^ make_mbu_mask64(g_fi_bits[i], g_fi_mbu_width);
             g_fi_injected++;
             val = (int64_t)u;
@@ -208,7 +237,7 @@ int16_t __harness_fi_hook_i16(int16_t val, int32_t static_site_id) {
     g_fi_dyn_step++;
     fi_check_budget();
     for (int i = 0; i < g_fi_num_events; i++) {
-        if (g_fi_dyn_step == g_fi_steps[i]) {
+        if (fi_should_apply(static_site_id, i)) {
             uint16_t u = (uint16_t)val ^ (uint16_t)(make_mbu_mask32(g_fi_bits[i], g_fi_mbu_width) & 0xFFFFU);
             g_fi_injected++;
             val = (int16_t)u;

@@ -45,7 +45,10 @@ void     harness_fi_set_step_budget(uint64_t budget);
 void     harness_fi_arm_mbu_or_burst(const uint64_t *target_steps, const uint32_t *target_bits,
                                      int num_events, uint32_t mbu_width);
 
+typedef double harness_v2f64_t __attribute__((vector_size(16)));
+
 double   __harness_fi_hook_f64(double val, int32_t static_site_id);
+harness_v2f64_t __harness_fi_hook_v2f64(harness_v2f64_t val, int32_t static_site_id);
 float    __harness_fi_hook_f32(float val, int32_t static_site_id);
 int32_t  __harness_fi_hook_i32(int32_t val, int32_t static_site_id);
 int64_t  __harness_fi_hook_i64(int64_t val, int32_t static_site_id);
