@@ -4,6 +4,11 @@
 #include <string.h>
 #include <math.h>
 
+// 时间驱动降档（ATFT_SPRT_TIME_DRIVEN）：无事件流逝的时间也作为 H0 的证据。
+// 默认关闭，关闭时判决规则与冻结基线逐位一致。
+static int g_atft_sprt_time_driven = 0;
+
+
 atft_runtime_state_t g_atft_state = {
     .total_votes = 0,
     .fault_free_votes = 0,
@@ -107,6 +112,7 @@ void atft_init_sprt(double calm_interval, double rate_ratio, double alpha, doubl
     g_atft_state.sprt_bound_a = log((1.0 - beta) / alpha);
     g_atft_state.sprt_bound_b = log(beta / (1.0 - alpha));
     g_atft_state.sprt_llr = 0.0;
+    g_atft_sprt_time_driven = getenv("ATFT_SPRT_TIME_DRIVEN") ? 1 : 0;
 }
 
 void atft_reset_stats(void) {    g_atft_state.total_votes = 0;
@@ -129,6 +135,29 @@ atft_prot_mode_t atft_get_mode(void) {
 // ============================================================================
 void atft_advance_insts(uint64_t inst_count) {
     g_atft_state.retired_inst_counter += inst_count;
+    if (!g_atft_state.sprt_enabled || !g_atft_sprt_time_driven) return;
+
+    // 时间驱动的降档判决。
+    //
+    // 原来 LLR 只在事件到达时更新，于是平静段里"没有事件"这件事不产生任何证据，
+    // 降档必须等到下一次事件 —— 而平静段的事件间隔 ~ 1/lambda0 就是轨道周期量级。
+    // 实测回落滞后 108~154 min，超过平静段 83.5 min，系统基本不回 LOW，
+    // 占空比收益只剩 1.07x（见 docs/HANDOFF.md 第 8 节）。这不是参数没调好，
+    // 是事件驱动的序贯检验在低速率段的结构性缺陷。
+    //
+    // 正确的连续时间形式：泊松过程在 [0,T] 上观测到 n 个事件时
+    //     LLR = n * ln r - (r - 1) * lambda0 * T
+    // 时间项应当随时间连续累减，每条退休指令减 (r-1)/T_calm；事件只贡献 +ln r。
+    // 总量与原来的分段形式相同，但判决点从"事件时刻"变成"任意时刻"。
+    double t_norm = (double)inst_count / g_atft_state.calm_avg_interval;
+    g_atft_state.sprt_llr -= (g_atft_state.sprt_rate_ratio - 1.0) * t_norm;
+    if (g_atft_state.sprt_llr < g_atft_state.sprt_bound_b)
+        g_atft_state.sprt_llr = g_atft_state.sprt_bound_b;
+    if (g_atft_state.current_mode == ATFT_MODE_HIGH &&
+        g_atft_state.sprt_llr <= g_atft_state.sprt_bound_b) {
+        g_atft_state.current_mode = ATFT_MODE_LOW;
+        g_atft_state.mode_switch_count++;
+    }
 }
 
 void atft_report_ecc_event(void) {
@@ -150,8 +179,11 @@ void atft_report_ecc_event(void) {
     //       Poisson 速率在线变点检测的 Gamma 共轭闭式后验。
     if (g_atft_state.sprt_enabled) {
         double t_norm = (double)delta_inst / g_atft_state.calm_avg_interval;
+        // 时间驱动模式下，时间项已经由 atft_advance_insts 连续累减过了，
+        // 事件在这里只贡献 +ln r，否则会把同一段时间算两遍。
         g_atft_state.sprt_llr += g_atft_state.sprt_log_r
-                               - (g_atft_state.sprt_rate_ratio - 1.0) * t_norm;
+                               - (g_atft_sprt_time_driven ? 0.0
+                                  : (g_atft_state.sprt_rate_ratio - 1.0) * t_norm);
         if (g_atft_state.sprt_llr > g_atft_state.sprt_bound_a)
             g_atft_state.sprt_llr = g_atft_state.sprt_bound_a;
         if (g_atft_state.sprt_llr < g_atft_state.sprt_bound_b)

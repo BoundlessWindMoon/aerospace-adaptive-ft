@@ -1432,11 +1432,25 @@ static int run_switch_eval(void) {
                     double post = 0.0;
                     tnext = exp_sample(&rng, lam0);
                     while (post < calm_min) {
-                        post += tnext;
+                        // 把一个到达间隔切成细步再推进，这样"无事件流逝的时间"
+                        // 也有机会触发降档。事件流本身不变（间隔仍从指数分布抽），
+                        // 只是把模式的采样点从"事件时刻"变成"任意时刻"——
+                        // 事件驱动的判决规则在细步下结果逐位不变，所以这个改动
+                        // 对冻结基线是中性的，只是让时间驱动规则可被观测到。
+                        double left = tnext;
+                        int fell = 0;
+                        while (left > 0.0) {
+                            double step = left < 0.25 ? left : 0.25;
+                            atft_advance_insts((uint64_t)(step * ips));
+                            left -= step;
+                            post += step;
+                            if (atft_get_mode() == ATFT_MODE_LOW) { fell = 1; break; }
+                            if (post >= calm_min) break;
+                        }
+                        if (fell) break;
                         while (d < 4 && (calm_min + dwell_min + post) > next_win) {
                             atft_step_window(); next_win += win_min;
                         }
-                        atft_advance_insts((uint64_t)(tnext * ips));
                         atft_report_ecc_event();
                         if (atft_get_mode() == ATFT_MODE_LOW) break;
                         tnext = exp_sample(&rng, lam0);

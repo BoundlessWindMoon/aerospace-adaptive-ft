@@ -136,6 +136,14 @@ def ablation_matrix(delta_table, seed=None):
                                                                 "-atft-abft-insert",
                                                                 "-atft-layer-exclusive"],
                                                 mk({**denv, "ATFT_ABFT": "1"})),
+        # 近似副本在 x86 上是净亏损：gemm 里 10 条 fptrunc + 12 条 insertelement
+        # 去喂 3 条 <2 x float> fmul，而 <2 x float> 乘法与标量 double 同吞吐。
+        # 所以拿精确 fp64 副本做同样的分层，看哪个便宜。
+        ("opt_layered_exact",  "exact-tmr",    base + ["-atft-int-tmr-wire",
+                                                      "-atft-int-tmr-i64",
+                                                      "-atft-abft-insert",
+                                                      "-atft-layer-exclusive"],
+                                                mk({"ATFT_ABFT": "1"})),
         # D4 整数三模覆盖面扩到 i64（i32->i64 的下标扩展占 cast 注入点的 88%）
         ("opt_i64",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-tmr-i64"], mk(denv)),

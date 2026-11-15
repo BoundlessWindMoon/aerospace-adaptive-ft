@@ -2283,8 +2283,14 @@ Value *createInlineFastApproxVote(IRBuilder<> &IRB, Module *M,
 
   Value *a1_f32 = markVoterInternal(IRB.CreateExtractElement(vApprox2xF32, ConstantInt::get(I32Ty, 0), "a1.f32"));
   Value *a2_f32 = markVoterInternal(IRB.CreateExtractElement(vApprox2xF32, ConstantInt::get(I32Ty, 1), "a2.f32"));
-  Value *a1_f64 = markVoterInternal(IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64"));
-  Value *a2_f64 = markVoterInternal(IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64"));
+  // 通道本来就是 fp64 时（-atft-simd-f64：两份**精确**副本打进 <2 x double>）
+  // 不需要回扩，fpext double->double 也不合法
+  Value *a1_f64 = a1_f32->getType()->isDoubleTy()
+                      ? a1_f32
+                      : markVoterInternal(IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64"));
+  Value *a2_f64 = a2_f32->getType()->isDoubleTy()
+                      ? a2_f32
+                      : markVoterInternal(IRB.CreateFPExt(a2_f32, F64Ty, "a2.f64"));
 
   Function *FabsF64 = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F64Ty});
   Function *FabsF32 = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F32Ty});

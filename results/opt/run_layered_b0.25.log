@@ -1,0 +1,74 @@
+=== [1] 无故障近似误差包络剖析 ===
+  pb_gemm                E_f=1.126e-07  obs=112896
+  pb_2mm                 E_f=1.839e-07  obs=223488
+  pb_atax                E_f=1.053e-07  obs=4608
+  pb_bicg                E_f=1.036e-07  obs=4608
+  pb_jacobi2d            E_f=6.808e-08  obs=16928
+  pb_ludcmp              E_f=3.944e-07  obs=23780
+  pb_durbin              E_f=1.171e-07  obs=1600
+  pb_deriche             E_f=2.113e-04  obs=6152
+  pb_floyd_warshall      E_f=0.000e+00  obs=0
+  pb_nussinov            E_f=0.000e+00  obs=0
+  parsec_blackscholes    E_f=2.290e-04  obs=6137
+  dsp_kissfft            E_f=7.848e-05  obs=737
+  axc_sobel              E_f=0.000e+00  obs=38088
+  coast_crc16            E_f=0.000e+00  obs=0
+  coast_quicksort        E_f=0.000e+00  obs=0
+  obpmark_image_prep     E_f=0.000e+00  obs=0
+  obpmark_image_proc     E_f=0.000e+00  obs=0
+  -> 阈值表 /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/delta_table_a4_k4.csv
+=== [2] 消融 campaign (seed#0) ===
+  -> [native/fp64] flags=- trials=200
+  -> [native/int_arith] flags=- trials=200
+  -> [native/cast] flags=- trials=200
+  -> [native/load] flags=- trials=200
+  -> [native/addr] flags=- trials=200
+  -> [native/cmp_branch] flags=- trials=200
+  -> [opt_layered/fp64] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered/int_arith] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered/cast] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered/load] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered/addr] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered/cmp_branch] flags=-atft-cmp-tmr -atft-delta-runtime -atft-replica-exact -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered_exact/fp64] flags=-atft-cmp-tmr -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered_exact/int_arith] flags=-atft-cmp-tmr -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered_exact/cast] flags=-atft-cmp-tmr -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered_exact/load] flags=-atft-cmp-tmr -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered_exact/addr] flags=-atft-cmp-tmr -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+  -> [opt_layered_exact/cmp_branch] flags=-atft-cmp-tmr -atft-int-tmr-wire -atft-int-tmr-i64 -atft-abft-insert -atft-layer-exclusive trials=200
+
+=== 等权聚合 ===
+policy             倍率    SDC%     ±    DUE%     ±     检出恢复%     MWTF
+native           1.00   30.11  0.83   14.31  0.45      0.00      2.3
+opt_layered      5.60    6.22  0.56    6.93  0.39      4.18      1.4
+opt_layered_exact   5.22    5.86  0.55    6.82  0.39      5.23      1.5
+
+[native] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           29.42  2.98    0.00      0.00   10   2000
+  int_arith      44.15  2.09   24.55      0.00   17   3400
+  cast           16.05  1.69   57.82      0.00   17   3400
+  load           24.97  2.04    3.46      0.00   16   3200
+  addr            2.01  0.71    0.04      0.00   16   3200
+  cmp_branch     64.06  1.98    0.00      0.00   17   3400
+
+[opt_layered] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           14.46  2.55    0.42      8.08   10   2000
+  int_arith       8.81  1.30   10.52      2.84   17   3400
+  cast            6.53  1.12   29.23      0.79   17   3400
+  load            5.53  1.12    1.34      9.99   16   3200
+  addr            2.01  0.71    0.04      0.17   16   3200
+  cmp_branch      0.00  0.00    0.00      3.23   17   3400
+
+[opt_layered_exact] 分类别明细
+  category        SDC%     ±    DUE%     检出恢复%   负载     试验
+  fp64           13.04  2.49    0.04     16.73   10   2000
+  int_arith       7.70  1.27   10.19      0.13   17   3400
+  cast            7.02  1.14   29.27      0.33   17   3400
+  load            5.41  1.13    1.38     10.78   16   3200
+  addr            2.01  0.71    0.04      0.17   16   3200
+  cmp_branch      0.00  0.00    0.00      3.23   17   3400
+
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/fi_outcomes_a4_t200_b25_bud.csv
+-> /home/users/wangtianyu15/wtyWorkspace/aerospace-adaptive-ft/results/opt/aggregate_a4_t200_b25_bud.json

@@ -145,34 +145,31 @@ def main():
     print("  全程保护（q 用 k=2 上界）：%.2f 次 —— 冻结报告是 <1.53"
           % always_high["fail_mission"])
 
-    # --- 自适应：传感器增益扫描，检测器参数来自蒙特卡洛实测 ---
-    print("\n== 自适应（LOW=无保护，HIGH=全开+i64，r=100 的 SPRT α=β=0.01）==")
+    # --- 自适应：检测器参数全部来自 bin_switcheval 的蒙特卡洛实测 ---
+    # 细步采样修正：原来的恢复循环先加一个完整到达间隔再查模式，把回落滞后
+    # 系统性高估了（r=100 下 108.8 -> 65.7 min）。下面用修正后的数。
+    print("\n== 自适应：事件驱动 vs 时间驱动降档（r=100，α=β=0.01，3000 次过境）==")
     rows = []
-    for g, kappa, p_det, delay, recov in [
-            (1.000, "-",    0.9588, 3.563, 108.556),
-            (0.9925, "0.1", 0.9578, 3.581, 107.906),
-            (0.7875, "0.25", 0.8880, 4.120, 133.807),
-            (0.680, "32",   0.8288, 4.477, 154.048)]:
-        b = budget(orb, qN, qH, p_det, delay, recov)
+    for name, p_det, delay, recov, cl in [
+            ("事件驱动 / LOW=无保护", 0.9570, 3.580, 65.741, 1.0),
+            ("时间驱动 / LOW=无保护", 0.9847, 2.691, 9.067, 1.0),
+            ("事件驱动 / LOW=2.2×下界", 0.9570, 3.580, 65.741, 2.2),
+            ("时间驱动 / LOW=2.2×下界", 0.9847, 2.691, 9.067, 2.2)]:
+        qlow = qN if cl == 1.0 else qH * 10.0
+        b = budget(orb, qlow, qH, p_det, delay, recov, c_low=cl, c_high=8.25)
         ratio_fail = b["fail_mission"] / always_high["fail_mission"]
         ratio_cost = always_high["cost"] / b["cost"]
-        rows.append({"sensor_gain_g": g, "kappa": kappa, "p_detect": p_det,
-                     "delay_min": delay, "recovery_lag_min": recov,
-                     "quiet_per_orbit_min": round(b["quiet_per_orbit_min"], 2),
-                     "high_in_quiet_min": round(b["high_in_quiet_min"], 2),
-                     "low_exposure_min": round(b["W_low_min"], 3),
+        rows.append({"scenario": name, "p_detect": p_det, "delay_min": delay,
+                     "recovery_lag_min": recov, "c_low": cl,
                      "phi_high": round(b["phi_high"], 4),
                      "exp_cost_x": round(b["cost"], 3),
                      "fail_per_90d": round(b["fail_mission"], 2),
-                     "fail_vs_always_high": round(ratio_fail, 1),
                      "cost_saving_x": round(ratio_cost, 3),
                      "mwtf_ratio_vs_always_high": round(ratio_cost / ratio_fail, 4)})
-        print("  g=%-6.4f (κ=%-4s) 回落滞后 %.1f min vs 平静段 %.1f min -> "
-              "HIGH 占空 %.1f%%，期望开销 %.2f×，90 天失效 %.1f（全程保护的 %.0f 倍），"
-              "MWTF 比 %.3f"
-              % (g, kappa, recov, b["quiet_per_orbit_min"], 100 * b["phi_high"],
-                 b["cost"], b["fail_mission"], ratio_fail,
-                 ratio_cost / ratio_fail))
+        print("  %-24s HIGH 占空 %5.1f%%  期望开销 %.2f×  90 天失效 %7.2f  "
+              "相对全程保护省 %.2f×"
+              % (name, 100 * b["phi_high"], b["cost"], b["fail_mission"], ratio_cost))
+
 
     # --- 两个独立杠杆：回落速度 与 LOW 档的可靠性 ---
     print("\n== 杠杆一：回落滞后决定占空收益的上限（LOW 可靠性暂设与 HIGH 相同）==")
