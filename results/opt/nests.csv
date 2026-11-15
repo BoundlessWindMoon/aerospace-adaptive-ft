@@ -21,8 +21,8 @@ NEST,bench_pb_durbin,2,1,i1;,2,i0;i1;,2,fp,fadd;fdiv;fmul;fneg;phi;,1,cond_updat
 NEST,bench_pb_durbin,2,1,i1;,1,i1;,1,fp,,0,cond_update,cmp_branch,no_call
 NEST,bench_pb_deriche,2,2,i0;i1;,2,i0;i1;,2,fp,call;fadd;fdiv;fmul;fneg;fsub;phi;,0,cond_update,cmp_branch,has_call
 NEST,bench_pb_deriche,2,2,i0;i1;,2,i0;i1;,2,fp,fadd;fmul;,0,cond_update,cmp_branch,no_call
-NEST,bench_pb_floyd_warshall,3,2,i1;i2;,3,i0;i1;i2;,2,int,add;phi;,1,unconditional,cmp_branch,no_call
-NEST,bench_pb_nussinov,3,2,i0;i1;,3,i0;i1;i2;,3,int,add;phi;,1,unconditional,cmp_branch,no_call
+NEST,bench_pb_floyd_warshall,3,2,i1;i2;,3,i0;i1;i2;,2,int,add;phi;,1,cond_update,cmp_branch,no_call
+NEST,bench_pb_nussinov,3,2,i0;i1;,3,i0;i1;i2;,3,int,add;phi;,1,cond_update,cmp_branch,no_call
 NEST,bench_parsec_blackscholes,1,1,i0;,1,i0;,1,fp,call;fadd;fdiv;fmul;fneg;fsub;phi;,5,unconditional,cmp_branch,has_call
 NEST,bench_dsp_kissfft,1,1,i0;,1,i0;,1,fp,,0,cond_update,cmp_branch,no_call
 NEST,bench_axc_sobel,2,2,i0;i1;,2,i0;i1;,2,int,,0,cond_update,cmp_branch,no_call

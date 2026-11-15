@@ -1166,6 +1166,7 @@ void dumpAllNests(Function &F, LoopInfo &LI, ScalarEvolution &SE,
         std::set<std::string> ops;
         bool hasCall = false;
         unsigned phiOutsideHeader = 0;
+        bool selfPhi = false;
         std::set<Value *> seen;
         std::vector<Value *> work{SI->getValueOperand()};
         while (!work.empty()) {
@@ -1203,6 +1204,17 @@ void dumpAllNests(Function &F, LoopInfo &LI, ScalarEvolution &SE,
           }
           for (Use &U : inst->operands()) work.push_back(U.get());
         }
+        // store 本身是否被条件保护。floyd-warshall / nussinov 写成
+        //     if (d[i][j] > d[i][k] + d[k][j]) d[i][j] = ...;
+        // 也就是**条件写**而不是 phi 选择，所以要看 store 所在块的前驱是不是
+        // 由比较驱动的条件分支。条件写等价于 min/max，落在半环上，没有加法逆元。
+        bool guardedStore = false;
+        for (BasicBlock *pred : predecessors(SI->getParent())) {
+          auto *br = dyn_cast<BranchInst>(pred->getTerminator());
+          if (br && br->isConditional() && isa<CmpInst>(br->getCondition()) &&
+              Inner->contains(pred))
+            guardedStore = true;
+        }
         // 最内层循环体里是否有喂给条件分支的比较（min/max 的另一半证据）
         bool cmpDrivesBranch = false;
         for (BasicBlock *B2 : Inner->blocks()) {
@@ -1224,7 +1236,9 @@ void dumpAllNests(Function &F, LoopInfo &LI, ScalarEvolution &SE,
         line += "," + std::string(ty->isFloatingPointTy() ? "fp" : "int") + ",";
         for (const std::string &o : ops) line += o + ";";
         line += "," + std::to_string(phiOutsideHeader) + "," +
-                std::string(cmpDrivesBranch ? "cmp_branch" : "no_cmp_branch") +
+                std::string((selfPhi || guardedStore) ? "cond_update"
+                                                      : "unconditional") +
+                "," + std::string(cmpDrivesBranch ? "cmp_branch" : "no_cmp_branch") +
                 "," + std::string(hasCall ? "has_call" : "no_call");
         if (emitted.insert(line).second) OS << line << "\n";
       }
@@ -2863,7 +2877,8 @@ public:
       std::ofstream nf(AtftDumpNests);
       if (nf.is_open()) {
         nf << "kind,function,nest_depth,out_dims,out_idx,read_dims,read_idx,"
-              "max_array_dims,elem_type,ops,phi_outside_header,cmp_branch,calls\n";
+              "max_array_dims,elem_type,ops,phi_outside_header,cond_self_update,"
+              "cmp_branch,calls\n";
         for (Function *F : targetFuncs) {
           expandFMulAddIntrinsics(*F);
           auto &LI = FAM.getResult<LoopAnalysis>(*F);

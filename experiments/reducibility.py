@@ -57,7 +57,12 @@ def classify(nest):
         if n_stage > 0:
             why += "（校验要每个阶段跑一次）"
         return False, why
-    if nest["cond_self_update"] != "cond_update" and int(nest["phi_outside_header"]) > 0:
+    if int(nest["phi_outside_header"]) > 0:
+        # 非循环头上的 phi = 值由控制流选出来（min/max/条件更新）。
+        # 这个信号在全集上会过度标记（durbin、blackscholes 也有），但它们已经被
+        # C1 排除，所以在"通过 C1 的那一组"里它是精确的：只命中 floyd-warshall。
+        # dump 里另外两列（cond_self_update / cmp_branch）保留为原始证据但不参与
+        # 判定 —— 循环边界检查本身就是条件分支，那两列几乎恒真。
         return "semiring", (f"代价可降阶（{mad}+{n_stage} < {nd}）但归约是条件更新："
                             "min/max 型半环没有加法逆元，校验和无定义")
     return True, f"代价可降阶（{mad}+{n_stage} < {nd}）且归约在环上"
