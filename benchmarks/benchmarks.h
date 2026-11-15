@@ -80,6 +80,38 @@ void bench_pb_durbin(int n, const double *r, double *y);
 void bench_pb_deriche(int w, int h, double alpha, const double *imgIn,
                       double *imgOut, double *y1, double *y2);
 
+// ---- Suite A (扩展): PolyBench/C 4.2.1 完整 30 内核的其余 20 个 FP64 内核 ----
+void bench_pb_correlation(int m, int n, double float_n,
+                          double *data, double *corr, double *mean, double *stddev);
+void bench_pb_covariance(int m, int n, double float_n,
+                         double *data, double *cov, double *mean);
+void bench_pb_gemver(int n, double alpha, double beta, double *A,
+                     double *u1, double *v1, double *u2, double *v2,
+                     double *w, double *x, double *y, double *z);
+void bench_pb_gesummv(int n, double alpha, double beta,
+                      double *A, double *B, double *tmp, double *x, double *y);
+void bench_pb_symm(int m, int n, double alpha, double beta,
+                   double *C, double *A, double *B);
+void bench_pb_syr2k(int n, int m, double alpha, double beta,
+                    double *C, double *A, double *B);
+void bench_pb_syrk(int n, int m, double alpha, double beta, double *C, double *A);
+void bench_pb_trmm(int m, int n, double alpha, double *A, double *B);
+void bench_pb_3mm(int ni, int nj, int nk, int nl, int nm,
+                  double *E, double *A, double *B, double *F,
+                  double *C, double *D, double *G);
+void bench_pb_doitgen(int nr, int nq, int np, double *A, double *C4, double *sum);
+void bench_pb_mvt(int n, double *x1, double *x2, double *y1, double *y2, double *A);
+void bench_pb_cholesky(int n, double *A);
+void bench_pb_gramschmidt(int m, int n, double *A, double *R, double *Q);
+void bench_pb_lu(int n, double *A);
+void bench_pb_trisolv(int n, double *L, double *x, double *b);
+void bench_pb_adi(int tsteps, int n, double *u, double *v, double *p, double *q);
+void bench_pb_fdtd2d(int tmax, int nx, int ny,
+                     double *ex, double *ey, double *hz, double *fict);
+void bench_pb_heat3d(int tsteps, int n, double *A, double *B);
+void bench_pb_jacobi1d(int tsteps, int n, double *A, double *B);
+void bench_pb_seidel2d(int tsteps, int n, double *A);
+
 // ---- Suite A: PolyBench/C 4.2.1, INT32 (不规则控制流) ----
 void bench_pb_floyd_warshall(int n, int32_t *path);
 

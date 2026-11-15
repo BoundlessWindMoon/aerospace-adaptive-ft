@@ -137,6 +137,269 @@
 #undef _PB_W
 #undef _PB_H
 
+// (k) datamining/correlation
+#define init_array  pb_correlation_init_array
+#define print_array pb_correlation_print_array
+#define main        pb_correlation_unused_main
+#include "../third_party/polybench-c/datamining/correlation/correlation.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef M
+#undef N
+#undef _PB_M
+#undef _PB_N
+
+// (l) datamining/covariance
+#define init_array  pb_covariance_init_array
+#define print_array pb_covariance_print_array
+#define main        pb_covariance_unused_main
+#include "../third_party/polybench-c/datamining/covariance/covariance.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef M
+#undef N
+#undef _PB_M
+#undef _PB_N
+
+// (m) linear-algebra/blas/gemver
+#define init_array  pb_gemver_init_array
+#define print_array pb_gemver_print_array
+#define main        pb_gemver_unused_main
+#include "../third_party/polybench-c/linear-algebra/blas/gemver/gemver.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+// (n) linear-algebra/blas/gesummv
+#define init_array  pb_gesummv_init_array
+#define print_array pb_gesummv_print_array
+#define main        pb_gesummv_unused_main
+#include "../third_party/polybench-c/linear-algebra/blas/gesummv/gesummv.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+
+// (o) linear-algebra/blas/symm
+#define init_array  pb_symm_init_array
+#define print_array pb_symm_print_array
+#define main        pb_symm_unused_main
+#include "../third_party/polybench-c/linear-algebra/blas/symm/symm.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef M
+#undef N
+#undef _PB_M
+#undef _PB_N
+
+// (p) linear-algebra/blas/syr2k
+#define init_array  pb_syr2k_init_array
+#define print_array pb_syr2k_print_array
+#define main        pb_syr2k_unused_main
+#include "../third_party/polybench-c/linear-algebra/blas/syr2k/syr2k.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef M
+#undef N
+#undef _PB_M
+#undef _PB_N
+
+// (q) linear-algebra/blas/syrk
+#define init_array  pb_syrk_init_array
+#define print_array pb_syrk_print_array
+#define main        pb_syrk_unused_main
+#include "../third_party/polybench-c/linear-algebra/blas/syrk/syrk.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef M
+#undef N
+#undef _PB_M
+#undef _PB_N
+
+// (r) linear-algebra/blas/trmm
+#define init_array  pb_trmm_init_array
+#define print_array pb_trmm_print_array
+#define main        pb_trmm_unused_main
+#include "../third_party/polybench-c/linear-algebra/blas/trmm/trmm.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef M
+#undef N
+#undef _PB_M
+#undef _PB_N
+
+
+// (s) linear-algebra/kernels/3mm
+#define init_array  pb_3mm_init_array
+#define print_array pb_3mm_print_array
+#define main        pb_3mm_unused_main
+#include "../third_party/polybench-c/linear-algebra/kernels/3mm/3mm.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef NI
+#undef NJ
+#undef NK
+#undef NL
+#undef NM
+#undef _PB_NI
+#undef _PB_NJ
+#undef _PB_NK
+#undef _PB_NL
+#undef _PB_NM
+
+// (t) linear-algebra/kernels/doitgen
+#define init_array  pb_doitgen_init_array
+#define print_array pb_doitgen_print_array
+#define main        pb_doitgen_unused_main
+#include "../third_party/polybench-c/linear-algebra/kernels/doitgen/doitgen.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef NQ
+#undef NR
+#undef NP
+#undef _PB_NQ
+#undef _PB_NR
+#undef _PB_NP
+
+// (u) linear-algebra/kernels/mvt
+#define init_array  pb_mvt_init_array
+#define print_array pb_mvt_print_array
+#define main        pb_mvt_unused_main
+#include "../third_party/polybench-c/linear-algebra/kernels/mvt/mvt.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+
+// (v) linear-algebra/solvers/cholesky（上游 init 已构造正定矩阵，保留其 init）
+#define init_array  pb_cholesky_init_array
+#define print_array pb_cholesky_print_array
+#define main        pb_cholesky_unused_main
+#include "../third_party/polybench-c/linear-algebra/solvers/cholesky/cholesky.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+// (w) linear-algebra/solvers/gramschmidt
+#define init_array  pb_gramschmidt_init_array
+#define print_array pb_gramschmidt_print_array
+#define main        pb_gramschmidt_unused_main
+#include "../third_party/polybench-c/linear-algebra/solvers/gramschmidt/gramschmidt.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef M
+#undef N
+#undef _PB_M
+#undef _PB_N
+
+// (x) linear-algebra/solvers/lu
+#define init_array  pb_lu_init_array
+#define print_array pb_lu_print_array
+#define main        pb_lu_unused_main
+#include "../third_party/polybench-c/linear-algebra/solvers/lu/lu.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+// (y) linear-algebra/solvers/trisolv
+#define init_array  pb_trisolv_init_array
+#define print_array pb_trisolv_print_array
+#define main        pb_trisolv_unused_main
+#include "../third_party/polybench-c/linear-algebra/solvers/trisolv/trisolv.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef N
+#undef _PB_N
+
+
+// (z) stencils/adi
+#define init_array  pb_adi_init_array
+#define print_array pb_adi_print_array
+#define main        pb_adi_unused_main
+#include "../third_party/polybench-c/stencils/adi/adi.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef TSTEPS
+#undef N
+#undef _PB_TSTEPS
+#undef _PB_N
+
+// (aa) stencils/fdtd-2d
+#define init_array  pb_fdtd2d_init_array
+#define print_array pb_fdtd2d_print_array
+#define main        pb_fdtd2d_unused_main
+#include "../third_party/polybench-c/stencils/fdtd-2d/fdtd-2d.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef TMAX
+#undef NX
+#undef NY
+#undef _PB_TMAX
+#undef _PB_NX
+#undef _PB_NY
+
+// (ab) stencils/heat-3d
+#define init_array  pb_heat3d_init_array
+#define print_array pb_heat3d_print_array
+#define main        pb_heat3d_unused_main
+#include "../third_party/polybench-c/stencils/heat-3d/heat-3d.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef TSTEPS
+#undef N
+#undef _PB_TSTEPS
+#undef _PB_N
+
+// (ac) stencils/jacobi-1d
+#define init_array  pb_jacobi1d_init_array
+#define print_array pb_jacobi1d_print_array
+#define main        pb_jacobi1d_unused_main
+#include "../third_party/polybench-c/stencils/jacobi-1d/jacobi-1d.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef TSTEPS
+#undef N
+#undef _PB_TSTEPS
+#undef _PB_N
+
+// (ad) stencils/seidel-2d
+#define init_array  pb_seidel2d_init_array
+#define print_array pb_seidel2d_print_array
+#define main        pb_seidel2d_unused_main
+#include "../third_party/polybench-c/stencils/seidel-2d/seidel-2d.c"
+#undef init_array
+#undef print_array
+#undef main
+#undef TSTEPS
+#undef N
+#undef _PB_TSTEPS
+#undef _PB_N
+
+
 // ============================================================================
 // 2. PolyBench/C 4.2.1 —— INT32 内核（不规则控制流 / 整数数据通路）
 //    切换 DATA_TYPE 到 int，需先清掉 FP64 一组宏定义
@@ -288,6 +551,121 @@ void bench_pb_deriche(int w, int h, double alpha, const double *imgIn,
                    (double (*)[h])imgOut,
                    (double (*)[h])y1,
                    (double (*)[h])y2);
+}
+
+__attribute__((noinline))
+void bench_pb_correlation(int m, int n, double float_n,
+                          double *data, double *corr, double *mean, double *stddev) {
+    kernel_correlation(m, n, float_n, (double (*)[m])data, (double (*)[m])corr, mean, stddev);
+}
+
+__attribute__((noinline))
+void bench_pb_covariance(int m, int n, double float_n,
+                         double *data, double *cov, double *mean) {
+    kernel_covariance(m, n, float_n, (double (*)[m])data, (double (*)[m])cov, mean);
+}
+
+__attribute__((noinline))
+void bench_pb_gemver(int n, double alpha, double beta, double *A,
+                     double *u1, double *v1, double *u2, double *v2,
+                     double *w, double *x, double *y, double *z) {
+    kernel_gemver(n, alpha, beta, (double (*)[n])A, u1, v1, u2, v2, w, x, y, z);
+}
+
+__attribute__((noinline))
+void bench_pb_gesummv(int n, double alpha, double beta,
+                      double *A, double *B, double *tmp, double *x, double *y) {
+    kernel_gesummv(n, alpha, beta, (double (*)[n])A, (double (*)[n])B, tmp, x, y);
+}
+
+__attribute__((noinline))
+void bench_pb_symm(int m, int n, double alpha, double beta,
+                   double *C, double *A, double *B) {
+    kernel_symm(m, n, alpha, beta, (double (*)[n])C, (double (*)[m])A, (double (*)[n])B);
+}
+
+__attribute__((noinline))
+void bench_pb_syr2k(int n, int m, double alpha, double beta,
+                    double *C, double *A, double *B) {
+    kernel_syr2k(n, m, alpha, beta, (double (*)[n])C, (double (*)[m])A, (double (*)[m])B);
+}
+
+__attribute__((noinline))
+void bench_pb_syrk(int n, int m, double alpha, double beta, double *C, double *A) {
+    kernel_syrk(n, m, alpha, beta, (double (*)[n])C, (double (*)[m])A);
+}
+
+__attribute__((noinline))
+void bench_pb_trmm(int m, int n, double alpha, double *A, double *B) {
+    kernel_trmm(m, n, alpha, (double (*)[m])A, (double (*)[n])B);
+}
+
+__attribute__((noinline))
+void bench_pb_3mm(int ni, int nj, int nk, int nl, int nm,
+                  double *E, double *A, double *B, double *F,
+                  double *C, double *D, double *G) {
+    kernel_3mm(ni, nj, nk, nl, nm,
+               (double (*)[nj])E, (double (*)[nk])A, (double (*)[nj])B,
+               (double (*)[nl])F, (double (*)[nm])C, (double (*)[nl])D,
+               (double (*)[nl])G);
+}
+
+__attribute__((noinline))
+void bench_pb_doitgen(int nr, int nq, int np, double *A, double *C4, double *sum) {
+    kernel_doitgen(nr, nq, np, (double (*)[nq][np])A, (double (*)[np])C4, sum);
+}
+
+__attribute__((noinline))
+void bench_pb_mvt(int n, double *x1, double *x2, double *y1, double *y2, double *A) {
+    kernel_mvt(n, x1, x2, y1, y2, (double (*)[n])A);
+}
+
+__attribute__((noinline))
+void bench_pb_cholesky(int n, double *A) {
+    kernel_cholesky(n, (double (*)[n])A);
+}
+
+__attribute__((noinline))
+void bench_pb_gramschmidt(int m, int n, double *A, double *R, double *Q) {
+    kernel_gramschmidt(m, n, (double (*)[n])A, (double (*)[n])R, (double (*)[n])Q);
+}
+
+__attribute__((noinline))
+void bench_pb_lu(int n, double *A) {
+    kernel_lu(n, (double (*)[n])A);
+}
+
+__attribute__((noinline))
+void bench_pb_trisolv(int n, double *L, double *x, double *b) {
+    kernel_trisolv(n, (double (*)[n])L, x, b);
+}
+
+__attribute__((noinline))
+void bench_pb_adi(int tsteps, int n, double *u, double *v, double *p, double *q) {
+    kernel_adi(tsteps, n, (double (*)[n])u, (double (*)[n])v,
+               (double (*)[n])p, (double (*)[n])q);
+}
+
+__attribute__((noinline))
+void bench_pb_fdtd2d(int tmax, int nx, int ny,
+                     double *ex, double *ey, double *hz, double *fict) {
+    kernel_fdtd_2d(tmax, nx, ny, (double (*)[ny])ex, (double (*)[ny])ey,
+                   (double (*)[ny])hz, fict);
+}
+
+__attribute__((noinline))
+void bench_pb_heat3d(int tsteps, int n, double *A, double *B) {
+    kernel_heat_3d(tsteps, n, (double (*)[n][n])A, (double (*)[n][n])B);
+}
+
+__attribute__((noinline))
+void bench_pb_jacobi1d(int tsteps, int n, double *A, double *B) {
+    kernel_jacobi_1d(tsteps, n, A, B);
+}
+
+__attribute__((noinline))
+void bench_pb_seidel2d(int tsteps, int n, double *A) {
+    kernel_seidel_2d(tsteps, n, (double (*)[n])A);
 }
 
 __attribute__((noinline))

@@ -188,6 +188,27 @@ static const bench_meta_t BENCHES[] = {
     { "coast_quicksort",    "COAST tests (BYU/LANL)",  BK_INT,  BTAG_AEROSPACE },
     { "obpmark_image_prep", "OBPMark v0.3 (ESA+BSC)",  BK_INT,  BTAG_REPR | BTAG_AEROSPACE },
     { "obpmark_image_proc", "OBPMark v0.3 (ESA+BSC)",  BK_INT,  BTAG_REPR | BTAG_AEROSPACE },
+    /* PolyBench/C 4.2.1 完整 30 内核覆盖的其余 20 个 FP64 内核（MINI_DATASET） */
+    { "pb_correlation",     "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_covariance",      "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_gemver",          "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_gesummv",         "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_symm",            "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_syr2k",           "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_syrk",            "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_trmm",            "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_3mm",             "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_doitgen",         "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_mvt",             "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_cholesky",        "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_gramschmidt",     "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_lu",              "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_trisolv",         "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_adi",             "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_fdtd2d",          "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_heat3d",          "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_jacobi1d",        "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "pb_seidel2d",        "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
 };
 
 #define NUM_BENCHES ((int)(sizeof(BENCHES) / sizeof(BENCHES[0])))
@@ -230,6 +251,46 @@ static uint64_t splitmix64(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
+// PolyBench/C 4.2.1 MINI_DATASET 维度（与各内核头文件 MINI 分支逐一核对，
+// 缓冲区按此精确分配，欠配即为静默堆越界）
+#define PBM_CORR_M 28
+#define PBM_CORR_N 32
+#define PBM_GEMVER_N 40
+#define PBM_GESUMMV_N 30
+#define PBM_SYMM_M 20
+#define PBM_SYMM_N 30
+#define PBM_SYR2K_M 20
+#define PBM_SYR2K_N 30
+#define PBM_SYRK_M 20
+#define PBM_SYRK_N 30
+#define PBM_TRMM_M 20
+#define PBM_TRMM_N 30
+#define PBM_3MM_NI 16
+#define PBM_3MM_NJ 18
+#define PBM_3MM_NK 20
+#define PBM_3MM_NL 22
+#define PBM_3MM_NM 24
+#define PBM_DOITGEN_NR 10
+#define PBM_DOITGEN_NQ 8
+#define PBM_DOITGEN_NP 12
+#define PBM_MVT_N 40
+#define PBM_CHOLESKY_N 40
+#define PBM_GS_M 20
+#define PBM_GS_N 30
+#define PBM_LU_N 40
+#define PBM_TRISOLV_N 40
+#define PBM_ADI_TSTEPS 20
+#define PBM_ADI_N 20
+#define PBM_FDTD_TMAX 20
+#define PBM_FDTD_NX 20
+#define PBM_FDTD_NY 30
+#define PBM_HEAT_TSTEPS 20
+#define PBM_HEAT_N 10
+#define PBM_JAC1D_TSTEPS 20
+#define PBM_JAC1D_N 30
+#define PBM_SEIDEL_TSTEPS 20
+#define PBM_SEIDEL_N 40
+
 typedef struct {
     int n_mat;
     int n_lu, n_dur;
@@ -271,6 +332,28 @@ typedef struct {
 
     // 整数/uint8 内核的输出在计时窗口外统一导出到 double 缓冲，供 QoR 复用
     double *fw_out_d, *nus_out_d, *sobel_out_d, *crc_out_d, *qs_out_d;
+
+    // PolyBench/C 4.2.1 补齐的 20 个 FP64 内核缓冲（*0 为就地改写内核的原始副本）
+    double *corr_data, *corr_data0, *corr_corr, *corr_mean, *corr_stddev;
+    double *cov_data, *cov_data0, *cov_cov, *cov_mean;
+    double *gmv_A, *gmv_A0, *gmv_u1, *gmv_v1, *gmv_u2, *gmv_v2, *gmv_w, *gmv_x, *gmv_y, *gmv_z;
+    double *gsv_A, *gsv_B, *gsv_tmp, *gsv_x, *gsv_y;
+    double *symm_C, *symm_C0, *symm_A, *symm_B;
+    double *s2k_C, *s2k_C0, *s2k_A, *s2k_B;
+    double *syk_C, *syk_C0, *syk_A;
+    double *trmm_A, *trmm_B, *trmm_B0;
+    double *m3_A, *m3_B, *m3_C, *m3_D, *m3_E, *m3_F, *m3_G;
+    double *dtg_A, *dtg_A0, *dtg_C4, *dtg_sum;
+    double *mvt_A, *mvt_x1, *mvt_x1_0, *mvt_x2, *mvt_x2_0, *mvt_y1, *mvt_y2;
+    double *chol_A, *chol_A0;
+    double *gs_A, *gs_A0, *gs_R, *gs_Q;
+    double *lu2_A, *lu2_A0;
+    double *tri_L, *tri_x, *tri_b;
+    double *adi_u, *adi_u0, *adi_v, *adi_p, *adi_q;
+    double *fd_ex, *fd_ex0, *fd_ey, *fd_ey0, *fd_hz, *fd_hz0, *fd_fict;
+    double *h3_A, *h3_A0, *h3_B, *h3_B0;
+    double *j1_A, *j1_A0, *j1_B, *j1_B0;
+    double *sd_A, *sd_A0;
 
     double *out_ptrs[NUM_BENCHES];
     int     out_sizes[NUM_BENCHES];
@@ -475,6 +558,245 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     ws->out_ptrs[15] = ws->obp_prep_d; ws->out_sizes[15] = obp_px;         ws->peak_vals[15] = 65535.0;ws->perf_iters[15] = 600;
     ws->out_ptrs[16] = ws->obp_proc_d; ws->out_sizes[16] = obp_bin;        ws->peak_vals[16] = 65535.0;ws->perf_iters[16] = 400;
 
+    // ---- PolyBench/C 4.2.1 补齐内核：按 MINI 维度精确分配 ----
+    ws->corr_data=calloc(PBM_CORR_N*PBM_CORR_M,sizeof(double));
+    ws->corr_data0=calloc(PBM_CORR_N*PBM_CORR_M,sizeof(double));
+    ws->corr_corr=calloc(PBM_CORR_M*PBM_CORR_M,sizeof(double));
+    ws->corr_mean=calloc(PBM_CORR_M,sizeof(double));
+    ws->corr_stddev=calloc(PBM_CORR_M,sizeof(double));
+    ws->cov_data=calloc(PBM_CORR_N*PBM_CORR_M,sizeof(double));
+    ws->cov_data0=calloc(PBM_CORR_N*PBM_CORR_M,sizeof(double));
+    ws->cov_cov=calloc(PBM_CORR_M*PBM_CORR_M,sizeof(double));
+    ws->cov_mean=calloc(PBM_CORR_M,sizeof(double));
+    ws->gmv_A=calloc(PBM_GEMVER_N*PBM_GEMVER_N,sizeof(double));
+    ws->gmv_A0=calloc(PBM_GEMVER_N*PBM_GEMVER_N,sizeof(double));
+    ws->gmv_u1=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gmv_v1=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gmv_u2=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gmv_v2=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gmv_w=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gmv_x=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gmv_y=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gmv_z=calloc(PBM_GEMVER_N,sizeof(double));
+    ws->gsv_A=calloc(PBM_GESUMMV_N*PBM_GESUMMV_N,sizeof(double));
+    ws->gsv_B=calloc(PBM_GESUMMV_N*PBM_GESUMMV_N,sizeof(double));
+    ws->gsv_tmp=calloc(PBM_GESUMMV_N,sizeof(double));
+    ws->gsv_x=calloc(PBM_GESUMMV_N,sizeof(double));
+    ws->gsv_y=calloc(PBM_GESUMMV_N,sizeof(double));
+    ws->symm_C=calloc(PBM_SYMM_M*PBM_SYMM_N,sizeof(double));
+    ws->symm_C0=calloc(PBM_SYMM_M*PBM_SYMM_N,sizeof(double));
+    ws->symm_A=calloc(PBM_SYMM_M*PBM_SYMM_M,sizeof(double));
+    ws->symm_B=calloc(PBM_SYMM_M*PBM_SYMM_N,sizeof(double));
+    ws->s2k_C=calloc(PBM_SYR2K_N*PBM_SYR2K_N,sizeof(double));
+    ws->s2k_C0=calloc(PBM_SYR2K_N*PBM_SYR2K_N,sizeof(double));
+    ws->s2k_A=calloc(PBM_SYR2K_N*PBM_SYR2K_M,sizeof(double));
+    ws->s2k_B=calloc(PBM_SYR2K_N*PBM_SYR2K_M,sizeof(double));
+    ws->syk_C=calloc(PBM_SYRK_N*PBM_SYRK_N,sizeof(double));
+    ws->syk_C0=calloc(PBM_SYRK_N*PBM_SYRK_N,sizeof(double));
+    ws->syk_A=calloc(PBM_SYRK_N*PBM_SYRK_M,sizeof(double));
+    ws->trmm_A=calloc(PBM_TRMM_M*PBM_TRMM_M,sizeof(double));
+    ws->trmm_B=calloc(PBM_TRMM_M*PBM_TRMM_N,sizeof(double));
+    ws->trmm_B0=calloc(PBM_TRMM_M*PBM_TRMM_N,sizeof(double));
+    ws->m3_A=calloc(PBM_3MM_NI*PBM_3MM_NK,sizeof(double));
+    ws->m3_B=calloc(PBM_3MM_NK*PBM_3MM_NJ,sizeof(double));
+    ws->m3_C=calloc(PBM_3MM_NJ*PBM_3MM_NM,sizeof(double));
+    ws->m3_D=calloc(PBM_3MM_NM*PBM_3MM_NL,sizeof(double));
+    ws->m3_E=calloc(PBM_3MM_NI*PBM_3MM_NJ,sizeof(double));
+    ws->m3_F=calloc(PBM_3MM_NJ*PBM_3MM_NL,sizeof(double));
+    ws->m3_G=calloc(PBM_3MM_NI*PBM_3MM_NL,sizeof(double));
+    ws->dtg_A=calloc(PBM_DOITGEN_NR*PBM_DOITGEN_NQ*PBM_DOITGEN_NP,sizeof(double));
+    ws->dtg_A0=calloc(PBM_DOITGEN_NR*PBM_DOITGEN_NQ*PBM_DOITGEN_NP,sizeof(double));
+    ws->dtg_C4=calloc(PBM_DOITGEN_NP*PBM_DOITGEN_NP,sizeof(double));
+    ws->dtg_sum=calloc(PBM_DOITGEN_NP,sizeof(double));
+    ws->mvt_A=calloc(PBM_MVT_N*PBM_MVT_N,sizeof(double));
+    ws->mvt_x1=calloc(PBM_MVT_N,sizeof(double));
+    ws->mvt_x1_0=calloc(PBM_MVT_N,sizeof(double));
+    ws->mvt_x2=calloc(PBM_MVT_N,sizeof(double));
+    ws->mvt_x2_0=calloc(PBM_MVT_N,sizeof(double));
+    ws->mvt_y1=calloc(PBM_MVT_N,sizeof(double));
+    ws->mvt_y2=calloc(PBM_MVT_N,sizeof(double));
+    ws->chol_A=calloc(PBM_CHOLESKY_N*PBM_CHOLESKY_N,sizeof(double));
+    ws->chol_A0=calloc(PBM_CHOLESKY_N*PBM_CHOLESKY_N,sizeof(double));
+    ws->gs_A=calloc(PBM_GS_M*PBM_GS_N,sizeof(double));
+    ws->gs_A0=calloc(PBM_GS_M*PBM_GS_N,sizeof(double));
+    ws->gs_R=calloc(PBM_GS_N*PBM_GS_N,sizeof(double));
+    ws->gs_Q=calloc(PBM_GS_M*PBM_GS_N,sizeof(double));
+    ws->lu2_A=calloc(PBM_LU_N*PBM_LU_N,sizeof(double));
+    ws->lu2_A0=calloc(PBM_LU_N*PBM_LU_N,sizeof(double));
+    ws->tri_L=calloc(PBM_TRISOLV_N*PBM_TRISOLV_N,sizeof(double));
+    ws->tri_x=calloc(PBM_TRISOLV_N,sizeof(double));
+    ws->tri_b=calloc(PBM_TRISOLV_N,sizeof(double));
+    ws->adi_u=calloc(PBM_ADI_N*PBM_ADI_N,sizeof(double));
+    ws->adi_u0=calloc(PBM_ADI_N*PBM_ADI_N,sizeof(double));
+    ws->adi_v=calloc(PBM_ADI_N*PBM_ADI_N,sizeof(double));
+    ws->adi_p=calloc(PBM_ADI_N*PBM_ADI_N,sizeof(double));
+    ws->adi_q=calloc(PBM_ADI_N*PBM_ADI_N,sizeof(double));
+    ws->fd_ex=calloc(PBM_FDTD_NX*PBM_FDTD_NY,sizeof(double));
+    ws->fd_ex0=calloc(PBM_FDTD_NX*PBM_FDTD_NY,sizeof(double));
+    ws->fd_ey=calloc(PBM_FDTD_NX*PBM_FDTD_NY,sizeof(double));
+    ws->fd_ey0=calloc(PBM_FDTD_NX*PBM_FDTD_NY,sizeof(double));
+    ws->fd_hz=calloc(PBM_FDTD_NX*PBM_FDTD_NY,sizeof(double));
+    ws->fd_hz0=calloc(PBM_FDTD_NX*PBM_FDTD_NY,sizeof(double));
+    ws->fd_fict=calloc(PBM_FDTD_TMAX,sizeof(double));
+    ws->h3_A=calloc(PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N,sizeof(double));
+    ws->h3_A0=calloc(PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N,sizeof(double));
+    ws->h3_B=calloc(PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N,sizeof(double));
+    ws->h3_B0=calloc(PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N,sizeof(double));
+    ws->j1_A=calloc(PBM_JAC1D_N,sizeof(double));
+    ws->j1_A0=calloc(PBM_JAC1D_N,sizeof(double));
+    ws->j1_B=calloc(PBM_JAC1D_N,sizeof(double));
+    ws->j1_B0=calloc(PBM_JAC1D_N,sizeof(double));
+    ws->sd_A=calloc(PBM_SEIDEL_N*PBM_SEIDEL_N,sizeof(double));
+    ws->sd_A0=calloc(PBM_SEIDEL_N*PBM_SEIDEL_N,sizeof(double));
+
+// ---- 按上游 init_array 公式逐一复刻初始化（静态 init_array 无法跨 TU 调用）----
+    { int i,j,k;
+      // correlation: data[N][M]=(DATA_TYPE)(i*j)/M + i ; float_n=N
+      for (i=0;i<PBM_CORR_N;i++) for (j=0;j<PBM_CORR_M;j++)
+        ws->corr_data0[i*PBM_CORR_M+j]=(double)(i*j)/PBM_CORR_M + i;
+      // covariance: data[N][M]=((DATA_TYPE)i*j)/M ; float_n=n
+      for (i=0;i<PBM_CORR_N;i++) for (j=0;j<PBM_CORR_M;j++)
+        ws->cov_data0[i*PBM_CORR_M+j]=((double)i*j)/PBM_CORR_M;
+      // gemver
+      { double fn=(double)PBM_GEMVER_N;
+        for (i=0;i<PBM_GEMVER_N;i++){
+          ws->gmv_u1[i]=i; ws->gmv_u2[i]=((i+1)/fn)/2.0;
+          ws->gmv_v1[i]=((i+1)/fn)/4.0; ws->gmv_v2[i]=((i+1)/fn)/6.0;
+          ws->gmv_y[i]=((i+1)/fn)/8.0; ws->gmv_z[i]=((i+1)/fn)/9.0;
+          ws->gmv_x[i]=0.0; ws->gmv_w[i]=0.0;
+          for (j=0;j<PBM_GEMVER_N;j++)
+            ws->gmv_A0[i*PBM_GEMVER_N+j]=(double)(i*j % PBM_GEMVER_N)/PBM_GEMVER_N;
+        } }
+      // gesummv (A,B,x 只读)
+      for (i=0;i<PBM_GESUMMV_N;i++){
+        ws->gsv_x[i]=(double)(i%PBM_GESUMMV_N)/PBM_GESUMMV_N;
+        for (j=0;j<PBM_GESUMMV_N;j++){
+          ws->gsv_A[i*PBM_GESUMMV_N+j]=(double)((i*j+1)%PBM_GESUMMV_N)/PBM_GESUMMV_N;
+          ws->gsv_B[i*PBM_GESUMMV_N+j]=(double)((i*j+2)%PBM_GESUMMV_N)/PBM_GESUMMV_N;
+        } }
+      // symm
+      for (i=0;i<PBM_SYMM_M;i++) for (j=0;j<PBM_SYMM_N;j++){
+        ws->symm_C0[i*PBM_SYMM_N+j]=(double)((i+j)%100)/PBM_SYMM_M;
+        ws->symm_B[i*PBM_SYMM_N+j]=(double)((PBM_SYMM_N+i-j)%100)/PBM_SYMM_M; }
+      for (i=0;i<PBM_SYMM_M;i++){
+        for (j=0;j<=i;j++) ws->symm_A[i*PBM_SYMM_M+j]=(double)((i+j)%100)/PBM_SYMM_M;
+        for (j=i+1;j<PBM_SYMM_M;j++) ws->symm_A[i*PBM_SYMM_M+j]=-999; }
+      // syr2k
+      for (i=0;i<PBM_SYR2K_N;i++) for (j=0;j<PBM_SYR2K_M;j++){
+        ws->s2k_A[i*PBM_SYR2K_M+j]=(double)((i*j+1)%PBM_SYR2K_N)/PBM_SYR2K_N;
+        ws->s2k_B[i*PBM_SYR2K_M+j]=(double)((i*j+2)%PBM_SYR2K_M)/PBM_SYR2K_M; }
+      for (i=0;i<PBM_SYR2K_N;i++) for (j=0;j<PBM_SYR2K_N;j++)
+        ws->s2k_C0[i*PBM_SYR2K_N+j]=(double)((i*j+3)%PBM_SYR2K_N)/PBM_SYR2K_M;
+      // syrk
+      for (i=0;i<PBM_SYRK_N;i++) for (j=0;j<PBM_SYRK_M;j++)
+        ws->syk_A[i*PBM_SYRK_M+j]=(double)((i*j+1)%PBM_SYRK_N)/PBM_SYRK_N;
+      for (i=0;i<PBM_SYRK_N;i++) for (j=0;j<PBM_SYRK_N;j++)
+        ws->syk_C0[i*PBM_SYRK_N+j]=(double)((i*j+2)%PBM_SYRK_M)/PBM_SYRK_M;
+      // trmm
+      for (i=0;i<PBM_TRMM_M;i++){
+        for (j=0;j<i;j++) ws->trmm_A[i*PBM_TRMM_M+j]=(double)((i+j)%PBM_TRMM_M)/PBM_TRMM_M;
+        ws->trmm_A[i*PBM_TRMM_M+i]=1.0;
+        for (j=0;j<PBM_TRMM_N;j++)
+          ws->trmm_B0[i*PBM_TRMM_N+j]=(double)((PBM_TRMM_N+(i-j))%PBM_TRMM_N)/PBM_TRMM_N; }
+      // 3mm (A,B,C,D 只读)
+      for (i=0;i<PBM_3MM_NI;i++) for (j=0;j<PBM_3MM_NK;j++)
+        ws->m3_A[i*PBM_3MM_NK+j]=(double)((i*j+1)%PBM_3MM_NI)/(5*PBM_3MM_NI);
+      for (i=0;i<PBM_3MM_NK;i++) for (j=0;j<PBM_3MM_NJ;j++)
+        ws->m3_B[i*PBM_3MM_NJ+j]=(double)((i*(j+1)+2)%PBM_3MM_NJ)/(5*PBM_3MM_NJ);
+      for (i=0;i<PBM_3MM_NJ;i++) for (j=0;j<PBM_3MM_NM;j++)
+        ws->m3_C[i*PBM_3MM_NM+j]=(double)(i*(j+3)%PBM_3MM_NL)/(5*PBM_3MM_NL);
+      for (i=0;i<PBM_3MM_NM;i++) for (j=0;j<PBM_3MM_NL;j++)
+        ws->m3_D[i*PBM_3MM_NL+j]=(double)((i*(j+2)+2)%PBM_3MM_NK)/(5*PBM_3MM_NK);
+      // doitgen
+      for (i=0;i<PBM_DOITGEN_NR;i++) for (j=0;j<PBM_DOITGEN_NQ;j++) for (k=0;k<PBM_DOITGEN_NP;k++)
+        ws->dtg_A0[(i*PBM_DOITGEN_NQ+j)*PBM_DOITGEN_NP+k]=(double)((i*j+k)%PBM_DOITGEN_NP)/PBM_DOITGEN_NP;
+      for (i=0;i<PBM_DOITGEN_NP;i++) for (j=0;j<PBM_DOITGEN_NP;j++)
+        ws->dtg_C4[i*PBM_DOITGEN_NP+j]=(double)(i*j%PBM_DOITGEN_NP)/PBM_DOITGEN_NP;
+    // mvt
+      for (i=0;i<PBM_MVT_N;i++){
+        ws->mvt_x1_0[i]=(double)(i%PBM_MVT_N)/PBM_MVT_N;
+        ws->mvt_x2_0[i]=(double)((i+1)%PBM_MVT_N)/PBM_MVT_N;
+        ws->mvt_y1[i]=(double)((i+3)%PBM_MVT_N)/PBM_MVT_N;
+        ws->mvt_y2[i]=(double)((i+4)%PBM_MVT_N)/PBM_MVT_N;
+        for (j=0;j<PBM_MVT_N;j++)
+          ws->mvt_A[i*PBM_MVT_N+j]=(double)(i*j%PBM_MVT_N)/PBM_MVT_N;
+      }
+      // cholesky / lu: 构造基矩阵后做 A := A*A^T 保证（半）正定（复刻上游 init）
+      { int r_,sc,t_; double *tmp=malloc((size_t)PBM_CHOLESKY_N*PBM_CHOLESKY_N*sizeof(double));
+        for (i=0;i<PBM_CHOLESKY_N;i++){
+          for (j=0;j<=i;j++) ws->chol_A0[i*PBM_CHOLESKY_N+j]=(double)((-j)%PBM_CHOLESKY_N)/PBM_CHOLESKY_N+1;
+          for (j=i+1;j<PBM_CHOLESKY_N;j++) ws->chol_A0[i*PBM_CHOLESKY_N+j]=0;
+          ws->chol_A0[i*PBM_CHOLESKY_N+i]=1;
+        }
+        for (r_=0;r_<PBM_CHOLESKY_N;r_++) for (sc=0;sc<PBM_CHOLESKY_N;sc++) tmp[r_*PBM_CHOLESKY_N+sc]=0;
+        for (t_=0;t_<PBM_CHOLESKY_N;t_++) for (r_=0;r_<PBM_CHOLESKY_N;r_++) for (sc=0;sc<PBM_CHOLESKY_N;sc++)
+          tmp[r_*PBM_CHOLESKY_N+sc]+=ws->chol_A0[r_*PBM_CHOLESKY_N+t_]*ws->chol_A0[sc*PBM_CHOLESKY_N+t_];
+        for (r_=0;r_<PBM_CHOLESKY_N;r_++) for (sc=0;sc<PBM_CHOLESKY_N;sc++) ws->chol_A0[r_*PBM_CHOLESKY_N+sc]=tmp[r_*PBM_CHOLESKY_N+sc];
+        free(tmp);
+        tmp=malloc((size_t)PBM_LU_N*PBM_LU_N*sizeof(double));
+        for (i=0;i<PBM_LU_N;i++){
+          for (j=0;j<=i;j++) ws->lu2_A0[i*PBM_LU_N+j]=(double)((-j)%PBM_LU_N)/PBM_LU_N+1;
+          for (j=i+1;j<PBM_LU_N;j++) ws->lu2_A0[i*PBM_LU_N+j]=0;
+          ws->lu2_A0[i*PBM_LU_N+i]=1;
+        }
+        for (r_=0;r_<PBM_LU_N;r_++) for (sc=0;sc<PBM_LU_N;sc++) tmp[r_*PBM_LU_N+sc]=0;
+        for (t_=0;t_<PBM_LU_N;t_++) for (r_=0;r_<PBM_LU_N;r_++) for (sc=0;sc<PBM_LU_N;sc++)
+          tmp[r_*PBM_LU_N+sc]+=ws->lu2_A0[r_*PBM_LU_N+t_]*ws->lu2_A0[sc*PBM_LU_N+t_];
+        for (r_=0;r_<PBM_LU_N;r_++) for (sc=0;sc<PBM_LU_N;sc++) ws->lu2_A0[r_*PBM_LU_N+sc]=tmp[r_*PBM_LU_N+sc];
+        free(tmp);
+      }
+      // gramschmidt: A[i][j]=((i*j%M)/M)*100+10 ; Q,R 置零
+      for (i=0;i<PBM_GS_M;i++) for (j=0;j<PBM_GS_N;j++)
+        ws->gs_A0[i*PBM_GS_N+j]=(((double)((i*j)%PBM_GS_M)/PBM_GS_M)*100)+10;
+      // trisolv
+      for (i=0;i<PBM_TRISOLV_N;i++){
+        ws->tri_x[i]=-999; ws->tri_b[i]=i;
+        for (j=0;j<=i;j++) ws->tri_L[i*PBM_TRISOLV_N+j]=(double)(i+PBM_TRISOLV_N-j+1)*2/PBM_TRISOLV_N;
+      }
+      // adi
+      for (i=0;i<PBM_ADI_N;i++) for (j=0;j<PBM_ADI_N;j++)
+        ws->adi_u0[i*PBM_ADI_N+j]=(double)(i+PBM_ADI_N-j)/PBM_ADI_N;
+      // fdtd-2d
+      for (i=0;i<PBM_FDTD_TMAX;i++) ws->fd_fict[i]=(double)i;
+      for (i=0;i<PBM_FDTD_NX;i++) for (j=0;j<PBM_FDTD_NY;j++){
+        ws->fd_ex0[i*PBM_FDTD_NY+j]=((double)i*(j+1))/PBM_FDTD_NX;
+        ws->fd_ey0[i*PBM_FDTD_NY+j]=((double)i*(j+2))/PBM_FDTD_NY;
+        ws->fd_hz0[i*PBM_FDTD_NY+j]=((double)i*(j+3))/PBM_FDTD_NX;
+      }
+      // heat-3d
+      for (i=0;i<PBM_HEAT_N;i++) for (j=0;j<PBM_HEAT_N;j++) for (k=0;k<PBM_HEAT_N;k++)
+        ws->h3_A0[(i*PBM_HEAT_N+j)*PBM_HEAT_N+k]=ws->h3_B0[(i*PBM_HEAT_N+j)*PBM_HEAT_N+k]=
+          (double)(i+j+(PBM_HEAT_N-k))*10/PBM_HEAT_N;
+      // jacobi-1d
+      for (i=0;i<PBM_JAC1D_N;i++){
+        ws->j1_A0[i]=((double)i+2)/PBM_JAC1D_N; ws->j1_B0[i]=((double)i+3)/PBM_JAC1D_N; }
+      // seidel-2d
+      for (i=0;i<PBM_SEIDEL_N;i++) for (j=0;j<PBM_SEIDEL_N;j++)
+        ws->sd_A0[i*PBM_SEIDEL_N+j]=((double)i*(j+2)+2)/PBM_SEIDEL_N;
+
+    }
+// 补齐内核的 live-out / QoR 配置（输出直接是 double 缓冲，无需 export 转换）
+    ws->out_ptrs[17]=ws->corr_corr; ws->out_sizes[17]=PBM_CORR_M*PBM_CORR_M; ws->peak_vals[17]=1.0;    ws->perf_iters[17]=300;
+    ws->out_ptrs[18]=ws->cov_cov;   ws->out_sizes[18]=PBM_CORR_M*PBM_CORR_M; ws->peak_vals[18]=50.0;   ws->perf_iters[18]=300;
+    ws->out_ptrs[19]=ws->gmv_w;     ws->out_sizes[19]=PBM_GEMVER_N;          ws->peak_vals[19]=50.0;   ws->perf_iters[19]=500;
+    ws->out_ptrs[20]=ws->gsv_y;     ws->out_sizes[20]=PBM_GESUMMV_N;         ws->peak_vals[20]=50.0;   ws->perf_iters[20]=800;
+    ws->out_ptrs[21]=ws->symm_C;    ws->out_sizes[21]=PBM_SYMM_M*PBM_SYMM_N; ws->peak_vals[21]=50.0;   ws->perf_iters[21]=400;
+    ws->out_ptrs[22]=ws->s2k_C;     ws->out_sizes[22]=PBM_SYR2K_N*PBM_SYR2K_N;ws->peak_vals[22]=50.0;  ws->perf_iters[22]=300;
+    ws->out_ptrs[23]=ws->syk_C;     ws->out_sizes[23]=PBM_SYRK_N*PBM_SYRK_N; ws->peak_vals[23]=50.0;   ws->perf_iters[23]=400;
+    ws->out_ptrs[24]=ws->trmm_B;    ws->out_sizes[24]=PBM_TRMM_M*PBM_TRMM_N; ws->peak_vals[24]=50.0;   ws->perf_iters[24]=400;
+    ws->out_ptrs[25]=ws->m3_G;      ws->out_sizes[25]=PBM_3MM_NI*PBM_3MM_NL; ws->peak_vals[25]=10.0;   ws->perf_iters[25]=300;
+    ws->out_ptrs[26]=ws->dtg_A;     ws->out_sizes[26]=PBM_DOITGEN_NR*PBM_DOITGEN_NQ*PBM_DOITGEN_NP; ws->peak_vals[26]=10.0; ws->perf_iters[26]=400;
+    ws->out_ptrs[27]=ws->mvt_x1;    ws->out_sizes[27]=PBM_MVT_N;             ws->peak_vals[27]=50.0;   ws->perf_iters[27]=500;
+    ws->out_ptrs[28]=ws->chol_A;    ws->out_sizes[28]=PBM_CHOLESKY_N*PBM_CHOLESKY_N; ws->peak_vals[28]=50.0; ws->perf_iters[28]=400;
+    ws->out_ptrs[29]=ws->gs_R;      ws->out_sizes[29]=PBM_GS_N*PBM_GS_N;     ws->peak_vals[29]=1000.0; ws->perf_iters[29]=300;
+    ws->out_ptrs[30]=ws->lu2_A;     ws->out_sizes[30]=PBM_LU_N*PBM_LU_N;     ws->peak_vals[30]=100.0;  ws->perf_iters[30]=300;
+    ws->out_ptrs[31]=ws->tri_x;     ws->out_sizes[31]=PBM_TRISOLV_N;         ws->peak_vals[31]=100.0;  ws->perf_iters[31]=800;
+    ws->out_ptrs[32]=ws->adi_u;     ws->out_sizes[32]=PBM_ADI_N*PBM_ADI_N;   ws->peak_vals[32]=2.0;    ws->perf_iters[32]=150;
+    ws->out_ptrs[33]=ws->fd_hz;     ws->out_sizes[33]=PBM_FDTD_NX*PBM_FDTD_NY;ws->peak_vals[33]=50.0;  ws->perf_iters[33]=150;
+    ws->out_ptrs[34]=ws->h3_A;      ws->out_sizes[34]=PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N; ws->peak_vals[34]=50.0; ws->perf_iters[34]=150;
+    ws->out_ptrs[35]=ws->j1_A;      ws->out_sizes[35]=PBM_JAC1D_N;           ws->peak_vals[35]=2.0;    ws->perf_iters[35]=800;
+    ws->out_ptrs[36]=ws->sd_A;      ws->out_sizes[36]=PBM_SEIDEL_N*PBM_SEIDEL_N; ws->peak_vals[36]=50.0; ws->perf_iters[36]=100;
+    
     workspace_selfcheck(ws);
 }
 
@@ -509,6 +831,49 @@ static void reset_mutable_buffers(suite_workspace_t *ws, int b) {
             memset(ws->obp_binned, 0, bin * sizeof(uint32_t));
             memset(ws->obp_out, 0, bin * sizeof(uint32_t));
         }
+    } else if (b == 17) {
+        memcpy(ws->corr_data, ws->corr_data0, (size_t)PBM_CORR_N*PBM_CORR_M*sizeof(double));
+    } else if (b == 18) {
+        memcpy(ws->cov_data, ws->cov_data0, (size_t)PBM_CORR_N*PBM_CORR_M*sizeof(double));
+    } else if (b == 19) {
+        memcpy(ws->gmv_A, ws->gmv_A0, (size_t)PBM_GEMVER_N*PBM_GEMVER_N*sizeof(double));
+        memset(ws->gmv_x, 0, (size_t)PBM_GEMVER_N*sizeof(double));
+        memset(ws->gmv_w, 0, (size_t)PBM_GEMVER_N*sizeof(double));
+    } else if (b == 21) {
+        memcpy(ws->symm_C, ws->symm_C0, (size_t)PBM_SYMM_M*PBM_SYMM_N*sizeof(double));
+    } else if (b == 22) {
+        memcpy(ws->s2k_C, ws->s2k_C0, (size_t)PBM_SYR2K_N*PBM_SYR2K_N*sizeof(double));
+    } else if (b == 23) {
+        memcpy(ws->syk_C, ws->syk_C0, (size_t)PBM_SYRK_N*PBM_SYRK_N*sizeof(double));
+    } else if (b == 24) {
+        memcpy(ws->trmm_B, ws->trmm_B0, (size_t)PBM_TRMM_M*PBM_TRMM_N*sizeof(double));
+    } else if (b == 26) {
+        memcpy(ws->dtg_A, ws->dtg_A0, (size_t)PBM_DOITGEN_NR*PBM_DOITGEN_NQ*PBM_DOITGEN_NP*sizeof(double));
+    } else if (b == 27) {
+        memcpy(ws->mvt_x1, ws->mvt_x1_0, (size_t)PBM_MVT_N*sizeof(double));
+        memcpy(ws->mvt_x2, ws->mvt_x2_0, (size_t)PBM_MVT_N*sizeof(double));
+    } else if (b == 28) {
+        memcpy(ws->chol_A, ws->chol_A0, (size_t)PBM_CHOLESKY_N*PBM_CHOLESKY_N*sizeof(double));
+    } else if (b == 29) {
+        memcpy(ws->gs_A, ws->gs_A0, (size_t)PBM_GS_M*PBM_GS_N*sizeof(double));
+        memset(ws->gs_Q, 0, (size_t)PBM_GS_M*PBM_GS_N*sizeof(double));
+        memset(ws->gs_R, 0, (size_t)PBM_GS_N*PBM_GS_N*sizeof(double));
+    } else if (b == 30) {
+        memcpy(ws->lu2_A, ws->lu2_A0, (size_t)PBM_LU_N*PBM_LU_N*sizeof(double));
+    } else if (b == 32) {
+        memcpy(ws->adi_u, ws->adi_u0, (size_t)PBM_ADI_N*PBM_ADI_N*sizeof(double));
+    } else if (b == 33) {
+        memcpy(ws->fd_ex, ws->fd_ex0, (size_t)PBM_FDTD_NX*PBM_FDTD_NY*sizeof(double));
+        memcpy(ws->fd_ey, ws->fd_ey0, (size_t)PBM_FDTD_NX*PBM_FDTD_NY*sizeof(double));
+        memcpy(ws->fd_hz, ws->fd_hz0, (size_t)PBM_FDTD_NX*PBM_FDTD_NY*sizeof(double));
+    } else if (b == 34) {
+        memcpy(ws->h3_A, ws->h3_A0, (size_t)PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N*sizeof(double));
+        memcpy(ws->h3_B, ws->h3_B0, (size_t)PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N*sizeof(double));
+    } else if (b == 35) {
+        memcpy(ws->j1_A, ws->j1_A0, (size_t)PBM_JAC1D_N*sizeof(double));
+        memcpy(ws->j1_B, ws->j1_B0, (size_t)PBM_JAC1D_N*sizeof(double));
+    } else if (b == 36) {
+        memcpy(ws->sd_A, ws->sd_A0, (size_t)PBM_SEIDEL_N*PBM_SEIDEL_N*sizeof(double));
     }
 }
 
@@ -618,6 +983,33 @@ if (g_abft_harness) {
         case 16: bench_obpmark_image_proc(ws->obp_w, ws->obp_h, ws->obp_nframes,
                                           ws->obp_frame_i, ws->obp_frame, ws->obp_frames,
                                           ws->obp_gains, ws->obp_binned, ws->obp_out); break;
+        case 17: bench_pb_correlation(PBM_CORR_M, PBM_CORR_N, (double)PBM_CORR_N,
+                                      ws->corr_data, ws->corr_corr, ws->corr_mean, ws->corr_stddev); break;
+        case 18: bench_pb_covariance(PBM_CORR_M, PBM_CORR_N, (double)PBM_CORR_N,
+                                     ws->cov_data, ws->cov_cov, ws->cov_mean); break;
+        case 19: bench_pb_gemver(PBM_GEMVER_N, 1.5, 1.2, ws->gmv_A, ws->gmv_u1, ws->gmv_v1,
+                                 ws->gmv_u2, ws->gmv_v2, ws->gmv_w, ws->gmv_x, ws->gmv_y, ws->gmv_z); break;
+        case 20: bench_pb_gesummv(PBM_GESUMMV_N, 1.5, 1.2, ws->gsv_A, ws->gsv_B,
+                                  ws->gsv_tmp, ws->gsv_x, ws->gsv_y); break;
+        case 21: bench_pb_symm(PBM_SYMM_M, PBM_SYMM_N, 1.5, 1.2, ws->symm_C, ws->symm_A, ws->symm_B); break;
+        case 22: bench_pb_syr2k(PBM_SYR2K_N, PBM_SYR2K_M, 1.5, 1.2, ws->s2k_C, ws->s2k_A, ws->s2k_B); break;
+        case 23: bench_pb_syrk(PBM_SYRK_N, PBM_SYRK_M, 1.5, 1.2, ws->syk_C, ws->syk_A); break;
+        case 24: bench_pb_trmm(PBM_TRMM_M, PBM_TRMM_N, 1.5, ws->trmm_A, ws->trmm_B); break;
+        case 25: bench_pb_3mm(PBM_3MM_NI, PBM_3MM_NJ, PBM_3MM_NK, PBM_3MM_NL, PBM_3MM_NM,
+                              ws->m3_E, ws->m3_A, ws->m3_B, ws->m3_F, ws->m3_C, ws->m3_D, ws->m3_G); break;
+        case 26: bench_pb_doitgen(PBM_DOITGEN_NR, PBM_DOITGEN_NQ, PBM_DOITGEN_NP,
+                                  ws->dtg_A, ws->dtg_C4, ws->dtg_sum); break;
+        case 27: bench_pb_mvt(PBM_MVT_N, ws->mvt_x1, ws->mvt_x2, ws->mvt_y1, ws->mvt_y2, ws->mvt_A); break;
+        case 28: bench_pb_cholesky(PBM_CHOLESKY_N, ws->chol_A); break;
+        case 29: bench_pb_gramschmidt(PBM_GS_M, PBM_GS_N, ws->gs_A, ws->gs_R, ws->gs_Q); break;
+        case 30: bench_pb_lu(PBM_LU_N, ws->lu2_A); break;
+        case 31: bench_pb_trisolv(PBM_TRISOLV_N, ws->tri_L, ws->tri_x, ws->tri_b); break;
+        case 32: bench_pb_adi(PBM_ADI_TSTEPS, PBM_ADI_N, ws->adi_u, ws->adi_v, ws->adi_p, ws->adi_q); break;
+        case 33: bench_pb_fdtd2d(PBM_FDTD_TMAX, PBM_FDTD_NX, PBM_FDTD_NY,
+                                 ws->fd_ex, ws->fd_ey, ws->fd_hz, ws->fd_fict); break;
+        case 34: bench_pb_heat3d(PBM_HEAT_TSTEPS, PBM_HEAT_N, ws->h3_A, ws->h3_B); break;
+        case 35: bench_pb_jacobi1d(PBM_JAC1D_TSTEPS, PBM_JAC1D_N, ws->j1_A, ws->j1_B); break;
+        case 36: bench_pb_seidel2d(PBM_SEIDEL_TSTEPS, PBM_SEIDEL_N, ws->sd_A); break;
         default:
             // 注册表里新增了负载但忘了加 case：立刻失败，不要静默跑错程序
             fprintf(stderr, "[eval_suite] invoke_benchmark: benchmark %d (%s) 未实现\n",
@@ -674,6 +1066,28 @@ static void free_workspace(suite_workspace_t *ws) {
     free(ws->obp_offsets); free(ws->obp_gains); free(ws->obp_bad);
     free(ws->obp_binned); free(ws->obp_out);
     free(ws->obp_prep_d); free(ws->obp_proc_d);
+    free(ws->corr_data); free(ws->corr_data0); free(ws->corr_corr); free(ws->corr_mean); free(ws->corr_stddev);
+    free(ws->cov_data); free(ws->cov_data0); free(ws->cov_cov); free(ws->cov_mean);
+    free(ws->gmv_A); free(ws->gmv_A0); free(ws->gmv_u1); free(ws->gmv_v1); free(ws->gmv_u2);
+    free(ws->gmv_v2); free(ws->gmv_w); free(ws->gmv_x); free(ws->gmv_y); free(ws->gmv_z);
+    free(ws->gsv_A); free(ws->gsv_B); free(ws->gsv_tmp); free(ws->gsv_x); free(ws->gsv_y);
+    free(ws->symm_C); free(ws->symm_C0); free(ws->symm_A); free(ws->symm_B);
+    free(ws->s2k_C); free(ws->s2k_C0); free(ws->s2k_A); free(ws->s2k_B);
+    free(ws->syk_C); free(ws->syk_C0); free(ws->syk_A);
+    free(ws->trmm_A); free(ws->trmm_B); free(ws->trmm_B0);
+    free(ws->m3_A); free(ws->m3_B); free(ws->m3_C); free(ws->m3_D); free(ws->m3_E); free(ws->m3_F); free(ws->m3_G);
+    free(ws->dtg_A); free(ws->dtg_A0); free(ws->dtg_C4); free(ws->dtg_sum);
+    free(ws->mvt_A); free(ws->mvt_x1); free(ws->mvt_x1_0); free(ws->mvt_x2); free(ws->mvt_x2_0);
+    free(ws->mvt_y1); free(ws->mvt_y2);
+    free(ws->chol_A); free(ws->chol_A0);
+    free(ws->gs_A); free(ws->gs_A0); free(ws->gs_R); free(ws->gs_Q);
+    free(ws->lu2_A); free(ws->lu2_A0);
+    free(ws->tri_L); free(ws->tri_x); free(ws->tri_b);
+    free(ws->adi_u); free(ws->adi_u0); free(ws->adi_v); free(ws->adi_p); free(ws->adi_q);
+    free(ws->fd_ex); free(ws->fd_ex0); free(ws->fd_ey); free(ws->fd_ey0); free(ws->fd_hz); free(ws->fd_hz0); free(ws->fd_fict);
+    free(ws->h3_A); free(ws->h3_A0); free(ws->h3_B); free(ws->h3_B0);
+    free(ws->j1_A); free(ws->j1_A0); free(ws->j1_B); free(ws->j1_B0);
+    free(ws->sd_A); free(ws->sd_A0);
 }
 
 static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir, int dump_golden) {
