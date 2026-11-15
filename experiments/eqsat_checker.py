@@ -88,16 +88,23 @@ class EGraph:
             changed = False
             self.memo.clear()
             for cid in list(self.classes):
-                if self.find(cid) != cid:
+                # union 会在循环体内合并等价类并改动 self.classes，
+                # 所以必须对快照迭代，并在每轮重新确认 cid 还是代表元
+                if cid not in self.classes or self.find(cid) != cid:
                     continue
                 newset = set()
-                for en in self.classes[cid]:
+                for en in list(self.classes[cid]):
                     cen = self.canon(en)
-                    if cen in self.memo and self.find(self.memo[cen]) != cid:
-                        changed |= self.union(cid, self.memo[cen])
-                    self.memo[cen] = cid
+                    other = self.memo.get(cen)
+                    if other is not None and self.find(other) != self.find(cid):
+                        changed |= self.union(cid, other)
+                    self.memo[cen] = self.find(cid)
                     newset.add(cen)
-                self.classes[cid] = newset
+                root = self.find(cid)
+                if root in self.classes:
+                    self.classes[root] |= newset
+                else:
+                    self.classes[root] = newset
 
 
 # ---------------------------------------------------------------- 自由下标分析
@@ -251,13 +258,16 @@ def from_sums(path):
     for r in rows:
         if not r["function"].startswith("bench_"):
             continue
-        acc_base, acc_idx = r["accumulator"].split(":")
+        acc_base, acc_idx = r["accumulator"].split("@", 1)[0].split(":")
         acc_idx = [x for x in acc_idx.split(";") if x]
         terms = []
         for t in r["terms"].split("|"):
             if not t:
                 continue
-            base, idx = t.split(":")
+            # 项的格式是 base:i0;i1;@偏移。偏移此处不参与代价搜索（它影响的是
+            # 生成校验器时的边界项），必须先切掉，否则会被当成一个"下标"。
+            body = t.split("@", 1)[0]
+            base, idx = body.split(":")
             terms.append((base, [x for x in idx.split(";") if x]))
         if not terms or not acc_idx:
             continue

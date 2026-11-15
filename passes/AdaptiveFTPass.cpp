@@ -521,7 +521,54 @@ namespace {
 struct AccessInfo {
   std::string base;             // 数组基址名
   std::set<unsigned> idxDeps;   // 依赖的循环层号（0 = 最外层）
+  std::string offset;           // 相对输出访问的地址偏移（SCEV 差值，符号式）
 };
+
+// 相对偏移：两个访问地址的 SCEV 之差。stencil 的校验式必须知道它 ——
+// 移位窗口的校验和与原窗口差一圈边界项，只知道"依赖哪些下标"是不够的。
+// 运行期维度（PolyBench 的 n）下行偏移不是常量，但 SCEV 能给出精确的符号式。
+static void collectGEPIndices(Value *P, std::vector<Value *> &idxs, Value *&base) {
+  P = P->stripPointerCasts();
+  while (auto *GEP = dyn_cast<GetElementPtrInst>(P)) {
+    std::vector<Value *> here;
+    for (Use &U : GEP->indices()) here.push_back(U.get());
+    idxs.insert(idxs.begin(), here.begin(), here.end());
+    P = GEP->getPointerOperand()->stripPointerCasts();
+  }
+  base = P;
+}
+
+// 逐维下标差。指针整体的 SCEV 在 opaque pointer + 运行期步长下常常算不出
+// （getMinusSCEV 返回 CouldNotCompute），但**整数下标**一定可 SCEV 化，
+// 逐维相减就能拿到 stencil 需要的相对偏移（0 / ±1 / 运行期维度则报 ?）。
+static std::string scevOffset(Value *Ptr, Value *RefPtr, ScalarEvolution &SE) {
+  std::vector<Value *> ia, ib;
+  Value *ba = nullptr, *bb = nullptr;
+  collectGEPIndices(Ptr, ia, ba);
+  collectGEPIndices(RefPtr, ib, bb);
+  if (ia.empty() || ia.size() != ib.size()) return "?";
+  std::string out;
+  for (unsigned k = 0; k < ia.size(); ++k) {
+    if (k) out += "/";
+    if (!SE.isSCEVable(ia[k]->getType()) || !SE.isSCEVable(ib[k]->getType())) {
+      out += "?";
+      continue;
+    }
+    const SCEV *D = SE.getMinusSCEV(SE.getSCEV(ia[k]), SE.getSCEV(ib[k]));
+    if (auto *C = dyn_cast<SCEVConstant>(D)) {
+      out += std::to_string(C->getAPInt().getSExtValue());
+    } else if (isa<SCEVCouldNotCompute>(D)) {
+      out += "?";
+    } else {
+      // 非常量偏移（典型是 ±n 这种运行期维度）只记一个标记：CSV 里塞完整
+      // SCEV 文本会和分隔符打架，而下游真正需要知道的就是"这一维是符号偏移、
+      // 生成校验器时要补边界项"这一个事实
+      out += "sym";
+    }
+  }
+  if (ba != bb) out += "(other)";
+  return out;
+}
 
 // 下标依赖哪些循环：交给 ScalarEvolution。一个访问的 SCEV 里出现的每个
 // SCEVAddRecExpr 都对应一层循环，这比手写 use 链遍历鲁棒得多 ——
@@ -540,9 +587,10 @@ static std::string baseName(Value *Ptr) {
   while (auto *GEP = dyn_cast<GetElementPtrInst>(P)) P = GEP->getPointerOperand();
   while (auto *LD = dyn_cast<LoadInst>(P)) P = LD->getPointerOperand();
   P = P->stripPointerCasts();
-  if (P->hasName() && !P->getName().startswith(".")) return P->getName().str();
   if (auto *Arg = dyn_cast<Argument>(P)) return "arg" + std::to_string(Arg->getArgNo());
-  return P->hasName() ? P->getName().str() : "anon";
+  if (P->hasName() && !P->getName().startswith(".")) return P->getName().str();
+  if (isa<AllocaInst>(P)) return "local";
+  return "anon";
 }
 
 // 结构相等：没跑 GVN 时同一个下标表达式会被算多遍，按 Value 身份比会判不相等
@@ -612,6 +660,7 @@ static bool describeAccessSCEV(Value *Ptr, ScalarEvolution &SE,
 // 收集累加项（或映射体）里的所有数组访问与算子构成
 static void collectTermAccesses(Value *root, ScalarEvolution &SE,
                                 const std::map<const Loop *, unsigned> &depthOf,
+                                Loop *OuterLoop, Value *RefPtr,
                                 std::vector<AccessInfo> &terms, std::string &opMix) {
   std::vector<Value *> wl{root};
   std::set<Value *> seen;
@@ -621,7 +670,10 @@ static void collectTermAccesses(Value *root, ScalarEvolution &SE,
     if (!seen.insert(v).second) continue;
     if (auto *LD = dyn_cast<LoadInst>(v)) {
       AccessInfo ai;
-      if (describeAccessSCEV(LD->getPointerOperand(), SE, depthOf, ai)) terms.push_back(ai);
+      if (describeAccessSCEV(LD->getPointerOperand(), SE, depthOf, ai)) {
+        if (RefPtr) ai.offset = scevOffset(LD->getPointerOperand(), RefPtr, SE);
+        terms.push_back(ai);
+      }
       continue;
     }
     if (auto *BO = dyn_cast<BinaryOperator>(v)) {
@@ -640,27 +692,24 @@ static void collectTermAccesses(Value *root, ScalarEvolution &SE,
       }
       continue;
     }
-    // 循环不变的标量因子（常系数、循环外算出的值）也要记下来：
-    // 它是因子外提规则的作用对象 —— stencil 的 0.2 * (u1+...+u5) 就靠它
-    // 把乘法从 N^2 次降到 1 次。记成"自由下标为空"的项。
+    // 循环不变的标量因子（常系数、形参、循环外算出的值）必须记下来：
+    // 它是因子外提规则的作用对象（stencil 的 0.2 就靠它把乘法从 N^2 降到 1），
+    // 而且漏了它抽出来的表达式就是不完整的 —— gemm 的 alpha 之前正是这么被丢掉的。
+    // 浮点类型不可 SCEV 化，所以循环不变性要用 LoopInfo 判，不能用 SCEV 判。
     if (isa<ConstantFP>(v)) {
       terms.push_back({"const", {}});
       continue;
     }
-    if (SE.isSCEVable(v->getType())) {
-      AddRecLoopCollector C;
-      SCEVTraversal<AddRecLoopCollector> T(C);
-      T.visitAll(SE.getSCEV(v));
-      bool invariant = true;
-      for (const Loop *L : C.loops)
-        if (depthOf.count(L)) { invariant = false; break; }
-      if (invariant && !isa<LoadInst>(v)) terms.push_back({"scalar", {}});
+    if (OuterLoop && OuterLoop->isLoopInvariant(v)) {
+      terms.push_back({"scalar", {}});
+      continue;
     }
   }
 }
 
 void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
                        std::ostream &OS) {
+  std::set<std::string> emitted;   // 结构相同的描述去重
   std::vector<Loop *> innermost;
   for (Loop *L : LI.getLoopsInPreorder())
     if (L->getSubLoops().empty()) innermost.push_back(L);
@@ -676,8 +725,21 @@ void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
       depthOf[nest[d]] = d;
       tripCounts.push_back(SE.getSmallConstantTripCount(nest[d]));
     }
-    auto emitTrips = [&]() {
-      for (unsigned t : tripCounts) OS << t << ";";
+    auto emitLine = [&](const char *kind, const AccessInfo &acc,
+                        const std::string &opMix,
+                        const std::vector<AccessInfo> &terms) {
+      std::string line = std::string(kind) + "," + F.getName().str() + "," +
+                         std::to_string(nest.size()) + ",";
+      for (unsigned t : tripCounts) line += std::to_string(t) + ";";
+      line += "," + acc.base + ":";
+      for (unsigned d : acc.idxDeps) line += "i" + std::to_string(d) + ";";
+      line += "," + (opMix.empty() ? std::string("+") : opMix) + ",";
+      for (const AccessInfo &t : terms) {
+        line += t.base + ":";
+        for (unsigned d : t.idxDeps) line += "i" + std::to_string(d) + ";";
+        line += "@" + (t.offset.empty() ? std::string("-") : t.offset) + "|";
+      }
+      return line + "\n";
     };
 
     for (BasicBlock *BB : Inner->blocks()) {
@@ -701,19 +763,10 @@ void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
             if (term) {
               std::vector<AccessInfo> terms;
               std::string opMix;
-              collectTermAccesses(term, SE, depthOf, terms, opMix);
+              collectTermAccesses(term, SE, depthOf, nest.front(), SI->getPointerOperand(), terms, opMix);
               if (!terms.empty()) {
-                OS << "REDUCTION," << F.getName().str() << "," << nest.size() << ",";
-                emitTrips();
-                OS << "," << accAcc.base << ":";
-                for (unsigned d : accAcc.idxDeps) OS << "i" << d << ";";
-                OS << "," << (opMix.empty() ? "+" : opMix) << ",";
-                for (const AccessInfo &t : terms) {
-                  OS << t.base << ":";
-                  for (unsigned d : t.idxDeps) OS << "i" << d << ";";
-                  OS << "|";
-                }
-                OS << "\n";
+                std::string line = emitLine("REDUCTION", accAcc, opMix, terms);
+                if (emitted.insert(line).second) OS << line;
                 continue;
               }
             }
@@ -724,7 +777,7 @@ void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
         //     （jacobi2d / deriche / sobel 这类 stencil 就是这一类）
         std::vector<AccessInfo> terms;
         std::string opMix;
-        collectTermAccesses(val, SE, depthOf, terms, opMix);
+        collectTermAccesses(val, SE, depthOf, nest.front(), SI->getPointerOperand(), terms, opMix);
         if (terms.size() < 2) continue;      // 单个 load 的拷贝不算映射
         bool selfRef = false;
         std::vector<Value *> wl{val};
@@ -741,17 +794,8 @@ void dumpReductionSums(Function &F, LoopInfo &LI, ScalarEvolution &SE,
             for (Use &U : I2->operands()) wl.push_back(U.get());
         }
         if (selfRef) continue;
-        OS << "LINEAR_MAP," << F.getName().str() << "," << nest.size() << ",";
-        emitTrips();
-        OS << "," << accAcc.base << ":";
-        for (unsigned d : accAcc.idxDeps) OS << "i" << d << ";";
-        OS << "," << (opMix.empty() ? "+" : opMix) << ",";
-        for (const AccessInfo &t : terms) {
-          OS << t.base << ":";
-          for (unsigned d : t.idxDeps) OS << "i" << d << ";";
-          OS << "|";
-        }
-        OS << "\n";
+        std::string line = emitLine("LINEAR_MAP", accAcc, opMix, terms);
+        if (emitted.insert(line).second) OS << line;
       }
     }
   }
