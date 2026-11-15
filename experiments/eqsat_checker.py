@@ -307,6 +307,43 @@ def render(eg, best, cid):
     return f"sum_{en[1]}({kids[0]})"
 
 
+def checksum_capability(kind, acc_idx, check_idx, red_idx):
+    """返回候选校验式的结构性检测能力说明。
+
+    这里刻意不把“单错可检测”伪装成端到端故障覆盖率。对当前生成的
+    行/列和类校验，在精确算术下，任意一个非零输出元素错误都会改变
+    校验和；但单个秩一校验不能定位多个错误，具有相反符号的错误也可能
+    抵消。纠错还需要原数据快照或其它独立信息。
+    """
+    output_width = f"N_{check_idx}"
+    if kind == "REDUCTION":
+        correction = "snapshot_required"
+        scope = "reduction_output_slice"
+    elif kind == "LINEAR_MAP":
+        correction = "detection_only"
+        scope = "linear_map_output_slice"
+    else:
+        correction = "unknown"
+        scope = "unknown"
+    return {
+        "checksum_rank": 1,
+        "checksum_scope": scope,
+        "checksum_output_width": output_width,
+        "detected_error_subspace_dimension": "1",
+        "undetected_error_subspace_dimension": f"{output_width}-1",
+        "error_localization_rank": 1,
+        "single_error_detection": "all_nonzero_single_output_errors",
+        "single_error_coverage": 1.0,
+        "multi_error_cancellation": "possible",
+        "multi_error_localization": "not_supported",
+        "correction_capability": correction,
+        "blind_spot": "opposite_signed_errors_can_cancel",
+        "check_direction": check_idx,
+        "output_indices": ",".join(acc_idx),
+        "reduction_indices": ",".join(red_idx),
+    }
+
+
 def from_sums(path):
     """读 `-atft-dump-sums` 的产物，对每条归约自动构造校验目标式并搜索。
 
@@ -386,6 +423,7 @@ def from_sums(path):
         n_stage = max(0, int(r["nest_depth"]) - len(set(acc_idx)) - len(red_idx))
         chk_deg_eff = p_deg(chk_tot) + n_stage
         admit = chk_deg_eff < p_deg(ker_tot)
+        capability = checksum_capability(r["kind"], acc_idx, check_idx, red_idx)
         out.append({"kind": r["kind"], "function": r["function"],
                     "acc": "%s[%s]" % (acc_base, ",".join(acc_idx)),
                     "check_dir": check_idx, "red": ",".join(red_idx),
@@ -396,7 +434,8 @@ def from_sums(path):
                     "chk_mults": p_str(m_chk),
                     "expr": render(eg, after, root),
                     "admit": admit,
-                    "layer": "代数校验层" if admit else "回落指令冗余"})
+                    "layer": "代数校验层" if admit else "回落指令冗余",
+                    **capability})
     return out
 
 
@@ -462,8 +501,13 @@ def main():
     return results
 
 
-def main_from_sums(path):
+def main_from_sums(path, json_out=None):
     rows = from_sums(path)
+    if json_out:
+        import json
+        with open(json_out, "w") as f:
+            json.dump(rows, f, indent=2, ensure_ascii=False)
+        print(f"候选报告已写入: {json_out}")
     print("准入判据：校验式的代价多项式次数 < 内核自身的次数")
     print("（代价是关于迭代空间 N 的多项式；搜索前后的比较不是判据 —— "
           "matvec 搜索后乘法也降一阶，但总代价与内核同阶，所以不准入）\n")
@@ -489,9 +533,12 @@ def main_from_sums(path):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        main_from_sums(sys.argv[1])
+        out = None
+        if "--json-out" in sys.argv:
+            pos = sys.argv.index("--json-out")
+            if pos + 1 >= len(sys.argv):
+                raise SystemExit("--json-out 需要路径")
+            out = sys.argv[pos + 1]
+        main_from_sums(sys.argv[1], out)
     else:
         main()
-
-
-

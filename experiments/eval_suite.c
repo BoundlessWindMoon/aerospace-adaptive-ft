@@ -1266,7 +1266,50 @@ static int run_scale_sweep_pmu(const char *policy_name) {
 // ----------------------------------------------------------------------------
 static int run_delta_profile(void) {
     suite_workspace_t ws;
-    alloc_and_init_workspace(&ws, 0);
+    const char *small_env = getenv("ATFT_PROFILE_SMALL");
+    int profile_small = small_env && *small_env && atoi(small_env) != 0;
+    alloc_and_init_workspace(&ws, profile_small);
+    const char *variant = getenv("ATFT_PROFILE_VARIANT");
+    if (variant && *variant) {
+        // 只用于独立 profile，不影响默认 campaign。scaled 改变输入幅度，
+        // 用来验证阈值是否只适配某一个固定数值范围。
+        if (strcmp(variant, "scaled") == 0) {
+            const double scale = 3.0;
+            int nm2 = ws.n_mat * ws.n_mat;
+            for (int i = 0; i < nm2; i++) {
+                ws.A[i] *= scale;
+                ws.B[i] *= scale;
+                ws.C[i] *= scale;
+                ws.D[i] *= scale;
+                ws.jac_A[i] *= scale;
+                ws.jac_B[i] *= scale;
+            }
+            for (int i = 0; i < ws.n_mat; i++) {
+                ws.x[i] *= scale;
+                ws.p_bicg[i] *= scale;
+                ws.r_bicg[i] *= scale;
+            }
+            for (int i = 0; i < ws.n_lu * ws.n_lu; i++) ws.lu_A0[i] *= scale;
+            for (int i = 0; i < ws.n_lu; i++) ws.lu_b[i] *= scale;
+            // Durbin 的相关序列需要满足稳定性条件；scaled_safe 保持它不变，
+            // scaled 则作为越界输入压力测试，观察阈值在失稳场景下的行为。
+            if (strcmp(variant, "scaled_safe") != 0) {
+                for (int i = 0; i < ws.n_dur; i++) ws.dur_r[i] *= scale;
+            }
+            for (int i = 0; i < ws.der_w * ws.der_h; i++) ws.der_in[i] *= scale;
+            for (int i = 0; i < ws.n_opts; i++) {
+                ws.bs_spt[i] *= scale;
+                ws.bs_strike[i] *= scale;
+                ws.bs_rate[i] *= scale;
+                ws.bs_vol[i] *= scale;
+                ws.bs_time[i] *= scale;
+            }
+            for (int i = 0; i < ws.n_fft; i++) {
+                ws.fft_re[i] *= scale;
+                ws.fft_im[i] *= scale;
+            }
+        }
+    }
 
     printf("benchmark,env_max_rel_dev,observations\n");
     for (int b = 0; b < NUM_BENCHES; b++) {
