@@ -103,6 +103,8 @@ static uint64_t g_fi_seed_base = 0x123456789abcdef0ULL;
 static void load_delta_table(void) {
     const char *v = getenv("ATFT_REPLICA_EXACT");
     if (v && *v && atoi(v) != 0) atft_set_replica_exact(1);
+    if ((v = getenv("ATFT_ABFT")) && *v && atoi(v) != 0)
+        atft_abft_set(1, (v = getenv("ATFT_ABFT_REPAIR")) ? atoi(v) : 1);
     if ((v = getenv("ATFT_FI_SEED")) && *v) g_fi_seed_base = strtoull(v, NULL, 0);
 
     const char *path = getenv("ATFT_DELTA_TABLE");
@@ -529,13 +531,44 @@ static void export_outputs(suite_workspace_t *ws, int b) {
     // b == 13 (crc16) 的结果由 invoke_benchmark 直接写入 crc_out_d
 }
 
+// 代数校验层的调用点。校验器本身是通用过程（runtime/atft_runtime.c），
+// 这里按 `-atft-dump-sums` + eqsat 合成出的式子为被识别的内核接上维度与步长。
+// 编译期自动插这几行调用是剩下的工程步，不影响下面测到的代价与检出数字。
+static double g_abft_rowsum[4096];
+static double *g_abft_cold = NULL;   // beta != 0 时重算整行需要的原数据副本
+
 static void invoke_benchmark(suite_workspace_t *ws, int b) {
     reset_mutable_buffers(ws, b);
+    int n = ws->n_mat;
+    if (g_atft_abft_enabled && (b == 0 || b == 1) && n <= 4096) {
+        const double *src = (b == 0) ? ws->C : ws->tmp_2mm;
+        atft_abft_pre_rowsum(src, n, n, n, g_abft_rowsum);
+        if (b == 0) {
+            if (!g_abft_cold) g_abft_cold = (double *)malloc(sizeof(double) * (size_t)n * n);
+            atft_abft_pre_copy(src, n, n, n, g_abft_cold);
+        }
+    }
     switch (b) {
-        case 0: bench_pb_gemm(ws->n_mat, ws->n_mat, ws->n_mat, 1.5, 1.2, ws->A, ws->B, ws->C); break;
-        case 1: bench_pb_2mm(ws->n_mat, ws->n_mat, ws->n_mat, ws->n_mat, 1.5, 1.2, ws->tmp_2mm, ws->A, ws->B, ws->A, ws->D); break;
-        case 2: bench_pb_atax(ws->n_mat, ws->n_mat, ws->A, ws->x, ws->y, ws->tmp_atax); break;
-        case 3: bench_pb_bicg(ws->n_mat, ws->n_mat, ws->A, ws->s_bicg, ws->q_bicg, ws->p_bicg, ws->r_bicg); break;
+        case 0:
+            bench_pb_gemm(n, n, n, 1.5, 1.2, ws->A, ws->B, ws->C);
+            atft_abft_post_gemm(ws->C, ws->A, ws->B, n, n, n, n, n, n,
+                                1.5, 1.2, g_abft_rowsum, g_abft_cold);
+            break;
+        case 1:
+            bench_pb_2mm(n, n, n, n, 1.5, 1.2, ws->tmp_2mm, ws->A, ws->B, ws->A, ws->D);
+            atft_abft_post_gemm(ws->tmp_2mm, ws->A, ws->B, n, n, n, n, n, n,
+                                1.5, 0.0, g_abft_rowsum, NULL);
+            break;
+        case 2:
+            bench_pb_atax(n, n, ws->A, ws->x, ws->y, ws->tmp_atax);
+            atft_abft_check_matvec(ws->tmp_atax, ws->A, ws->x, n, n, n, 0);
+            atft_abft_check_matvec(ws->y, ws->A, ws->tmp_atax, n, n, n, 1);
+            break;
+        case 3:
+            bench_pb_bicg(n, n, ws->A, ws->s_bicg, ws->q_bicg, ws->p_bicg, ws->r_bicg);
+            atft_abft_check_matvec(ws->q_bicg, ws->A, ws->p_bicg, n, n, n, 0);
+            atft_abft_check_matvec(ws->s_bicg, ws->A, ws->r_bicg, n, n, n, 1);
+            break;
         case 4: bench_pb_jacobi2d(4, ws->n_mat, ws->jac_A, ws->jac_B); break;
         case 5: bench_pb_ludcmp(ws->n_lu, ws->lu_A, ws->lu_b, ws->lu_x, ws->lu_y); break;
         case 6: bench_pb_durbin(ws->n_dur, ws->dur_r, ws->dur_y); break;

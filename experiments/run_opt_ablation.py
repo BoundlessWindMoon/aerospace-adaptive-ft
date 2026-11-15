@@ -104,6 +104,10 @@ def ablation_matrix(delta_table, seed=None):
         ("opt_all",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire"], mk(denv)),
         ("opt_bnd",            "approx-simd",  base + dflags + ["-atft-int-tmr-boundary"], mk(denv)),
         ("opt_bnd_only",       "approx-simd",  ["-atft-int-tmr-boundary"], mk({})),
+        # 代数校验层：零指令冗余，只跑等价饱和合成出的 O(n^2) 校验式
+        ("abft",               "native",       [],               mk({"ATFT_ABFT": "1"})),
+        ("abft_norepair",      "native",       [],               mk({"ATFT_ABFT": "1",
+                                                                     "ATFT_ABFT_REPAIR": "0"})),
         # D4 整数三模覆盖面扩到 i64（i32->i64 的下标扩展占 cast 注入点的 88%）
         ("opt_i64",            "approx-simd",  base + dflags + ["-atft-int-tmr-wire",
                                                                 "-atft-int-tmr-i64"], mk(denv)),

@@ -148,6 +148,46 @@ float atft_approx_expf(float x);
 
 // 单比特翻转故障注入函数 (供 LLVM IR 插桩或实验评估使用, 参考 LLFI/LLTFI)
 
+// ============================================================================
+// 5. 代数校验层（ABFT）：由等价饱和合成的校验式对应的通用校验器
+//
+// 校验式本身由 `-atft-dump-sums` + `experiments/eqsat_checker.py` 自动搜出：
+//   矩阵乘  sum_j C[i][j] == beta*sum_j C_old[i][j] + alpha*sum_k A[i][k]*(sum_j B[k][j])
+//   矩阵向量 sum_i y[i]   == sum_j (sum_i A[i][j]) * x[j]
+// 这里只实现"按搜到的式子算一遍并比对"的通用过程，不含任何内核专用逻辑：
+// 维度与步长由调用方传入，判据阈值按数制的单位舍入导出（与 D3 的 delta 同源）。
+//
+// 代价：校验 O(n^2)，原计算 O(n^3)，所以渐近上近乎免费。
+// 判据：|lhs - rhs| <= kappa * u_fp64 * n * ||A||_inf * ||B||_inf
+//       （Huang & Abraham 1984 的校验和 + Smith & van de Geijn 2015 的舍入界形式）
+// ============================================================================
+typedef struct {
+    uint64_t checks;        // 执行的校验次数（行数）
+    uint64_t flagged;       // 判为异常的行数
+    uint64_t repaired;      // 重算修复的行数
+} atft_abft_stats_t;
+
+extern atft_abft_stats_t g_atft_abft;
+extern int g_atft_abft_enabled;      // 0 = 不做校验（基线行为）
+extern int g_atft_abft_repair;       // 1 = 检出后重算该行
+
+void atft_abft_set(int enabled, int repair);
+
+// 矩阵乘：C = beta*C + alpha*A*B，行主序、行步长由调用方给
+// pre 在内核前记录 C 的行和，post 在内核后校验（必要时重算整行）
+void atft_abft_pre_rowsum(const double *C, int ni, int nj, long ldc, double *rowsum);
+// c_old 给 beta != 0 时重算整行所需的原数据副本（可为 NULL：那时只检不纠）
+void atft_abft_post_gemm(double *C, const double *A, const double *B,
+                         int ni, int nj, int nk, long ldc, long lda, long ldb,
+                         double alpha, double beta, const double *rowsum_pre,
+                         const double *c_old);
+void atft_abft_pre_copy(const double *C, int ni, int nj, long ldc, double *dst);
+
+// 矩阵向量：y[j] (或 tmp[i]) 的全和校验。vec_len 给 y 的长度，
+// mode=0 表示 y[i] = sum_j A[i][j]*x[j]，mode=1 表示 y[j] = sum_i A[i][j]*x[i]
+void atft_abft_check_matvec(const double *y, const double *A, const double *x,
+                            int m, int n, long lda, int mode);
+
 // 打印统计摘要
 
 #ifdef __cplusplus

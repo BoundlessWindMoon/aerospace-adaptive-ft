@@ -489,3 +489,148 @@ typedef float v2f32 __attribute__((ext_vector_type(2)));
 
 
 
+
+// ============================================================================
+// 代数校验层（ABFT）：通用校验器
+//
+// 校验式由等价饱和自动合成（见 experiments/eqsat_checker.py 与 METHOD.md）：
+//   gemm   : sum_j C[i][j] == beta*sum_j C_old[i][j] + alpha*sum_k A[i][k]*(sum_j B[k][j])
+//   matvec : sum_i y[i]    == sum_j (sum_i A[i][j]) * x[j]
+// 本文件只实现"按式子算一遍再比对"的通用过程，维度与步长全部由调用方传入，
+// 没有任何内核专用分支。阈值由 fp64 单位舍入导出，与 D3 的 delta 同源。
+// ============================================================================
+atft_abft_stats_t g_atft_abft = {0, 0, 0};
+int g_atft_abft_enabled = 0;
+int g_atft_abft_repair = 1;
+
+#define ATFT_U_FP64 2.220446049250313e-16
+#define ATFT_ABFT_KAPPA 32.0
+
+void atft_abft_set(int enabled, int repair) {
+    g_atft_abft_enabled = enabled ? 1 : 0;
+    g_atft_abft_repair = repair ? 1 : 0;
+}
+
+void atft_abft_pre_rowsum(const double *C, int ni, int nj, long ldc, double *rowsum) {
+    if (!g_atft_abft_enabled) return;
+    for (int i = 0; i < ni; i++) {
+        double s = 0.0;
+        const double *row = C + (long)i * ldc;
+        for (int j = 0; j < nj; j++) s += row[j];
+        rowsum[i] = s;
+    }
+}
+
+void atft_abft_pre_copy(const double *C, int ni, int nj, long ldc, double *dst) {
+    if (!g_atft_abft_enabled || !dst) return;
+    for (int i = 0; i < ni; i++)
+        memcpy(dst + (long)i * nj, C + (long)i * ldc, sizeof(double) * (size_t)nj);
+}
+
+void atft_abft_post_gemm(double *C, const double *A, const double *B,
+                         int ni, int nj, int nk, long ldc, long lda, long ldb,
+                         double alpha, double beta, const double *rowsum_pre,
+                         const double *c_old) {
+    if (!g_atft_abft_enabled) return;
+
+    // 搜到的式子要求先把 B 沿 j 方向求和（O(n^2)），这一步被提到 i 循环之外，
+    // 正是乘法从 O(n^3) 降到 O(n^2) 的来源
+    double *vb = (double *)malloc(sizeof(double) * (size_t)nk);
+    if (!vb) return;
+    double nrm_a = 0.0, nrm_b = 0.0;
+    for (int k = 0; k < nk; k++) {
+        double s = 0.0, rowmax = 0.0;
+        const double *row = B + (long)k * ldb;
+        for (int j = 0; j < nj; j++) {
+            s += row[j];
+            double a = fabs(row[j]);
+            if (a > rowmax) rowmax = a;
+        }
+        vb[k] = s;
+        if (rowmax > nrm_b) nrm_b = rowmax;
+    }
+    for (int i = 0; i < ni; i++) {
+        double rowmax = 0.0;
+        const double *row = A + (long)i * lda;
+        for (int k = 0; k < nk; k++) {
+            double a = fabs(row[k]);
+            if (a > rowmax) rowmax = a;
+        }
+        if (rowmax > nrm_a) nrm_a = rowmax;
+    }
+
+    double tol = ATFT_ABFT_KAPPA * ATFT_U_FP64 * (double)nk * nrm_a * nrm_b;
+    for (int i = 0; i < ni; i++) {
+        double lhs = 0.0;
+        double *crow = C + (long)i * ldc;
+        for (int j = 0; j < nj; j++) lhs += crow[j];
+        double acc = 0.0;
+        const double *arow = A + (long)i * lda;
+        for (int k = 0; k < nk; k++) acc += arow[k] * vb[k];
+        double rhs = beta * rowsum_pre[i] + alpha * acc;
+        double scale = fabs(rhs) > 1.0 ? fabs(rhs) : 1.0;
+        g_atft_abft.checks++;
+        if (!(fabs(lhs - rhs) <= tol + ATFT_ABFT_KAPPA * ATFT_U_FP64 * scale * (double)nj)) {
+            g_atft_abft.flagged++;
+            g_atft_state.detected_faults++;
+            // 重算该行需要 C 的原值（C_new = beta*C_old + alpha*A*B）。
+            // 只有行和是不够的 —— 这是 ABFT 的经典取舍：校验和 O(n) 足够检错，
+            // 要**纠错**就得留下 O(n^2) 的原数据副本。副本仍是 O(n^2)，
+            // 相对 O(n^3) 的原计算渐近免费。beta == 0 时不需要副本。
+            if (g_atft_abft_repair && (beta == 0.0 || c_old)) {
+                const double *old_row = c_old ? (c_old + (long)i * (long)nj) : NULL;
+                for (int j = 0; j < nj; j++) {
+                    double s = 0.0;
+                    for (int k = 0; k < nk; k++)
+                        s += arow[k] * B[(long)k * ldb + j];
+                    crow[j] = (old_row ? beta * old_row[j] : 0.0) + alpha * s;
+                }
+                g_atft_abft.repaired++;
+                g_atft_state.recovered_by_reexec++;
+            }
+        }
+    }
+    free(vb);
+}
+
+void atft_abft_check_matvec(const double *y, const double *A, const double *x,
+                            int m, int n, long lda, int mode) {
+    if (!g_atft_abft_enabled) return;
+    double lhs = 0.0;
+    int ylen = (mode == 0) ? m : n;
+    for (int i = 0; i < ylen; i++) lhs += y[i];
+
+    double rhs = 0.0, nrm_a = 0.0, nrm_x = 0.0;
+    if (mode == 0) {
+        // y[i] = sum_j A[i][j]*x[j]  ->  sum_i y[i] = sum_j (sum_i A[i][j]) * x[j]
+        for (int j = 0; j < n; j++) {
+            double col = 0.0;
+            for (int i = 0; i < m; i++) {
+                double a = A[(long)i * lda + j];
+                col += a;
+                if (fabs(a) > nrm_a) nrm_a = fabs(a);
+            }
+            rhs += col * x[j];
+            if (fabs(x[j]) > nrm_x) nrm_x = fabs(x[j]);
+        }
+    } else {
+        // y[j] = sum_i A[i][j]*x[i]  ->  sum_j y[j] = sum_i (sum_j A[i][j]) * x[i]
+        for (int i = 0; i < m; i++) {
+            double row = 0.0;
+            for (int j = 0; j < n; j++) {
+                double a = A[(long)i * lda + j];
+                row += a;
+                if (fabs(a) > nrm_a) nrm_a = fabs(a);
+            }
+            rhs += row * x[i];
+            if (fabs(x[i]) > nrm_x) nrm_x = fabs(x[i]);
+        }
+    }
+    double tol = ATFT_ABFT_KAPPA * ATFT_U_FP64 * (double)(m > n ? m : n) * nrm_a * nrm_x;
+    double scale = fabs(rhs) > 1.0 ? fabs(rhs) : 1.0;
+    g_atft_abft.checks++;
+    if (!(fabs(lhs - rhs) <= tol + ATFT_ABFT_KAPPA * ATFT_U_FP64 * scale * (double)ylen)) {
+        g_atft_abft.flagged++;
+        g_atft_state.detected_faults++;
+    }
+}
