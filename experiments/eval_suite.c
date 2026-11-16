@@ -1249,6 +1249,67 @@ static int rangecheck_invoke(suite_workspace_t *ws, int b) {
     return 1;
 }
 
+// ============================================================================
+// fork 隔离的整内核 TMR：3 份各跑在独立进程。崩溃/挂死的副本只是"缺一票"，
+// 不再拖垮全体 —— 这正是进程内串行粗粒度治不了 DUE 的原因。单事件故障只命中第 0 份
+// （其余 fork 后解除注入），故总有 ≥2 份干净 → SDC 与 DUE 都能被幸存者多数决救回。
+// 由 ATFT_COARSE_FORK=1 打开（配合 ATFT_COARSE>=2）。
+// ============================================================================
+static int g_coarse_fork = 0;
+static double *g_fork_out = NULL;   // 共享：3 * cap 个 double
+static int *g_fork_done = NULL;     // 共享：3 个完成标志
+static size_t g_fork_cap = 0;
+static void fork_ensure(size_t need) {
+    if (g_fork_out && need <= g_fork_cap) return;
+    if (g_fork_out) munmap(g_fork_out, 3 * g_fork_cap * sizeof(double));
+    g_fork_out = (double *)mmap(NULL, 3 * need * sizeof(double),
+                                PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (!g_fork_done)
+        g_fork_done = (int *)mmap(NULL, 3 * sizeof(int),
+                                  PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    g_fork_cap = need;
+}
+static int coarse_invoke_fork(suite_workspace_t *ws, int b) {
+    size_t n = (size_t)ws->out_sizes[b];
+    fork_ensure(n);
+    for (int i = 0; i < 3; i++) g_fork_done[i] = 0;
+    int nforked = 0;
+    for (int i = 0; i < 3; i++) {
+        pid_t pid = fork();
+        if (pid < 0) break;
+        if (pid == 0) {
+            struct itimerval cw; memset(&cw, 0, sizeof(cw));
+            cw.it_value.tv_usec = g_cfg.watchdog_us;   // 本副本挂死自杀，不拖累父
+            signal(SIGALRM, SIG_DFL); setitimer(ITIMER_REAL, &cw, NULL);
+            if (i > 0) harness_fi_arm_mbu_or_burst(NULL, NULL, 0, 1);  // 仅第 0 份可被注入
+            reset_mutable_buffers(ws, b);
+            invoke_benchmark(ws, b);
+            export_outputs(ws, b);
+            memcpy(&g_fork_out[(size_t)i * n], ws->out_ptrs[b], n * sizeof(double));
+            g_fork_done[i] = 1;
+            _exit(0);
+        }
+        nforked++;
+    }
+    for (int r = 0; r < nforked; r++) { int st; if (wait(&st) < 0) break; }
+    int ndone = 0, idx[3];
+    for (int i = 0; i < 3; i++) if (g_fork_done[i]) idx[ndone++] = i;
+    double *out = ws->out_ptrs[b];
+    if (ndone == 0) return 1;              // 全崩（单故障下不应发生）
+    for (size_t k = 0; k < n; k++) {
+        if (ndone >= 3) {
+            double v0 = g_fork_out[(size_t)idx[0]*n+k], v1 = g_fork_out[(size_t)idx[1]*n+k], v2 = g_fork_out[(size_t)idx[2]*n+k];
+            out[k] = (v0 == v1 || v0 == v2) ? v0 : (v1 == v2 ? v1 : v0);
+        } else {                           // 1~2 份幸存：取幸存者（均为未注入的干净份）
+            out[k] = g_fork_out[(size_t)idx[0]*n+k];
+        }
+    }
+    int recovered = (ndone < 3);           // 有副本缺席=检出并靠幸存者恢复
+    if (recovered) g_atft_state.detected_faults++;
+    return recovered;
+}
+
+
 
 static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir, int dump_golden) {
     suite_workspace_t ws;
@@ -1459,7 +1520,8 @@ static void fi_run_campaign(suite_workspace_t *ws, int b, const char *policy_nam
             harness_fi_set_step_budget(st->total_dyn_insts * (uint64_t)g_cfg.budget_factor);
 
             memset(ws->out_ptrs[b], 0, (size_t)ws->out_sizes[b] * sizeof(double));
-            if (g_coarse_n >= 2) coarse_invoke(ws, b);   // 粗粒度整内核冗余路径（FI 下测覆盖面）
+            if (g_coarse_fork && g_coarse_n >= 2) coarse_invoke_fork(ws, b);  // fork 隔离 TMR（治 DUE）
+            else if (g_coarse_n >= 2) coarse_invoke(ws, b);   // 粗粒度整内核冗余路径（FI 下测覆盖面）
             else if (g_rangecheck_k > 0) rangecheck_invoke(ws, b);  // M2 症状检测路径
             else invoke_benchmark(ws, b);
             export_outputs(ws, b);
@@ -1509,6 +1571,7 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
     }
     { const char *cs = getenv("ATFT_COARSE"); g_coarse_n = cs ? atoi(cs) : 0; }
     { const char *rk = getenv("ATFT_RANGECHECK"); g_rangecheck_k = rk ? atof(rk) : 0.0; }
+    { const char *ck = getenv("ATFT_COARSE_FORK"); g_coarse_fork = ck ? atoi(ck) : 0; }
     install_crash_handlers();
 
     for (int b = 0; b < NUM_BENCHES; b++) {
