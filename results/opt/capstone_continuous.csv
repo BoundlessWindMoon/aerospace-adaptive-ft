@@ -1,0 +1,3 @@
+orbit,ratecap_overhead,costate_overhead,costate_saving_pct,static_menu_overhead,conventional_tmr_overhead,saving_vs_static_menu_pct,saving_vs_conventional_tmr_pct,budget_fail,mu_star
+leo_cont,1.03,1.0221,0.77,1.6407,3.1717,37.2,67.5,14.42,6226
+sso_cont,1.035,1.0261,0.85,1.6407,3.1717,36.9,67.4,15.51,6010

@@ -1,0 +1,7 @@
+orbit,eps_fps,parallel_cores,mean_overhead_adaptive,mean_overhead_always_low,mean_overhead_always_high,worst_resid_adaptive_fps,worst_resid_always_low_fps,adaptive_meets_eps,low_meets_eps,low_violation_steps_pct
+leo_serial,1.000e-04,0,1.12,1.0,1.641,5.819e-06,1.164e-03,1,0,18.7
+sso_serial,1.000e-04,0,1.002,1.0,1.641,9.513e-05,1.117e-04,1,0,21.4
+geo_flare_serial,1.000e-04,0,1.121,1.0,1.641,9.908e-05,5.819e-04,1,0,20.4
+leo_parallel,1.000e-04,1,1.0,1.0,1.0,5.819e-06,1.164e-03,1,0,18.7
+sso_parallel,1.000e-04,1,1.0,1.0,1.0,9.513e-05,1.117e-04,1,0,21.4
+geo_flare_parallel,1.000e-04,1,1.0,1.0,1.0,9.908e-05,5.819e-04,1,0,20.4

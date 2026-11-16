@@ -1,0 +1,4 @@
+orbit,budget_fail_per_mission,ratecap_mean_overhead,costate_mean_overhead,mu_star,costate_B_check,overhead_saving_pct
+leo,0.4263,1.1195,1.1195,4189,0.4263,0.0
+sso,1.807,1.0017,1.0017,626.8,1.807,0.0
+geo_flare,4.92,1.1207,1.1195,8378,3.751,0.11
