@@ -96,3 +96,15 @@ c1–c4 / 标定（cal/hpc_cal）/ 验证（ftcheck/frontier_validation）/ appr
 需要新的 FI 覆盖率/开销数据（新核或新策略）才动 `experiments/eval_suite.c`——那是
 重编译路径，改完要重跑 `run_opt_ablation.py` + `aggregate.py` 重生成 matrix_solid。
 
+## 负载无关评测器（tools/）
+
+`tools/workload_eval.py` 把"负载"和"测试"解耦：测试逻辑固定，任何负载只要给一张
+符合契约的剖面表就能无感跑通并产出 md 报告。
+
+- **契约**：CSV 列 `benchmark,policy,overhead_x,e_sdc`，每个 benchmark 至少含一行
+  `policy=native`。`results/opt/capstone_menu.csv` 即一份合法剖面（当前 PolyBench 负载）。
+- **用法**：`python3 tools/workload_eval.py [--menu <profile.csv>] [--name <负载名>]`
+  → 产出 `tools/reports/<负载名>_report.md`（连续 λ payoff / 达标性 / Pareto / 要点）。
+- **例子**：`tools/example_workload.csv` 是一份与 PolyBench 无关的合成负载，
+  `--menu tools/example_workload.csv` 跑出独立报告，评测器代码一行不改。
+

@@ -1,0 +1,10 @@
+benchmark,policy,overhead_x,e_sdc
+synth_hot,native,1.0,0.20
+synth_hot,coarse_serial,2.0,0.0
+synth_hot,coarse_parallel,1.0,0.0
+synth_cold,native,1.0,0.02
+synth_cold,coarse_serial,2.5,0.0
+synth_cold,coarse_parallel,1.0,0.0
+synth_checkable,native,1.0,0.10
+synth_checkable,result_check,1.08,0.0
+synth_checkable,coarse_parallel,1.0,0.0
