@@ -94,6 +94,37 @@ static void mc_cmf(int trials, const double *gold) {
     printf("  double 2/3 副本同元素  : %5.1f%%   <- 高多重击穿\n", 100.0*esc_double/trials);
 }
 
+// 投票器自检（TSC 口径）：多数决写 out 后，独立复核每个 out[k] 是否被 ≥2 份副本支持；
+// 不支持 → voter_fault（fail-stop）。把投票器自身的瞬态从"静默放行"变成"检出"。
+// 返回 1 = 自检发现投票器被扰动。
+static int voter_self_check(const double *out, const double *a, const double *b, const double *c) {
+    size_t nn=(size_t)N*N;
+    for (size_t i=0;i<nn;i++){ int sup=(out[i]==a[i])+(out[i]==b[i])+(out[i]==c[i]); if(sup<2) return 1; }
+    return 0;
+}
+// 蒙特卡洛：投票器瞬态（翻 out 的一个元素）下，普通投票器 vs 自检投票器的 SDC 逃逸率。
+static void mc_voter(int trials, const double *gold) {
+    size_t nn=(size_t)N*N;
+    double *out = malloc(bytes());
+    int esc_plain=0, esc_sc=0, det_sc=0;
+    for (int t=0;t<trials;t++){
+        run_one(C1); run_one(C2); run_one(C3);          // 三份干净 = gold
+        for (size_t i=0;i<nn;i++){ out[i]=(C1[i]==C2[i]||C1[i]==C3[i])?C1[i]:(C2[i]==C3[i]?C2[i]:C1[i]); }
+        size_t j = xr()%nn; out[j] = flip_hi(out[j]);   // 投票器瞬态：写出被扰动
+        // plain：不自检，直接交付
+        int bad=0; for(size_t i=0;i<nn;i++) if(out[i]!=gold[i]){bad=1;break;}
+        if (bad) esc_plain++;
+        // self-check：独立复核 out 是否被多数副本支持
+        int vf = voter_self_check(out, C1, C2, C3);
+        if (vf) det_sc++; else if (bad) esc_sc++;
+    }
+    free(out);
+    printf("voter-montecarlo (N=%d, trials=%d)  投票器瞬态下的 SDC 逃逸率:\n", N, trials);
+    printf("  普通投票器       : %5.1f%%   <- 静默放行（投票器是单点）\n", 100.0*esc_plain/trials);
+    printf("  自检投票器       : %5.1f%%   (检出 %5.1f%%)  <- fail-stop，不再静默\n",
+           100.0*esc_sc/trials, 100.0*det_sc/trials);
+}
+
 int main(int argc, char **argv) {
     N = argc > 1 ? atoi(argv[1]) : 512;
     int reps = argc > 2 ? atoi(argv[2]) : 20;
@@ -132,6 +163,7 @@ int main(int argc, char **argv) {
     double *gold = malloc(bytes()); run_one(gold);
     int mc_trials = argc > 3 ? atoi(argv[3]) : 300;
     mc_cmf(mc_trials, gold);
+    mc_voter(mc_trials, gold);
     free(gold);
     return 0;
 }
