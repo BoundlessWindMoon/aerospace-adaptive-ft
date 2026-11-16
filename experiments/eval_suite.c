@@ -1790,6 +1790,9 @@ static int run_mbu_and_burst_stress(const char *policy_name) {
     suite_workspace_t ws;
     alloc_and_init_workspace(&ws, 1);
     install_crash_handlers();
+    { const char *cs = getenv("ATFT_COARSE"); g_coarse_n = cs ? atoi(cs) : 0; }
+    { const char *rk = getenv("ATFT_RANGECHECK"); g_rangecheck_k = rk ? atof(rk) : 0.0; }
+    { const char *ck = getenv("ATFT_COARSE_FORK"); g_coarse_fork = ck ? atoi(ck) : 0; }
 
     int targets[NUM_BENCHES];
     int n_targets = bench_select_tagged(BTAG_REPR, targets, NUM_BENCHES);

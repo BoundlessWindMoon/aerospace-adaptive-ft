@@ -1,0 +1,15 @@
+policy,group,label,trials,ok_pct,detrec_pct,sdc_pct,due_pct
+native,Spatial_MBU,SEU (1-bit),480,87.50,0.00,12.50,0.00
+native,Spatial_MBU,DBU (2-bit Adjacent),480,90.83,0.00,9.17,0.00
+native,Spatial_MBU,QBU (4-bit Burst),480,88.96,0.00,11.04,0.00
+native,Temporal_Burst,k=1 Fault/Run,480,87.29,0.00,12.71,0.00
+native,Temporal_Burst,k=2 Faults/Run,480,78.33,0.00,21.67,0.00
+native,Temporal_Burst,k=4 Faults/Run,480,62.50,0.00,37.50,0.00
+native,Temporal_Burst,k=8 Faults/Run,480,41.04,0.00,58.96,0.00
+coarse_fork,Spatial_MBU,SEU (1-bit),480,100.00,0.00,0.00,0.00
+coarse_fork,Spatial_MBU,DBU (2-bit Adjacent),480,100.00,0.00,0.00,0.00
+coarse_fork,Spatial_MBU,QBU (4-bit Burst),480,100.00,0.00,0.00,0.00
+coarse_fork,Temporal_Burst,k=1 Fault/Run,480,100.00,0.00,0.00,0.00
+coarse_fork,Temporal_Burst,k=2 Faults/Run,480,100.00,0.00,0.00,0.00
+coarse_fork,Temporal_Burst,k=4 Faults/Run,480,100.00,0.00,0.00,0.00
+coarse_fork,Temporal_Burst,k=8 Faults/Run,480,100.00,0.00,0.00,0.00
