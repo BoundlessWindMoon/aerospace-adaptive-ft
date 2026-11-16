@@ -7,3 +7,4 @@
 - [免检查点恢复（幂等区间一族）](lit_idempotence_recovery.md) —— 唯一能绕开"常驻三份"的恢复机制
 - [半环与阈值的理论工具](lit_semiring_and_thresholds.md) —— min-plus 验证的硬度结果，与阈值的概率界
 - [自适应容错的先行工作](lit_adaptive_prior.md) —— 在轨按辐射强度切保护等级，2012 年就有
+- [相关工作速查](RELATED_WORK.md) —— 2026-11-16 新增一轮：进程级冗余(PLR)、注入方法学、开销下压技术、分层选择先行工作、平台与空天锚点；每条一句话 + 对我们的启发

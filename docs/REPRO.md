@@ -40,14 +40,17 @@
   - 脚本：`experiments/freivalds_check.c`（`freivalds_probe` 原语）
 - **stencil 极值原理界校验（负结果，界定廉价校验适用域）**
   - 脚本：`experiments/stencil_check.c`
-- **粗粒度多核 scaling（gemm 演示）**
-  - 脚本：`experiments/coarse_rmt.c`
+- **粗粒度多核 scaling（gemm）**
+  - 脚本：`experiments/measure_coarse_scaling.py`（编译 `coarse_scaling.c`，warmup + 中位/21 次，核数经 taskset 作真参数）
+  - 输出：`core_saturation_sweep.csv`
+  - 另：`experiments/coarse_rmt.c` 是共模/投票器蒙特卡洛的演示器（非墙钟口径）
 
 ## 4. 真实工作点（少核）下包络
 
 - **核占用扫描（并行 ~1× 只在空闲核≥副本数时成立）**
-  - 脚本：`experiments/few_core_envelope.py`
-  - 输出：`core_saturation_sweep.csv`、`few_core_envelope.csv`
+  - 脚本：`experiments/measure_coarse_scaling.py`（实测，含 fork 墙钟）
+  - 输出：`core_saturation_sweep.csv`
+  - 注：`few_core_envelope.py` 内含硬编码常量，仅作下包络绘图，不作测量来源
 - **自适应下包络（每核选最便宜 SDC=0 策略）**
   - 脚本：`experiments/lower_envelope.py`
   - 输入：matrix_solid CSV + `coarse_overhead_subset.csv`
