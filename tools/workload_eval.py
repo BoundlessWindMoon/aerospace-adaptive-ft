@@ -35,7 +35,7 @@ from atft_core import (                       # noqa: E402
 )
 
 EPS = 1.0e-4
-ORBITS_CONT = [("LEO (SAMPEX)", "sampex"), ("SSO (Alsat-1)", "alsat1")]
+ORBITS_CONT = [("LEO-SAMPEX", "sampex"), ("SSO-Alsat1", "alsat1")]
 
 
 def load_menu_from_csv(path):
