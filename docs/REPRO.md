@@ -108,3 +108,11 @@ c1–c4 / 标定（cal/hpc_cal）/ 验证（ftcheck/frontier_validation）/ appr
 - **例子**：`tools/example_workload.csv` 是一份与 PolyBench 无关的合成负载，
   `--menu tools/example_workload.csv` 跑出独立报告，评测器代码一行不改。
 
+### 统一报告
+
+`tools/build_report.py` 把所有层面汇成**一个 md**（`tools/reports/full_report.md`）：
+①保护菜单(o,e) ②策略级覆盖与开销(solid FI 矩阵) ③少核下包络 ④自适应 payoff(现跑)
+⑤在线 λ̂。数据**生成**仍分散各源（各节标题标了 CSV），本工具只统一**汇总消费**；
+换负载/补实验后重跑即可刷新整份报告。
+    python3 tools/build_report.py
+
