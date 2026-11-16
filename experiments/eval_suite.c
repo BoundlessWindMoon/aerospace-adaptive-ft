@@ -1214,8 +1214,41 @@ static int coarse_invoke(suite_workspace_t *ws, int b) {
             if (!(v0 == v1 && v1 == v2)) mismatch = 1;
         }
     }
+    // 检出不一致（含已通过重执行纠错的情形）记一次检出，供 FI 把本次 trial 归为
+    // "检出并恢复"而非静默损坏。
+    if (mismatch) g_atft_state.detected_faults++;
     return mismatch;
 }
+
+// ============================================================================
+// M2 廉价症状检测：无故障包络给出每个输出的期望峰值 peak_vals[b]；高位指数翻转会把
+// 某元素推到 |v| > K·peak（越界）——O(n) 扫一遍即检出（≈1×），比整内核复制便宜一个量级。
+// 检出则重算一次纠错（瞬态不复现）。只抓大幅值 SDC，小幅值漏网交给上层/容差。
+// K 由 ATFT_RANGECHECK 给（做敏感性扫描，不写死）。默认关。
+// ============================================================================
+static double g_rangecheck_k = 0.0;
+static int rangecheck_suspect(suite_workspace_t *ws, int b) {
+    double lim = g_rangecheck_k * ws->peak_vals[b];
+    const double *out = ws->out_ptrs[b];
+    size_t n = (size_t)ws->out_sizes[b];
+    for (size_t k = 0; k < n; k++) {
+        double a = out[k] < 0 ? -out[k] : out[k];
+        if (!(a <= lim)) return 1;          // 越界或 NaN/Inf
+    }
+    return 0;
+}
+// 跑一遍 + 范围检测；越界则重算一次纠错。返回 1=检出。无故障开销≈1×。
+static int rangecheck_invoke(suite_workspace_t *ws, int b) {
+    invoke_benchmark(ws, b);
+    export_outputs(ws, b);
+    if (!rangecheck_suspect(ws, b)) return 0;
+    g_atft_state.detected_faults++;         // 症状命中 → 检出
+    reset_mutable_buffers(ws, b);
+    invoke_benchmark(ws, b);                // 重算一份干净的（瞬态不复现）
+    export_outputs(ws, b);
+    return 1;
+}
+
 
 static int run_pmu_perf_and_qor(const char *policy_name, const char *golden_dir, int dump_golden) {
     suite_workspace_t ws;
@@ -1426,7 +1459,9 @@ static void fi_run_campaign(suite_workspace_t *ws, int b, const char *policy_nam
             harness_fi_set_step_budget(st->total_dyn_insts * (uint64_t)g_cfg.budget_factor);
 
             memset(ws->out_ptrs[b], 0, (size_t)ws->out_sizes[b] * sizeof(double));
-            invoke_benchmark(ws, b);
+            if (g_coarse_n >= 2) coarse_invoke(ws, b);   // 粗粒度整内核冗余路径（FI 下测覆盖面）
+            else if (g_rangecheck_k > 0) rangecheck_invoke(ws, b);  // M2 症状检测路径
+            else invoke_benchmark(ws, b);
             export_outputs(ws, b);
 
             harness_qor_metrics_t q;
@@ -1472,6 +1507,8 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
         int ss = (big && *big && atoi(big) != 0) ? 0 : 1;
         alloc_and_init_workspace(&ws, ss);
     }
+    { const char *cs = getenv("ATFT_COARSE"); g_coarse_n = cs ? atoi(cs) : 0; }
+    { const char *rk = getenv("ATFT_RANGECHECK"); g_rangecheck_k = rk ? atof(rk) : 0.0; }
     install_crash_handlers();
 
     for (int b = 0; b < NUM_BENCHES; b++) {

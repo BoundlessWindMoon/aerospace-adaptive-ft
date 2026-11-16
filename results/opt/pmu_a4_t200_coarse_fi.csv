@@ -1,0 +1,13 @@
+policy,benchmark,exec_time_us,hw_insts,hw_cycles,rel_l2_err,mean_rel_err,max_abs_err,psnr_db,votes_per_iter,false_alarms
+native,pb_gemm,250.871,3292156,774473,0.0,0.0,0.0,120.0,0,0
+native,pb_2mm,706.289,11943323,2182268,0.0,0.0,0.0,120.0,0,0
+native,pb_jacobi2d,51.032,624983,157671,0.0,0.0,0.0,120.0,0,0
+native,pb_floyd_warshall,323.727,6560279,1000007,0.0,0.0,0.0,120.0,0,0
+native,pb_nussinov,119.046,1234711,367418,0.0,0.0,0.0,120.0,0,0
+native,obpmark_image_proc,16.344,283437,50484,0.0,0.0,0.0,120.0,0,0
+native,pb_covariance,161.809,1961707,498448,0.0,0.0,0.0,120.0,0,0
+native,pb_3mm,388.968,6917683,1201849,0.0,0.0,0.0,120.0,0,0
+native,pb_cholesky,106.71,1068359,329568,0.0,0.0,0.0,120.0,0,0
+native,pb_lu,142.501,2288295,440055,0.0,0.0,0.0,120.0,0,0
+native,pb_heat3d,281.707,4605284,866740,0.0,0.0,0.0,120.0,0,0
+native,pb_seidel2d,1547.751,3622274,4779704,0.0,0.0,0.0,120.0,0,0
