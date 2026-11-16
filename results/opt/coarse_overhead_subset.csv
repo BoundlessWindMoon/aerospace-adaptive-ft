@@ -1,0 +1,13 @@
+benchmark,coarse_dmr_rerun,coarse_tmr
+obpmark_image_proc,2.245,3.269
+pb_2mm,2.019,2.936
+pb_3mm,2.013,3.263
+pb_cholesky,2.228,3.184
+pb_covariance,2.074,3.082
+pb_floyd_warshall,2.074,3.065
+pb_gemm,2.154,3.156
+pb_heat3d,2.207,3.083
+pb_jacobi2d,2.625,3.745
+pb_lu,2.124,3.113
+pb_nussinov,2.243,3.265
+pb_seidel2d,2.011,2.983

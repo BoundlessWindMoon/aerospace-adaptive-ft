@@ -1189,11 +1189,27 @@ static int coarse_invoke(suite_workspace_t *ws, int b) {
     }
     int mismatch = 0;
     double *out = ws->out_ptrs[b];
-    for (size_t k = 0; k < n; k++) {
-        double v0 = g_coarse_shadow[0][k];
-        if (N == 2) { if (v0 != g_coarse_shadow[1][k]) mismatch = 1; out[k] = v0; }
-        else {
-            double v1 = g_coarse_shadow[1][k], v2 = g_coarse_shadow[2][k];
+    if (N == 2) {
+        // DMR 检测：两份比对
+        for (size_t k = 0; k < n; k++)
+            if (g_coarse_shadow[0][k] != g_coarse_shadow[1][k]) { mismatch = 1; break; }
+        if (!mismatch) {
+            memcpy(out, g_coarse_shadow[0], n * sizeof(double));
+        } else {
+            // 失配 → 重执行第 3 份做多数决纠错。无故障时走不到这里，所以无故障开销严格 2×；
+            // 这 1× 只在真检出故障时付（期望 = 2× + λ·1×），把纠错地板从 TMR 的 3× 压到 ~2×。
+            reset_mutable_buffers(ws, b);
+            invoke_benchmark(ws, b);
+            export_outputs(ws, b);
+            memcpy(g_coarse_shadow[2], out, n * sizeof(double));
+            for (size_t k = 0; k < n; k++) {
+                double v0 = g_coarse_shadow[0][k], v1 = g_coarse_shadow[1][k], v2 = g_coarse_shadow[2][k];
+                out[k] = (v0 == v1 || v0 == v2) ? v0 : (v1 == v2 ? v1 : v0);
+            }
+        }
+    } else {
+        for (size_t k = 0; k < n; k++) {
+            double v0 = g_coarse_shadow[0][k], v1 = g_coarse_shadow[1][k], v2 = g_coarse_shadow[2][k];
             out[k] = (v0 == v1 || v0 == v2) ? v0 : (v1 == v2 ? v1 : v0);
             if (!(v0 == v1 && v1 == v2)) mismatch = 1;
         }
