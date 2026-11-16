@@ -1,0 +1,7 @@
+# simd_bcast ablation: overhead + fp64/load coverage (native gemm=954720 insts, 2mm=1971187)
+/home/users/wangtianyu15/.comate-engine/store/terminals/dhirzu.output:PMU,native,native,pb_gemm,58.322,954720,179965,0.000000e+00,0.000000e+00,0.000000e+00,120.00,0,0
+/home/users/wangtianyu15/.comate-engine/store/terminals/dhirzu.output:PMU,native,native,pb_2mm,111.615,1971187,344699,0.000000e+00,0.000000e+00,0.000000e+00,120.00,0,0
+/home/users/wangtianyu15/.comate-engine/store/terminals/dhirzu.output:PMU,simd_tmr,simd_tmr,pb_gemm,248.486,4556328,766833,0.000000e+00,0.000000e+00,0.000000e+00,120.00,0,0
+/home/users/wangtianyu15/.comate-engine/store/terminals/dhirzu.output:PMU,simd_tmr,simd_tmr,pb_2mm,597.006,8780297,1842617,0.000000e+00,0.000000e+00,0.000000e+00,120.00,0,0
+/home/users/wangtianyu15/.comate-engine/store/terminals/s8kxpo.output:PMU,native,native,pb_gemm,58.399,954720,180128,0.000000e+00,0.000000e+00,0.000000e+00,120.00,0,0
+/home/users/wangtianyu15/.comate-engine/store/terminals/s8kxpo.output:PMU,native,native,pb_2mm,113.236,1971187,349584,0.000000e+00,0.000000e+00,0.000000e+00,120.00,0,0

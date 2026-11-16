@@ -8,3 +8,9 @@ third_party/
 # Python caches
 __pycache__/
 *.pyc
+
+# IDE / assistant workspace state
+.comate/
+
+# Archived scratch/exploration results (preserved on disk, out of VCS)
+results/opt/archive/
