@@ -74,3 +74,25 @@
 `results/opt/archive/`：2026-11 的 pgsp / path-frontier / delta-profile / boundary /
 c1–c4 / 标定（cal/hpc_cal）/ 验证（ftcheck/frontier_validation）/ approxcheck 等
 探索一次性产物，均已被上面 canonical 结果取代，留盘备查、不入 VCS。
+
+## 如何补一个实验
+
+固定契约，照这五步做，新实验即可被复现也能进本清单：
+
+1. **复用核心**，别复制粘贴菜单/求解/轨迹逻辑。从 `experiments/atft_core.py` import：
+   ```python
+   from atft_core import (build_menu, load_continuous_lambda,
+                          integrate, choose_ratecap, choose_costate,
+                          solve_to_budget, trace_leo, trace_sso, trace_geo_flare)
+   ```
+2. **读** `results/opt/` 下的 canonical CSV（见上面各节），不要读 `archive/`，
+   不要改已冻结的输入（`kernel_properties_*_matrix_solid.csv`、`coarse_overhead_subset.csv`、
+   `rq9_orbit_timeseries.csv`、`results/rq1_*`）。
+3. **写** 输出到 `results/opt/<实验名>.csv`，一个实验一个文件，列名自解释。
+4. **可复现**：任何随机必须带固定种子（如 `np.random.default_rng(12345)`），
+   不得用系统时间/无种子随机。新脚本放 `experiments/`，从仓库根目录运行。
+5. **登记**：在本文件对应小节补一行「结论 → 脚本 → 输入 → 输出」。
+
+需要新的 FI 覆盖率/开销数据（新核或新策略）才动 `experiments/eval_suite.c`——那是
+重编译路径，改完要重跑 `run_opt_ablation.py` + `aggregate.py` 重生成 matrix_solid。
+
