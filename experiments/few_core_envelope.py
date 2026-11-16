@@ -9,8 +9,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OPT = ROOT / "results" / "opt"
 SDC0 = 0.05  # fp64 SDC 视为清零的阈值(%)
-# coarse DMR+重执行无故障墙钟（相对 native）随可用核数：来自 core_saturation_sweep.csv
-COARSE_DMR = {1: 1.98, 2: 1.04, 4: 1.00}
 
 
 def load(p):
@@ -18,8 +16,25 @@ def load(p):
         return list(csv.DictReader(f))
 
 
+def load_coarse_dmr(ks=(1, 2, 4)):
+    """coarse DMR+重执行并行墙钟（相对 native）随可用核数：读 measure_coarse_scaling.py
+    的实测产物 core_saturation_sweep.csv，不再硬编码。缺失即报错，不回落。"""
+    out = {}
+    for r in load(OPT / "core_saturation_sweep.csv"):
+        c = int(r["cores"])
+        if r["method"] == "dmr_par" and c in ks:
+            out[c] = float(r["ratio_median"])
+    missing = [k for k in ks if k not in out]
+    if missing:
+        raise SystemExit(f"core_saturation_sweep.csv 缺 dmr_par 核数 {missing}；"
+                         "先跑 experiments/measure_coarse_scaling.py")
+    return out
+
+
+
 def main():
     suf = sys.argv[1] if len(sys.argv) > 1 else "a4_t200_matrix_solid"
+    coarse_dmr = load_coarse_dmr()
     pmu = load(OPT / f"pmu_{suf}.csv")
     fi = load(OPT / f"fi_outcomes_{suf}.csv")
     natc = {r["benchmark"]: float(r["hw_cycles"]) for r in pmu if r["policy"] == "native"}
@@ -42,7 +57,7 @@ def main():
         line = f"{b:14s}{abft_str:>13}{(f'{simd_o:.2f}×' if simd_o else '-'):>12}  | "
         cells = []
         for K in (1, 2, 4):
-            cands = {"coarse": COARSE_DMR[K]}
+            cands = {"coarse": coarse_dmr[K]}
             if abft_ok: cands["ABFT"] = abft_o
             if simd_ok and simd_o: cands["slack"] = simd_o
             best = min(cands, key=cands.get)
