@@ -1,0 +1,4 @@
+config,time_tax,inst_tax,cyc_tax,ipc_ratio,stack_frac
+scalar,16.331,15.438,16.286,0.948,0.1206
+simd32,7.115,7.38,7.119,1.037,0.1128
+simd64,6.319,6.83,6.314,1.082,0.1153

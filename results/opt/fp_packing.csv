@@ -1,0 +1,4 @@
+config,time_tax_geo,fp64_sdc_mean,fp64_sdc_max,bookkeep_frac
+scalar,13.518,0.0,0.0,0.19
+simd32,6.006,0.0,0.0,0.0901
+simd64,5.128,0.0,0.0,0.0498

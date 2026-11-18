@@ -1,0 +1,5 @@
+config,time_tax_geo,fp64_sdc_mean,fp64_sdc_max,int_sdc_mean,int_sdc_max
+fp_only,5.929,0.0,0.0,6.446,28.0
+fp_cmp,6.063,0.0,0.0,6.501,28.0
+fp_cmp_iw,5.695,0.0,0.0,1.0,6.0
+fp_cmp_iw_i64,5.91,0.0,0.0,0.0,0.0

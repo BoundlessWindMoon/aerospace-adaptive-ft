@@ -198,12 +198,18 @@ static cl::opt<bool> AtftIntTMRI64(
     cl::desc("Extend integer TMR coverage to i64 values (index extensions feeding GEPs)"),
     cl::init(false));
 
-// 诊断开关：关掉 CSE 屏障，用来**测量**屏障本身的代价（指令数与 IPC 损失）。
-// 关掉后 -O2 的 CSE/GVN 会把等价副本折叠，冗余不再成立，所以它只能用于测量，
-// 不能用于部署。测出的差值是"屏障税"的上界。
+// 关掉 CSE 屏障。原先假设关掉后 CSE/GVN 会折叠等价副本、冗余失效，故只敢用于测量。
+// 2026-11-18 在 approx-simd + int-tmr-wire 全栈、LARGE 规模、12 个负载上实测否掉了这个假设：
+//   关屏障后 SDC 覆盖不变（fp64/cast/int_arith 三目标均保持 0.00%，native 最高 27.5%），
+//   可注错静态点数不变（on=off=8666，冗余副本完整），而指令数降约一半（屏障税 ~2×）。
+// 原因：近似副本是 f32（与 f64 原值类型不同，CSE 折不动），整数副本被表决 select 吊住也不折，
+// 屏障挡的是个不存在的折叠，只白白钉住活跃区间、挡掉 LICM/向量化。
+// 因此本开关对该部署配置是有效的降税旋钮；但 exact-tmr/eddi/swift 等纯精确复制路径未经此验证，
+// 那些路径的副本逐位相同、确有被折叠风险，仍需保留屏障。默认不变，由部署配置显式开启。
 static cl::opt<bool> AtftNoBarrier(
     "atft-no-cse-barrier",
-    cl::desc("Measurement only: drop the CSE barriers (destroys redundancy, use for cost accounting)"),
+    cl::desc("Drop the CSE barriers. Validated safe (coverage+sites preserved, ~2x less tax) "
+             "for approx-simd + int-tmr-wire; keep barriers for pure exact-replication paths"),
     cl::init(false));
 
 // 整数通路改用双模检错 + 冷路径重执行：只留一份副本，汇点比对，

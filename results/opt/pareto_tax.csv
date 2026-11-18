@@ -1,0 +1,8 @@
+config,time_tax_geo,inst_tax_geo,max_sdc_pct,mean_sdc_pct
+ref_bar,14.08,15.866,0.0,0.0
+nobar,6.985,6.612,0.0,0.0
+nobar_bnd,6.576,6.378,8.33,0.625
+nobar_bnd_b50,5.921,5.473,8.33,1.84
+nobar_bnd_b30,3.227,2.903,15.83,3.889
+f64_bar,12.868,15.318,0.0,0.0
+f64_nobar,5.754,6.093,0.0,0.0
