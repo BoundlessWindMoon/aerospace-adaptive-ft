@@ -2638,6 +2638,40 @@ static bool atftMatchUnitStrideDoubleGEP(Value *ptr, PHINode *iv, Type *F64Ty,
   return atftMatchAffineIV(gep->getOperand(1), iv, off);
 }
 
+// 沿 gep 指针链回溯到根指针(alloca/arg/global)，用于按底层数组做保守别名判断
+static Value *atftRootPtr(Value *p) {
+  while (auto *g = dyn_cast<GetElementPtrInst>(p)) p = g->getPointerOperand();
+  return p;
+}
+
+// v 是否可外提到 preheader：在循环外=是；在循环内但为纯算术/gep/cast 且操作数全可外提=是。
+// 禁 load/store/call/phi（有副作用或循环携带），保证克隆到 PH 后语义不变。
+static bool atftIsHoistable(Value *v, Loop *L) {
+  auto *in = dyn_cast<Instruction>(v);
+  if (!in || !L->contains(in->getParent())) return true;   // 常量/参数/循环外定义
+  if (isa<GetElementPtrInst>(in) || isa<CastInst>(in) || isa<BinaryOperator>(in)) {
+    for (Use &u : in->operands())
+      if (!atftIsHoistable(u.get(), L)) return false;
+    return true;
+  }
+  return false;
+}
+
+// 把可外提的不变量表达式(递归)克隆进 PH，返回克隆后的值；带 cache 去重
+static Value *atftMaterializeInPH(Value *v, Loop *L, IRBuilder<> &PB,
+                                  std::map<Value *, Value *> &cache) {
+  auto *in = dyn_cast<Instruction>(v);
+  if (!in || !L->contains(in->getParent())) return v;      // 无需克隆
+  auto it = cache.find(v);
+  if (it != cache.end()) return it->second;
+  Instruction *cl = in->clone();
+  for (unsigned i = 0; i < cl->getNumOperands(); ++i)
+    cl->setOperand(i, atftMaterializeInPH(in->getOperand(i), L, PB, cache));
+  PB.Insert(cl);
+  cache[v] = cl;
+  return cl;
+}
+
 // 返回成功向量化的循环数。只转换严格匹配者，其余原样保留。
 static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
   expandFMulAddIntrinsics(F);                    // fmuladd → fmul+fadd，便于匹配纯 FP DAG
@@ -2733,15 +2767,15 @@ static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
         Value *base; int64_t off;
         if (!LD->getType()->isDoubleTy() ||
             !atftMatchUnitStrideDoubleGEP(LD->getPointerOperand(), iv, F64Ty, base, off) ||
-            !L->isLoopInvariant(base)) { ok = false; break; }
-        loads.push_back(LD); addrOf[LD] = {base, off}; loadBases.insert(base); continue;
+            !atftIsHoistable(base, L)) { ok = false; break; }
+        loads.push_back(LD); addrOf[LD] = {base, off}; loadBases.insert(atftRootPtr(base)); continue;
       }
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
         Value *base; int64_t off;
         if (!SI->getValueOperand()->getType()->isDoubleTy() ||
             !atftMatchUnitStrideDoubleGEP(SI->getPointerOperand(), iv, F64Ty, base, off) ||
-            !L->isLoopInvariant(base)) { ok = false; break; }
-        stores.push_back(SI); addrOf[SI] = {base, off}; storeBases.insert(base); continue;
+            !atftIsHoistable(base, L)) { ok = false; break; }
+        stores.push_back(SI); addrOf[SI] = {base, off}; storeBases.insert(atftRootPtr(base)); continue;
       }
       unsigned op = I.getOpcode();
       if (I.getType()->isDoubleTy() &&
@@ -2777,17 +2811,12 @@ static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
     Function *Fn = H->getParent();
     Instruction *phTerm = PH->getTerminator();
     IRBuilder<> PB(phTerm);
-    Value *boundPH = bound;                        // 物化上界到 PH（必要时克隆不变量表达式）
-    if (auto *bi = dyn_cast<Instruction>(bound)) {
-      if (L->contains(bi->getParent())) {
-        bool cloneOk = true;
-        for (Use &u : bi->operands())
-          if (auto *oi = dyn_cast<Instruction>(u.get()))
-            if (L->contains(oi->getParent())) { cloneOk = false; break; }
-        if (!cloneOk) continue;
-        Instruction *cl = bi->clone(); PB.Insert(cl); boundPH = cl;
-      }
-    }
+    std::map<Value *, Value *> hoistCache;         // 外提克隆去重(bound 与各 base 共用)
+    Value *boundPH = atftMaterializeInPH(bound, L, PB, hoistCache);  // 物化上界到 PH
+    std::map<Value *, Value *> baseHoist;          // 原 base → PH 里的外提副本
+    for (auto &kv : addrOf)
+      baseHoist[kv.second.first] =
+          atftMaterializeInPH(kv.second.first, L, PB, hoistCache);
     Value *Nx = incl ? PB.CreateAdd(boundPH, ConstantInt::get(IvTy, 1)) : boundPH;
     Value *tc = PB.CreateSub(Nx, start);
     Value *tcv = PB.CreateAnd(tc, ConstantInt::get(IvTy, ~(int64_t)(VF - 1)));
@@ -2822,7 +2851,7 @@ static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
     };
     auto gepAt = [&](Value *base, int64_t off) -> Value * {
       Value *ix = off ? VB.CreateAdd(idx64, ConstantInt::get(I64Ty, off)) : idx64;
-      return VB.CreateGEP(F64Ty, base, ix);
+      return VB.CreateGEP(F64Ty, baseHoist[base], ix);     // 用 PH 外提后的基址
     };
     // 冗余 lane 必须对优化器不透明，否则 InstCombine 发现高半==低半会折叠掉冗余(=假保护)。
     // 低半从原指针 load，高半从"经零开销指针屏障(=r,0，标量寄存器可分配)洗过的同地址指针"
