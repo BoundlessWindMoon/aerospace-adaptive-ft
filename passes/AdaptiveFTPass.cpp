@@ -212,6 +212,17 @@ static cl::opt<bool> AtftNoBarrier(
              "for approx-simd + int-tmr-wire; keep barriers for pure exact-replication paths"),
     cl::init(false));
 
+// 循环级检错(SWIFT 同步点思路)：实测 FP 近似三模 6.3× 税里 74% 是"每 store 一次
+// 分支+冷块+表决"的机制开销，纯指令数(IPC 1.08、无 spill)。本开关把每 store 的
+// 分支/冷块去掉，只留一条便宜的 this_ok 布尔，并经一个入口 alloca 累积(交给 mem2reg
+// 升成 loop-carried PHI)，在函数返回前一次性提交：不一致则置运行时检测标志(检错，
+// 不就地纠错，交系统级回滚——契合空天"检错+回滚"口径)。store 仍写精确值。
+static cl::opt<bool> AtftLoopVote(
+    "atft-loop-vote",
+    cl::desc("Amortized loop-level detection: accumulate per-store agreement into one flag, "
+             "commit once before return (detect-only, no per-store branch/cold-path)"),
+    cl::init(false));
+
 // 整数通路改用双模检错 + 冷路径重执行：只留一份副本，汇点比对，
 // 检到不一致由运行时置位、上层整段重算。常驻成本从"3 份计算 + 4 条表决"
 // 降到"2 份计算 + 1 次比对"，而可靠性仍是纠错级（重算给出第三个值）。
@@ -2588,6 +2599,31 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
   FunctionCallee ApproxCosFn = M->getOrInsertFunction("atft_approx_cosf", F32Ty, F32Ty);
   FunctionCallee ApproxExpFn = M->getOrInsertFunction("atft_approx_expf", F32Ty, F32Ty);
 
+  // 循环级检错(-atft-loop-vote)：精确 simd-f64 路径用 XOR 签名(两条逐位相同的链各累一个
+  // i64 签名，返回前比一次)——每 store 仅 2 条 XOR，直击不可约的每元素校验；非精确路径回落
+  // 到 i1 ok 容差累加。alloca 交 -O3 mem2reg 升 loop-carried PHI，省手工 PHI 与每 store 分支。
+  Type *I1Ty = Type::getInt1Ty(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  FunctionCallee LoopVoteCommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+  AllocaInst *okFlag = nullptr, *sigA = nullptr, *sigB = nullptr;
+  bool lvSig = AtftLoopVote && AtftSimdF64 && useSIMD && !pureApproxOutput;
+  bool emittedLoopVote = false;
+  if (AtftLoopVote && !pureApproxOutput) {
+    IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+    if (lvSig) {
+      sigA = EB.CreateAlloca(I64Ty, nullptr, "atft.sigA");
+      sigB = EB.CreateAlloca(I64Ty, nullptr, "atft.sigB");
+      EB.CreateStore(ConstantInt::get(I64Ty, 0), sigA);
+      EB.CreateStore(ConstantInt::get(I64Ty, 0), sigB);
+    } else {
+      okFlag = EB.CreateAlloca(I1Ty, nullptr, "atft.ok.flag");
+      EB.CreateStore(ConstantInt::getTrue(Ctx), okFlag);
+    }
+  }
+
+
+
   std::vector<PHINode *> phiNodes;
   std::vector<LoadInst *> loadInsts;
   std::vector<Instruction *> computeOrdered;
@@ -2877,8 +2913,43 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
                           ? a1_f32
                           : IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64");
 
+      // 循环级检错：不建分支/冷块，store 仍写精确 val
+      if (AtftLoopVote && (okFlag || sigA)) {
+        auto mk = [&](Value *V) -> Value * {
+          if (auto *I = dyn_cast<Instruction>(V))
+            I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
+          return V;
+        };
+        if (lvSig && sigA) {
+          // 精确路径：val 与 lane0 逐位相同，各累一个 XOR 签名(每 store 仅 2 条 XOR)
+          Value *a1_bits = mk(IRB.CreateBitCast(a1_f64, I64Ty, "lv.a1.bits"));
+          Value *v_bits = mk(IRB.CreateBitCast(val, I64Ty, "lv.v.bits"));
+          Value *ca = mk(IRB.CreateLoad(I64Ty, sigA, "lv.sigA.cur"));
+          mk(IRB.CreateStore(mk(IRB.CreateXor(ca, v_bits, "lv.sigA.next")), sigA));
+          Value *cb = mk(IRB.CreateLoad(I64Ty, sigB, "lv.sigB.cur"));
+          mk(IRB.CreateStore(mk(IRB.CreateXor(cb, a1_bits, "lv.sigB.next")), sigB));
+        } else {
+          // 非精确回落：逐元素容差比累 i1
+          Value *a2 = mk(IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 1), "lv.a2"));
+          Value *a2_f64 = (AtftSimdF64 && useSIMD) ? a2 : mk(IRB.CreateFPExt(a2, F64Ty, "lv.a2.f64"));
+          Function *FabsLV = Intrinsic::getDeclaration(M, Intrinsic::fabs, {F64Ty});
+          Value *absA1 = mk(IRB.CreateCall(FabsLV, {a1_f64}));
+          Value *scale = mk(IRB.CreateFAdd(ConstantFP::get(F64Ty, 1.0), absA1));
+          Value *effDelta = mk(IRB.CreateFMul(ConstantFP::get(F64Ty, delta), scale));
+          Value *diff = mk(IRB.CreateCall(FabsLV, {mk(IRB.CreateFSub(val, a1_f64))}));
+          Value *rOk = mk(IRB.CreateFCmpOLE(diff, effDelta, "lv.r.ok"));
+          Value *a12Ok = mk(IRB.CreateFCmpOEQ(a1_f64, a2_f64, "lv.a12.ok"));
+          Value *thisOk = mk(IRB.CreateAnd(rOk, a12Ok, "lv.this.ok"));
+          Value *cur = mk(IRB.CreateLoad(I1Ty, okFlag, "lv.ok.cur"));
+          mk(IRB.CreateStore(mk(IRB.CreateAnd(cur, thisOk, "lv.ok.next")), okFlag));
+        }
+        emittedLoopVote = true;
+        continue;
+      }
+
       if (pureApproxOutput) {
         SI->setOperand(0, a1_f64);
+
       } else if (useSIMD) {
         // SIMD 混合近似 TMR 在 Store 同步点采用内联快速无分支比较，仅在检测到故障时转入 ColdBB:
         // 为防止后置 FaultInjectorPass 在内联比较临时变量上二次注入，为内联比较指令标记 "atft.voter.internal"
@@ -2998,6 +3069,24 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
              ConstantInt::get(I32Ty, (int)critLevel)},
             "approx_tmr.sync");
         SI->setOperand(0, voted);
+      }
+    }
+  }
+
+  // 循环级检错：在每个返回点一次性提交(zext：1=一致，0=不一致→置检测标志)
+  if (AtftLoopVote && emittedLoopVote && (okFlag || sigA)) {
+    for (BasicBlock &BB : F) {
+      if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+        IRBuilder<> RB(RI);
+        Value *ok;
+        if (lvSig && sigA) {
+          Value *la = RB.CreateLoad(I64Ty, sigA, "lv.sigA.final");
+          Value *lb = RB.CreateLoad(I64Ty, sigB, "lv.sigB.final");
+          ok = RB.CreateICmpEQ(la, lb, "lv.sig.ok");
+        } else {
+          ok = RB.CreateLoad(I1Ty, okFlag, "lv.ok.final");
+        }
+        RB.CreateCall(LoopVoteCommitFn, {RB.CreateZExt(ok, I32Ty)});
       }
     }
   }

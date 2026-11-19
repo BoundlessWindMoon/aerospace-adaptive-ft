@@ -222,6 +222,7 @@ extern int g_atft_dmr_hit;          // 插桩按位或写入
 extern uint64_t g_atft_dmr_mismatches;
 extern uint64_t g_atft_dmr_reexecs;
 int  atft_dmr_take_flag(void);     // 读并清零；非零表示需要重算一次
+void atft_loop_vote_commit(int ok); // 循环级检错提交：ok==0 置检测标志(检错不纠错)
 
 // 打印统计摘要
 

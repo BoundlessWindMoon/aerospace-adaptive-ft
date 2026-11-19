@@ -1042,3 +1042,14 @@ int atft_dmr_take_flag(void) {
     }
     return f;
 }
+
+// 循环级检错的提交点：ok==0 表示本函数内某次表决不一致。检错(置检测标志)，
+// 不就地纠错——恢复交系统级回滚(空天 checkpoint)。复用 DMR 检测标志通路，
+// 使裁判层已有的检测统计能看到它。
+void atft_loop_vote_commit(int ok) {
+    if (!ok) {
+        g_atft_dmr_hit = 1;
+        g_atft_state.detected_faults++;
+    }
+}
+
