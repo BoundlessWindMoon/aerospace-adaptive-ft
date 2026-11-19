@@ -40,6 +40,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -268,6 +269,27 @@ static cl::opt<bool> AtftSimdBcast(
     cl::desc("SIMD channel: broadcast one load into both lanes instead of two "
              "independent loads (trades load-fault coverage for fewer hot-loop ops)"),
     cl::init(false));
+
+// wide-DMR：对规整的单位步长数据并行 FP 循环(map/stencil)做跨迭代向量化，把冗余副本放进
+// AVX-512 的高半 lane。zmm<8 x double> 低 4 lane 跑 4 个真实迭代、高 4 lane 跑同一数据的冗余
+// 副本(shuffle 广播造出独立 lane，优化器不会折叠)；每步比低半/高半、异或进 <4 x i64> 签名，
+// 循环出口比一次。向量化加速红利付掉冗余开销——对可向量化内核把 ~4.4× 的税压到 ~1×。
+// 只转换严格匹配的循环(规范 IV、单位步长 gep、纯 FP DAG、读写数组不别名、无 call)，其余原样留给既有路径。
+static cl::opt<bool> AtftWideDMR(
+    "atft-wide-dmr",
+    cl::desc("Cross-iteration vectorized DMR for unit-stride data-parallel FP "
+             "loops: redundant copy rides AVX-512 upper lanes, half-vs-half check"),
+    cl::init(false));
+
+// ISA 对齐旋钮：SSA 基准被钉死在 SSE2(baseline target-features)，连 native 都不碰 AVX-512。
+// 要公平衡量 wide-DMR 的收益，必须让 native 基线与受保护版跑在同一 ISA。开此旋钮会把所有目标
+// 函数的 target-features/target-cpu 提升到带 AVX-512，对 native 与受保护模式一视同仁。
+static cl::opt<bool> AtftIsaAvx512(
+    "atft-isa-avx512",
+    cl::desc("Raise target-features of all target functions to AVX-512 (uniform "
+             "ISA baseline for fair wide-DMR comparison)"),
+    cl::init(false));
+
 
 enum CritLevel {
   CRIT_NON_CRITICAL = 0,
@@ -2574,6 +2596,288 @@ Value *createInlineFastApproxVote(IRBuilder<> &IRB, Module *M,
   return markVoterInternal(IRB.CreateSelect(useApprox, a1_f64, rExact, "inline.approx.voted"));
 }
 
+// ============================================================================
+// 模块 2E: wide-DMR —— 跨迭代向量化 + 高半冗余 + 半区比对
+//   对规范单块单位步长数据并行 FP 循环(map/stencil)做 VF=4 向量化：
+//   zmm<8 x double> 低 4 lane = 4 个真实迭代，高 4 lane = 同数据冗余副本(shuffle 广播造出
+//   独立 lane，优化器不折叠)；每步低半^高半异或进 <4 x i64> 签名，出口比一次；标量余数跑尾巴。
+// ============================================================================
+
+// 剥掉 sext/zext/trunc 取底层值
+static Value *atftPeelIntCast(Value *v) {
+  while (auto *C = dyn_cast<CastInst>(v)) {
+    if (isa<SExtInst>(C) || isa<ZExtInst>(C) || isa<TruncInst>(C))
+      v = C->getOperand(0);
+    else break;
+  }
+  return v;
+}
+
+// idx(可带 sext/add const) 是否 = iv + 常量偏移；是则填 off 返回 true
+static bool atftMatchAffineIV(Value *idx, PHINode *iv, int64_t &off) {
+  idx = atftPeelIntCast(idx);
+  if (idx == iv) { off = 0; return true; }
+  if (auto *BO = dyn_cast<BinaryOperator>(idx)) {
+    Value *a = atftPeelIntCast(BO->getOperand(0));
+    auto *c = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (a == iv && c) {
+      if (BO->getOpcode() == Instruction::Add) { off = c->getSExtValue(); return true; }
+      if (BO->getOpcode() == Instruction::Sub) { off = -c->getSExtValue(); return true; }
+    }
+  }
+  return false;
+}
+
+// 单位步长 double gep：返回 base 指针与相对 iv 的常量偏移
+static bool atftMatchUnitStrideDoubleGEP(Value *ptr, PHINode *iv, Type *F64Ty,
+                                         Value *&base, int64_t &off) {
+  auto *gep = dyn_cast<GetElementPtrInst>(ptr);
+  if (!gep || gep->getNumIndices() != 1) return false;
+  if (gep->getSourceElementType() != F64Ty) return false;
+  base = gep->getPointerOperand();
+  return atftMatchAffineIV(gep->getOperand(1), iv, off);
+}
+
+// 返回成功向量化的循环数。只转换严格匹配者，其余原样保留。
+static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
+  expandFMulAddIntrinsics(F);                    // fmuladd → fmul+fadd，便于匹配纯 FP DAG
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *F64Ty = Type::getDoubleTy(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  const unsigned VF = 4;                       // 低 4 真实 + 高 4 冗余 = zmm<8>
+  VectorType *V4F64 = FixedVectorType::get(F64Ty, VF);
+  VectorType *V8F64 = FixedVectorType::get(F64Ty, 2 * VF);
+  VectorType *V4I64 = FixedVectorType::get(I64Ty, VF);
+  FunctionCallee CommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+  (void)V4F64; (void)V8F64; (void)V4I64; (void)CommitFn; (void)I64Ty;
+
+  std::vector<Loop *> innermost;
+  for (Loop *top : LI)
+    for (Loop *L : depth_first(top))
+      if (L->isInnermost()) innermost.push_back(L);
+
+  int converted = 0;
+  for (Loop *L : innermost) {
+    if (L->getNumBlocks() != 2) continue;          // header + 独立 body/latch
+    BasicBlock *H = L->getHeader();
+    BasicBlock *PH = L->getLoopPreheader();
+    BasicBlock *B = L->getLoopLatch();
+    BasicBlock *Exit = L->getExitBlock();
+    if (!PH || !Exit || !B || B == H) continue;
+    auto *latchBr = dyn_cast<BranchInst>(B->getTerminator());
+    if (!latchBr || !latchBr->isUnconditional() || latchBr->getSuccessor(0) != H) continue;
+
+    // header 条件分支：cmp ? body(B) : Exit（顶测）
+    auto *hbr = dyn_cast<BranchInst>(H->getTerminator());
+    if (!hbr || !hbr->isConditional()) continue;
+    auto *cmp = dyn_cast<ICmpInst>(hbr->getCondition());
+    if (!cmp) continue;
+    if (hbr->getSuccessor(0) != B || hbr->getSuccessor(1) != Exit) continue;
+
+    // 规范 IV：header phi [start, PH] + [iv+1, B]
+    PHINode *iv = nullptr;
+    for (PHINode &PN : H->phis()) {
+      if (!PN.getType()->isIntegerTy() || PN.getNumIncomingValues() != 2) continue;
+      Value *fromPH = PN.getIncomingValueForBlock(PH);
+      Value *fromLatch = PN.getIncomingValueForBlock(B);
+      if (!fromPH || !fromLatch) continue;
+      auto *add = dyn_cast<BinaryOperator>(fromLatch);
+      if (!add || add->getOpcode() != Instruction::Add) continue;
+      auto *one = dyn_cast<ConstantInt>(add->getOperand(1));
+      if (add->getOperand(0) != &PN || !one || !one->isOne()) continue;
+      if (!L->isLoopInvariant(fromPH)) continue;
+      iv = &PN; break;
+    }
+    if (!iv) continue;
+    Value *start = iv->getIncomingValueForBlock(PH);
+    Value *ivNext = iv->getIncomingValueForBlock(B);
+
+    // 退出比较在 iv（顶测），上界 bound 为不变量或可克隆到 PH 的不变量表达式
+    if (cmp->getOperand(0) != iv) continue;
+    Value *bound = cmp->getOperand(1);
+    ICmpInst::Predicate P = cmp->getPredicate();
+    bool incl;
+    if (P == ICmpInst::ICMP_SLT || P == ICmpInst::ICMP_ULT) incl = false;
+    else if (P == ICmpInst::ICMP_SLE || P == ICmpInst::ICMP_ULE) incl = true;
+    else continue;
+
+    // header 必须纯控制/寻址：只允许 iv phi、cmp、整数/指针不变量、终结符
+    bool hdrOk = true;
+    for (Instruction &I : *H) {
+      if (&I == iv || &I == cmp || I.isTerminator()) continue;
+      if (isa<LoadInst>(&I) || isa<StoreInst>(&I) || isa<CallInst>(&I) ||
+          !I.getType()->isIntOrPtrTy()) { hdrOk = false; break; }
+    }
+    if (!hdrOk) continue;
+
+    // === 识别 body(B) ===
+    bool ok = true;
+    std::vector<LoadInst *> loads;
+    std::vector<StoreInst *> stores;
+    std::map<Value *, std::pair<Value *, int64_t>> addrOf; // load/store -> (base,off)
+    std::vector<Instruction *> fpDag;
+    std::set<Value *> loadBases, storeBases;
+    for (Instruction &I : *B) {
+      if (I.isTerminator()) continue;
+      if (auto *PN = dyn_cast<PHINode>(&I)) { if (PN != iv) { ok = false; break; } continue; }
+      if (isa<GetElementPtrInst>(&I)) continue;               // 寻址
+      if (auto *C = dyn_cast<CastInst>(&I)) {                  // 仅整数/指针寻址型 cast
+        if (C->getType()->isIntOrPtrTy() && C->getSrcTy()->isIntOrPtrTy()) continue;
+        ok = false; break;                                    // FP cast → bail
+      }
+      if (I.getType()->isIntegerTy() || I.getType()->isPointerTy()) continue; // 整数寻址运算
+      if (auto *LD = dyn_cast<LoadInst>(&I)) {
+        Value *base; int64_t off;
+        if (!LD->getType()->isDoubleTy() ||
+            !atftMatchUnitStrideDoubleGEP(LD->getPointerOperand(), iv, F64Ty, base, off) ||
+            !L->isLoopInvariant(base)) { ok = false; break; }
+        loads.push_back(LD); addrOf[LD] = {base, off}; loadBases.insert(base); continue;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        Value *base; int64_t off;
+        if (!SI->getValueOperand()->getType()->isDoubleTy() ||
+            !atftMatchUnitStrideDoubleGEP(SI->getPointerOperand(), iv, F64Ty, base, off) ||
+            !L->isLoopInvariant(base)) { ok = false; break; }
+        stores.push_back(SI); addrOf[SI] = {base, off}; storeBases.insert(base); continue;
+      }
+      unsigned op = I.getOpcode();
+      if (I.getType()->isDoubleTy() &&
+          (op == Instruction::FAdd || op == Instruction::FSub ||
+           op == Instruction::FMul || op == Instruction::FDiv ||
+           op == Instruction::FNeg)) { fpDag.push_back(&I); continue; }
+      ok = false; break;                                      // call/其它 → bail
+    }
+    if (!ok || stores.empty() || fpDag.empty()) continue;
+    bool alias = false;
+    for (Value *sb : storeBases) if (loadBases.count(sb)) alias = true;
+    if (alias) continue;                                      // 读写别名 → bail
+    auto inVec = [](std::vector<Instruction *> &v, Instruction *x) {
+      return std::find(v.begin(), v.end(), x) != v.end();
+    };
+    auto okOperand = [&](Value *v) -> bool {
+      if (isa<Constant>(v)) return true;
+      if (auto *in = dyn_cast<Instruction>(v)) {
+        if (L->contains(in->getParent()))
+          return inVec(fpDag, in) ||
+                 std::find(loads.begin(), loads.end(), in) != loads.end();
+        return true;                                          // 循环外 = 不变量
+      }
+      return true;                                            // 参数/全局 = 不变量
+    };
+    for (Instruction *d : fpDag) { for (Use &u : d->operands()) if (!okOperand(u.get())) { ok = false; break; } if (!ok) break; }
+    if (!ok) continue;
+    for (StoreInst *SI : stores) if (!okOperand(SI->getValueOperand())) { ok = false; break; }
+    if (!ok) continue;
+
+    // === 发射：向量预导 [start,Vn) + 标量余数循环 [Vn,Nx) ===
+    Type *IvTy = iv->getType();
+    Function *Fn = H->getParent();
+    Instruction *phTerm = PH->getTerminator();
+    IRBuilder<> PB(phTerm);
+    Value *boundPH = bound;                        // 物化上界到 PH（必要时克隆不变量表达式）
+    if (auto *bi = dyn_cast<Instruction>(bound)) {
+      if (L->contains(bi->getParent())) {
+        bool cloneOk = true;
+        for (Use &u : bi->operands())
+          if (auto *oi = dyn_cast<Instruction>(u.get()))
+            if (L->contains(oi->getParent())) { cloneOk = false; break; }
+        if (!cloneOk) continue;
+        Instruction *cl = bi->clone(); PB.Insert(cl); boundPH = cl;
+      }
+    }
+    Value *Nx = incl ? PB.CreateAdd(boundPH, ConstantInt::get(IvTy, 1)) : boundPH;
+    Value *tc = PB.CreateSub(Nx, start);
+    Value *tcv = PB.CreateAnd(tc, ConstantInt::get(IvTy, ~(int64_t)(VF - 1)));
+    Value *Vn = PB.CreateAdd(start, tcv);
+    Value *needVec = PB.CreateICmpSGT(tcv, ConstantInt::get(IvTy, 0));
+    Value *remStart = PB.CreateSelect(needVec, Vn, start);
+
+    BasicBlock *vph = BasicBlock::Create(Ctx, "wdmr.vph", Fn, H);
+    BasicBlock *vbody = BasicBlock::Create(Ctx, "wdmr.vbody", Fn, H);
+    BasicBlock *vexit = BasicBlock::Create(Ctx, "wdmr.vexit", Fn, H);
+    BasicBlock *premerge = BasicBlock::Create(Ctx, "wdmr.premerge", Fn, H);
+    PB.CreateCondBr(needVec, vph, premerge);
+    phTerm->eraseFromParent();
+    IRBuilder<>(vph).CreateBr(vbody);
+    IRBuilder<>(premerge).CreateBr(H);
+    int phiIdx = iv->getBasicBlockIndex(PH);        // header iv phi: PH 入口 → premerge(remStart)
+    iv->setIncomingBlock(phiIdx, premerge);
+    iv->setIncomingValue(phiIdx, remStart);
+
+    // 向量体：低 4 lane 真实 4 迭代、高 4 lane 冗余副本，异或进 <4 x i64> 签名
+    IRBuilder<> VB(vbody);
+    PHINode *ivV = VB.CreatePHI(IvTy, 2, "wdmr.ivV");
+    PHINode *sig = VB.CreatePHI(V4I64, 2, "wdmr.sig");
+    ivV->addIncoming(start, vph);
+    sig->addIncoming(ConstantAggregateZero::get(V4I64), vph);
+    Value *idx64 = VB.CreateIntCast(ivV, I64Ty, true);
+    std::map<Value *, Value *> wide;
+    auto wideOf = [&](Value *v) -> Value * {
+      auto it = wide.find(v);
+      if (it != wide.end()) return it->second;
+      return VB.CreateVectorSplat(2 * VF, v);       // 不变量/常量 → 广播满 8 lane
+    };
+    auto gepAt = [&](Value *base, int64_t off) -> Value * {
+      Value *ix = off ? VB.CreateAdd(idx64, ConstantInt::get(I64Ty, off)) : idx64;
+      return VB.CreateGEP(F64Ty, base, ix);
+    };
+    // 冗余 lane 必须对优化器不透明，否则 InstCombine 发现高半==低半会折叠掉冗余(=假保护)。
+    // 低半从原指针 load，高半从"经零开销指针屏障(=r,0，标量寄存器可分配)洗过的同地址指针"
+    // 再 load 一次——两条 load 链 SSA 不同，GVN 不会合并，拼成 <8> 后高/低半不可证等价。
+    // codegen 仍选 zmm；load 数据故障属共模(与 -atft-simd-bcast 同口径)，检错针对计算通路。
+    Type *PtrTy = loads.empty() ? stores[0]->getPointerOperand()->getType()
+                                : loads[0]->getPointerOperand()->getType();
+    InlineAsm *pbar = InlineAsm::get(
+        FunctionType::get(PtrTy, {PtrTy}, false), "", "=r,0", /*hasSideEffects=*/true);
+    for (LoadInst *LD : loads) {
+      Value *p = gepAt(addrOf[LD].first, addrOf[LD].second);
+      Value *lo = VB.CreateAlignedLoad(V4F64, p, Align(8));
+      Value *pRed = VB.CreateCall(pbar, {p});
+      Value *hi = VB.CreateAlignedLoad(V4F64, pRed, Align(8));
+      wide[LD] = VB.CreateShuffleVector(lo, hi,
+                    ArrayRef<int>({0, 1, 2, 3, 4, 5, 6, 7}));   // [低4 真实 | 高4 冗余]
+    }
+    for (Instruction *d : fpDag) {
+      Value *w;
+      if (d->getOpcode() == Instruction::FNeg)
+        w = VB.CreateFNeg(wideOf(d->getOperand(0)));
+      else
+        w = VB.CreateBinOp((Instruction::BinaryOps)d->getOpcode(),
+                           wideOf(d->getOperand(0)), wideOf(d->getOperand(1)));
+      wide[d] = w;
+    }
+    Value *sigCur = sig;
+    for (StoreInst *SI : stores) {
+      Value *wv = wideOf(SI->getValueOperand());
+      Value *lo = VB.CreateShuffleVector(wv, PoisonValue::get(V8F64), ArrayRef<int>({0, 1, 2, 3}));
+      Value *hi = VB.CreateShuffleVector(wv, PoisonValue::get(V8F64), ArrayRef<int>({4, 5, 6, 7}));
+      VB.CreateAlignedStore(lo, gepAt(addrOf[SI].first, addrOf[SI].second), Align(8));
+      sigCur = VB.CreateXor(VB.CreateXor(sigCur, VB.CreateBitCast(lo, V4I64)),
+                            VB.CreateBitCast(hi, V4I64));
+    }
+    Value *ivVn = VB.CreateAdd(ivV, ConstantInt::get(IvTy, VF));
+    VB.CreateCondBr(VB.CreateICmpSLT(ivVn, Vn), vbody, vexit);
+    ivV->addIncoming(ivVn, vbody);
+    sig->addIncoming(sigCur, vbody);
+
+    IRBuilder<> XB(vexit);                           // 出口：<4 x i64> 异或归约 + 提交
+    Value *s = XB.CreateExtractElement(sigCur, (uint64_t)0);
+    for (unsigned k = 1; k < VF; k++)
+      s = XB.CreateXor(s, XB.CreateExtractElement(sigCur, (uint64_t)k));
+    XB.CreateCall(CommitFn, {XB.CreateZExt(XB.CreateICmpEQ(s, ConstantInt::get(I64Ty, 0)), I32Ty)});
+    XB.CreateBr(premerge);
+    converted++;
+  }
+  if (converted) {                               // 让 codegen 对 <8 x double> 选 zmm 而非拆成 xmm
+    F.addFnAttr("min-legal-vector-width", "512");
+    F.addFnAttr("prefer-vector-width", "512");
+  }
+  return converted;
+}
+
 void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
                                 double delta, bool useSIMD,
                                 const std::string &rankMethod, double budget,
@@ -3707,6 +4011,18 @@ public:
 
     std::vector<FuncCriticalityInfo> critReports;
 
+    // ISA 对齐：统一把目标函数提到 AVX-512（native 与受保护模式一视同仁，保证公平对比）
+    if (AtftIsaAvx512) {
+      for (Function *F : targetFuncs) {
+        F->addFnAttr("target-cpu", "x86-64-v4");
+        F->addFnAttr("target-features",
+                     "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma,"
+                     "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+cx8,+fxsr,+mmx,+x87");
+        F->addFnAttr("min-legal-vector-width", "512");
+        F->addFnAttr("prefer-vector-width", "512");
+      }
+    }
+
     for (Function *F : targetFuncs) {
       FuncCriticalityInfo info = analyzeFunctionCriticality(*F, FAM);
       critReports.push_back(info);
@@ -3801,6 +4117,13 @@ public:
       Function *F = targetFuncs[i];
       CritLevel clevel = critReports[i].level;
       auto &LI = FAM.getResult<LoopAnalysis>(*F);
+
+      // wide-DMR：先对规整单位步长数据并行 FP 循环做跨迭代向量化(高半冗余)，
+      // 转换掉的循环写 [start,Vn)；其标量余数与未匹配循环仍交给下面选定模式保护。
+      if (AtftWideDMR) {
+        int nv = transformFunctionWideDMR(*F, LI);
+        if (nv) errs() << "ATFT_WIDE_DMR," << F->getName().str() << "," << nv << "\n";
+      }
 
       // 分层互斥：这个函数已经有代数校验了，就不再叠加浮点近似三模。
       // 判据本来就是这么说的（"搜到就进代数校验层，搜不到就回落"），
