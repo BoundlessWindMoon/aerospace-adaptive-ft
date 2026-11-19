@@ -2704,6 +2704,7 @@ static Value *atftMaterializeInPH(Value *v, Loop *L, IRBuilder<> &PB,
 }
 
 // 返回成功向量化的循环数。只转换严格匹配者，其余原样保留。
+static void atftApplyHostISA(Function &F);       // 前置声明(定义在 atftRunO3 附近)
 static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
   expandFMulAddIntrinsics(F);                    // fmuladd → fmul+fadd，便于匹配纯 FP DAG
   Module *M = F.getParent();
@@ -2931,10 +2932,7 @@ static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
     XB.CreateBr(premerge);
     converted++;
   }
-  if (converted) {                               // 让 codegen 对 <8 x double> 选 zmm 而非拆成 xmm
-    F.addFnAttr("min-legal-vector-width", "512");
-    F.addFnAttr("prefer-vector-width", "512");
-  }
+  if (converted) atftApplyHostISA(F);            // 放开向量宽度到 host，让 codegen 选最宽
   return converted;
 }
 
@@ -2952,8 +2950,33 @@ static bool atftIsFPArith(Instruction *I) {
           op == Instruction::FNeg);
 }
 
-// 模块内跑一遍 default<O3>（复用 LLVM 通用向量化器等）。必须带 AVX-512 的 TargetMachine，
-// 否则 TTI 退化为 baseline、向量化器拿不到 AVX-512 cost model 就不会宽向量化。
+// 从 host 探测 CPU 特征串(通用、可移植；不写死 x86/avx512 具体型号)
+static std::string atftHostFeatures() {
+  StringMap<bool> f;
+  std::string s;
+  if (sys::getHostCPUFeatures(f))
+    for (auto &e : f)
+      if (e.second) { if (!s.empty()) s += ","; s += "+"; s += e.first().str(); }
+  return s;
+}
+// 把目标函数的 ISA 对齐到 host(target-cpu/features)，并在有宽 SIMD 时放开向量宽度。
+// 全程从 host 推导——换机器/换架构自动适配，无需改代码。
+static void atftApplyHostISA(Function &F) {
+  F.addFnAttr("target-cpu", std::string(sys::getHostCPUName()));
+  std::string feats = atftHostFeatures();
+  if (!feats.empty()) F.addFnAttr("target-features", feats);
+  StringMap<bool> f;
+  if (sys::getHostCPUFeatures(f)) {
+    unsigned w = f.lookup("avx512f") ? 512 : f.lookup("avx") ? 256 : f.lookup("sse2") ? 128 : 0;
+    if (w) {
+      F.addFnAttr("min-legal-vector-width", std::to_string(w));
+      F.addFnAttr("prefer-vector-width", std::to_string(w));
+    }
+  }
+}
+
+// 模块内跑一遍 default<O3>（复用 LLVM 通用向量化器等）。TargetMachine 必须带 host 特征，
+// 否则 TTI 退化为 baseline、向量化器拿不到宽 SIMD 的 cost model 就不会宽向量化。
 static void atftRunO3(Module &M) {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
@@ -2965,8 +2988,7 @@ static void atftRunO3(Module &M) {
   if (T) {
     TargetOptions opts;
     TM.reset(T->createTargetMachine(
-        triple, "x86-64-v4",
-        "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma",
+        triple, std::string(sys::getHostCPUName()), atftHostFeatures(),
         opts, Optional<Reloc::Model>(Reloc::PIC_)));
   }
   PassBuilder PB(TM.get());
@@ -4246,30 +4268,18 @@ public:
 
     std::vector<FuncCriticalityInfo> critReports;
 
-    // ISA 对齐：统一把目标函数提到 AVX-512（native 与受保护模式一视同仁，保证公平对比）
+    // ISA 对齐：把目标函数对齐到 host ISA（native 与受保护模式一视同仁，保证公平对比）
     if (AtftIsaAvx512) {
-      for (Function *F : targetFuncs) {
-        F->addFnAttr("target-cpu", "x86-64-v4");
-        F->addFnAttr("target-features",
-                     "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma,"
-                     "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+cx8,+fxsr,+mmx,+x87");
-        F->addFnAttr("min-legal-vector-width", "512");
-        F->addFnAttr("prefer-vector-width", "512");
-      }
+      for (Function *F : targetFuncs) atftApplyHostISA(*F);
     }
 
-    // 通用 DMR：ISA 提到 AVX-512 → 模块内跑 O3(复用 LLVM 向量化器) → 对每个目标函数通用注入
-    // 冗余影子+签名。不认循环形状，换没见过的内核也自动生效。处理完直接返回。
+    // 通用 DMR/TMR：ISA 对齐 host → 模块内跑 O3(复用 LLVM 向量化器) → 对每个目标函数通用注入
+    // 冗余影子+签名/投票。不认循环形状，换没见过的内核也自动生效。处理完直接返回。
     if (AtftDMRGeneric) {
       std::set<std::string> targetNames;
       for (Function *F : targetFuncs) {
         targetNames.insert(F->getName().str());
-        F->addFnAttr("target-cpu", "x86-64-v4");
-        F->addFnAttr("target-features",
-                     "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma,"
-                     "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+cx8,+fxsr,+mmx,+x87");
-        F->addFnAttr("min-legal-vector-width", "512");
-        F->addFnAttr("prefer-vector-width", "512");
+        atftApplyHostISA(*F);
       }
       atftRunO3(M);                               // 通用向量化(O3 可能改/删函数，故按名重解析)
       for (const std::string &n : targetNames) {
