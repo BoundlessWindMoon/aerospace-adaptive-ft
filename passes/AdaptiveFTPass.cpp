@@ -41,6 +41,11 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/Host.h"
 
 #include <algorithm>
 #include <cmath>
@@ -288,6 +293,16 @@ static cl::opt<bool> AtftIsaAvx512(
     "atft-isa-avx512",
     cl::desc("Raise target-features of all target functions to AVX-512 (uniform "
              "ISA baseline for fair wide-DMR comparison)"),
+    cl::init(false));
+
+// 通用 DMR：不认循环形状。先把 ISA 提到 AVX-512 并在模块内跑一遍 default<O3>(复用 LLVM
+// 成熟通用的 LoopVectorizer 把能向量化的内核自动宽向量化)，再对已向量化/标量的 FP 数据流
+// 通用地注入冗余影子链(叶子 load 走指针 launder 防折叠)+XOR 签名，返回点提交。map/stencil/
+// 归约/串行一视同仁，换没见过的内核也自动生效(非 pattern-match)。
+static cl::opt<bool> AtftDMRGeneric(
+    "atft-dmr-generic",
+    cl::desc("Shape-agnostic DMR: run LLVM vectorizer, then inject redundant FP "
+             "shadow dataflow + signature on whatever got vectorized (or scalar)"),
     cl::init(false));
 
 
@@ -2907,6 +2922,153 @@ static int transformFunctionWideDMR(Function &F, LoopInfo &LI) {
   return converted;
 }
 
+// FP(标量或向量)判定
+static bool atftIsFP(Value *v) {
+  Type *t = v->getType();
+  if (auto *vt = dyn_cast<VectorType>(t)) t = vt->getElementType();
+  return t->isFloatingPointTy();
+}
+static bool atftIsFPArith(Instruction *I) {
+  unsigned op = I->getOpcode();
+  return atftIsFP(I) &&
+         (op == Instruction::FAdd || op == Instruction::FSub ||
+          op == Instruction::FMul || op == Instruction::FDiv ||
+          op == Instruction::FNeg);
+}
+
+// 模块内跑一遍 default<O3>（复用 LLVM 通用向量化器等）。必须带 AVX-512 的 TargetMachine，
+// 否则 TTI 退化为 baseline、向量化器拿不到 AVX-512 cost model 就不会宽向量化。
+static void atftRunO3(Module &M) {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  std::string triple = M.getTargetTriple();
+  if (triple.empty()) triple = sys::getDefaultTargetTriple();
+  std::string err;
+  const Target *T = TargetRegistry::lookupTarget(triple, err);
+  std::unique_ptr<TargetMachine> TM;
+  if (T) {
+    TargetOptions opts;
+    TM.reset(T->createTargetMachine(
+        triple, "x86-64-v4",
+        "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma",
+        opts, Optional<Reloc::Model>(Reloc::PIC_)));
+  }
+  PassBuilder PB(TM.get());
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+  MPM.run(M, MAM);
+}
+
+// 通用 DMR 注入：对 F 里全部 FP 算术/加载/phi 造影子链(不认循环形状)，返回点按 i64 签名提交。
+// 前提：F 已向量化(调用方先跑 O3)。返回注入的影子算术条数。
+static int transformFunctionDMRGeneric(Function &F) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  FunctionCallee CommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+
+  std::vector<LoadInst *> fpLoads;
+  std::vector<PHINode *> fpPhis;
+  std::vector<Instruction *> fpArith;
+  std::vector<StoreInst *> fpStores;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      if (auto *LD = dyn_cast<LoadInst>(&I)) { if (atftIsFP(LD)) fpLoads.push_back(LD); }
+      else if (auto *PN = dyn_cast<PHINode>(&I)) { if (atftIsFP(PN)) fpPhis.push_back(PN); }
+      else if (auto *SI = dyn_cast<StoreInst>(&I)) { if (atftIsFP(SI->getValueOperand())) fpStores.push_back(SI); }
+      else if (atftIsFPArith(&I)) fpArith.push_back(&I);
+    }
+  if (fpArith.empty()) return 0;
+
+  DenseMap<Value *, Value *> shadow;
+  Type *PtrTy = fpLoads.empty() ? nullptr : fpLoads[0]->getPointerOperand()->getType();
+  InlineAsm *pbar = PtrTy ? InlineAsm::get(FunctionType::get(PtrTy, {PtrTy}, false),
+                                           "", "=r,0", /*hasSideEffects=*/false)
+                          : nullptr;
+  // 1) 影子 load：经指针 launder 的二次 load(SSA 不同→GVN 不合并→不透明)
+  for (LoadInst *LD : fpLoads) {
+    IRBuilder<> B(LD->getNextNode());
+    Value *ps = B.CreateCall(pbar, {LD->getPointerOperand()});
+    LoadInst *ls = B.CreateAlignedLoad(LD->getType(), ps, LD->getAlign(), "atft.dmr.ld");
+    shadow[LD] = ls;
+  }
+  // 2) 影子 phi 占位
+  for (PHINode *PN : fpPhis) {
+    IRBuilder<> B(&*PN->getParent()->getFirstInsertionPt());
+    PHINode *ps = B.CreatePHI(PN->getType(), PN->getNumIncomingValues(), "atft.dmr.phi");
+    shadow[PN] = ps;
+  }
+  auto shadowOf = [&](Value *v) -> Value * {
+    auto it = shadow.find(v);
+    return it != shadow.end() ? it->second : v;   // 不变量/常量/未覆盖 → 共用
+  };
+  // 3) 影子算术：按程序顺序克隆(操作数走 shadowOf)
+  for (Instruction *A : fpArith) {
+    IRBuilder<> B(A->getNextNode());
+    Value *s;
+    if (A->getOpcode() == Instruction::FNeg)
+      s = B.CreateFNeg(shadowOf(A->getOperand(0)));
+    else
+      s = B.CreateBinOp((Instruction::BinaryOps)A->getOpcode(),
+                        shadowOf(A->getOperand(0)), shadowOf(A->getOperand(1)));
+    shadow[A] = s;
+  }
+  // 4) 填影子 phi 入边
+  for (PHINode *PN : fpPhis) {
+    auto *ps = cast<PHINode>(shadow[PN]);
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+      ps->addIncoming(shadowOf(PN->getIncomingValue(i)), PN->getIncomingBlock(i));
+  }
+  // 5) 签名累加器(i64 alloca，交后续 mem2reg 升 SSA)
+  IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *sig = EB.CreateAlloca(I64Ty, nullptr, "atft.dmr.sig");
+  EB.CreateStore(ConstantInt::get(I64Ty, 0), sig);
+  auto foldDiff = [&](IRBuilder<> &B, Value *a, Value *b) {
+    Type *t = a->getType();
+    unsigned bits = t->getScalarSizeInBits();
+    Value *x;
+    if (auto *vt = dyn_cast<FixedVectorType>(t)) {
+      unsigned n = vt->getNumElements();
+      Type *vit = FixedVectorType::get(IntegerType::get(Ctx, bits), n);
+      x = B.CreateXor(B.CreateBitCast(a, vit), B.CreateBitCast(b, vit));
+      if (bits != 64) x = B.CreateZExtOrTrunc(x, FixedVectorType::get(I64Ty, n));
+      x = B.CreateIntrinsic(Intrinsic::vector_reduce_xor,
+                            {FixedVectorType::get(I64Ty, n)}, {x});
+    } else {
+      x = B.CreateXor(B.CreateBitCast(a, IntegerType::get(Ctx, bits)),
+                      B.CreateBitCast(b, IntegerType::get(Ctx, bits)));
+      if (bits != 64) x = B.CreateZExtOrTrunc(x, I64Ty);
+    }
+    B.CreateStore(B.CreateXor(B.CreateLoad(I64Ty, sig), x), sig);
+  };
+  for (StoreInst *SI : fpStores) {
+    Value *v = SI->getValueOperand();
+    if (shadow.count(v)) { IRBuilder<> B(SI); foldDiff(B, v, shadow[v]); }
+  }
+  int injected = (int)fpArith.size();
+  for (BasicBlock &BB : F) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI) continue;
+    IRBuilder<> B(RI);
+    if (RI->getNumOperands() == 1 && atftIsFP(RI->getOperand(0)) &&
+        shadow.count(RI->getOperand(0)))
+      foldDiff(B, RI->getOperand(0), shadow[RI->getOperand(0)]);
+    Value *ok = B.CreateICmpEQ(B.CreateLoad(I64Ty, sig), ConstantInt::get(I64Ty, 0));
+    B.CreateCall(CommitFn, {B.CreateZExt(ok, I32Ty)});
+  }
+  return injected;
+}
+
 void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
                                 double delta, bool useSIMD,
                                 const std::string &rankMethod, double budget,
@@ -4050,6 +4212,68 @@ public:
         F->addFnAttr("min-legal-vector-width", "512");
         F->addFnAttr("prefer-vector-width", "512");
       }
+    }
+
+    // 通用 DMR：ISA 提到 AVX-512 → 模块内 default<O3>(LLVM 通用向量化) → 逐函数注入影子+签名。
+    // 不认循环形状；O3 可能改动函数，故按名字在 O3 后重新解析目标集。
+    if (AtftDMRGeneric) {
+      for (Function *F : targetFuncs) {
+        F->addFnAttr("target-cpu", "x86-64-v4");
+        F->addFnAttr("target-features",
+                     "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma,"
+                     "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+cx8,+fxsr,+mmx,+x87");
+        F->addFnAttr("min-legal-vector-width", "512");
+        F->addFnAttr("prefer-vector-width", "512");
+      }
+      std::set<std::string> names;
+      for (Function *F : targetFuncs) names.insert(F->getName().str());
+      atftRunO3(M);
+      int total = 0;
+      for (Function &F : M) {
+        if (F.isDeclaration() || !names.count(F.getName().str())) continue;
+        int n = transformFunctionDMRGeneric(F);
+        if (n) { errs() << "ATFT_DMR_GENERIC," << F.getName().str() << "," << n << "\n"; total += n; }
+      }
+      errs() << "ATFT_DMR_GENERIC_TOTAL," << total << "\n";
+      writeAtftSelectionFile(AtftSelectionFile);
+      return PreservedAnalyses::none();
+    }
+
+    // 通用 DMR：ISA 提到 AVX-512 → 模块内跑 O3(复用 LLVM 向量化器) → 对每个目标函数通用注入
+    // 冗余影子+签名。不认循环形状，换没见过的内核也自动生效。处理完直接返回。
+    if (AtftDMRGeneric) {
+      std::set<std::string> targetNames;
+      for (Function *F : targetFuncs) {
+        targetNames.insert(F->getName().str());
+        F->addFnAttr("target-cpu", "x86-64-v4");
+        F->addFnAttr("target-features",
+                     "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma,"
+                     "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+cx8,+fxsr,+mmx,+x87");
+        F->addFnAttr("min-legal-vector-width", "512");
+        F->addFnAttr("prefer-vector-width", "512");
+      }
+      atftRunO3(M);                               // 通用向量化(O3 可能改/删函数，故按名重解析)
+      for (const std::string &n : targetNames) {
+        Function *F = M.getFunction(n);
+        if (!F || F->isDeclaration()) continue;
+        int inj = transformFunctionDMRGeneric(*F);
+        if (inj) errs() << "ATFT_DMR_GENERIC," << n << "," << inj << "\n";
+      }
+      // 清理：mem2reg 把签名 alloca 升 SSA(reduction phi)，省掉每迭代访存
+      {
+        PassBuilder PB;
+        LoopAnalysisManager LAM; FunctionAnalysisManager FAM2;
+        CGSCCAnalysisManager CGAM; ModuleAnalysisManager MAM2;
+        PB.registerModuleAnalyses(MAM2); PB.registerCGSCCAnalyses(CGAM);
+        PB.registerFunctionAnalyses(FAM2); PB.registerLoopAnalyses(LAM);
+        PB.crossRegisterProxies(LAM, FAM2, CGAM, MAM2);
+        FunctionPassManager FPM; FPM.addPass(PromotePass());
+        ModulePassManager MPM;
+        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+        MPM.run(M, MAM2);
+      }
+      writeAtftSelectionFile(AtftSelectionFile);
+      return PreservedAnalyses::none();
     }
 
     for (Function *F : targetFuncs) {

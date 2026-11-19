@@ -15,6 +15,7 @@ CFGS = [
     ("native512",  "native",      ISA,                                  True),
     ("simd64_512", "approx-simd", BASE + ISA,                           False),
     ("wide_dmr",   "approx-simd", BASE + ISA + ["-atft-wide-dmr"],      False),
+    ("dmr_generic","approx-simd", ["-atft-dmr-generic"],                False),
 ]
 
 SSA = H.build_infrastructure()
