@@ -2949,6 +2949,13 @@ static bool atftIsFPArith(Instruction *I) {
           op == Instruction::FMul || op == Instruction::FDiv ||
           op == Instruction::FNeg);
 }
+// 纯 FP 数学调用(sqrt/exp/sin/fma/fabs… 的 intrinsic 或任何 readnone 返回 FP 的调用)：
+// 无内存副作用→复制安全。覆盖它们才能堵住 cholesky/blackscholes 这类的超越函数共模洞。
+static bool atftIsPureFPCall(Instruction *I) {
+  auto *CI = dyn_cast<CallInst>(I);
+  if (!CI || CI->isInlineAsm() || !atftIsFP(CI)) return false;
+  return CI->doesNotAccessMemory();            // intrinsic(llvm.sqrt…) 与 readnone libm 都满足
+}
 
 // 从 host 探测 CPU 特征串(通用、可移植；不写死 x86/avx512 具体型号)
 static std::string atftHostFeatures() {
@@ -3026,6 +3033,7 @@ static int transformFunctionDMRGeneric(Function &F, int ways) {
       else if (auto *PN = dyn_cast<PHINode>(&I)) { if (atftIsFP(PN)) fpPhis.push_back(PN); }
       else if (auto *SI = dyn_cast<StoreInst>(&I)) { if (atftIsFP(SI->getValueOperand())) fpStores.push_back(SI); }
       else if (atftIsFPArith(&I)) fpArith.push_back(&I);
+      else if (atftIsPureFPCall(&I)) fpArith.push_back(&I);   // sqrt/exp/… 也造影子
     }
   if (fpArith.empty()) return 0;
 
@@ -3053,10 +3061,19 @@ static int transformFunctionDMRGeneric(Function &F, int ways) {
     };
     for (Instruction *A : fpArith) {
       IRBuilder<> B(A->getNextNode());
-      Value *s = (A->getOpcode() == Instruction::FNeg)
-                     ? B.CreateFNeg(so(A->getOperand(0)))
-                     : B.CreateBinOp((Instruction::BinaryOps)A->getOpcode(),
-                                     so(A->getOperand(0)), so(A->getOperand(1)));
+      Value *s;
+      if (auto *CI = dyn_cast<CallInst>(A)) {        // 纯 FP 调用：克隆并重映射实参
+        auto *cl = cast<CallInst>(CI->clone());
+        for (unsigned k = 0; k < cl->arg_size(); ++k)
+          cl->setArgOperand(k, so(CI->getArgOperand(k)));
+        B.Insert(cl);
+        s = cl;
+      } else if (A->getOpcode() == Instruction::FNeg) {
+        s = B.CreateFNeg(so(A->getOperand(0)));
+      } else {
+        s = B.CreateBinOp((Instruction::BinaryOps)A->getOpcode(),
+                          so(A->getOperand(0)), so(A->getOperand(1)));
+      }
       S[A] = s;
     }
     for (PHINode *PN : fpPhis) {
