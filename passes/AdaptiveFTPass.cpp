@@ -2599,23 +2599,23 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
   FunctionCallee ApproxCosFn = M->getOrInsertFunction("atft_approx_cosf", F32Ty, F32Ty);
   FunctionCallee ApproxExpFn = M->getOrInsertFunction("atft_approx_expf", F32Ty, F32Ty);
 
-  // 循环级检错(-atft-loop-vote)：精确 simd-f64 路径用 XOR 签名(两条逐位相同的链各累一个
-  // i64 签名，返回前比一次)——每 store 仅 2 条 XOR，直击不可约的每元素校验；非精确路径回落
-  // 到 i1 ok 容差累加。alloca 交 -O3 mem2reg 升 loop-carried PHI，省手工 PHI 与每 store 分支。
+  // 循环级检错(-atft-loop-vote)：精确 simd-f64 路径走 Elzar 式向量内冗余——两条副本就在同一
+  // <2 x f64> 向量的两 lane 里，对向量整体按位 XOR 累一个 <2 x i64> 签名(每 store 仅 1 条向量
+  // XOR，无 extract)，返回前比两 lane 一次；store 写 lane0，标量 val 链随之死代码消除。非精确路径
+  // 回落到 i1 ok 容差累加。alloca 交 -O3 mem2reg 升 loop-carried PHI，省手工 PHI 与每 store 分支。
   Type *I1Ty = Type::getInt1Ty(Ctx);
   Type *I64Ty = Type::getInt64Ty(Ctx);
+  VectorType *V2I64Ty = FixedVectorType::get(I64Ty, 2);
   FunctionCallee LoopVoteCommitFn = M->getOrInsertFunction(
       "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
-  AllocaInst *okFlag = nullptr, *sigA = nullptr, *sigB = nullptr;
+  AllocaInst *okFlag = nullptr, *sigVec = nullptr;
   bool lvSig = AtftLoopVote && AtftSimdF64 && useSIMD && !pureApproxOutput;
   bool emittedLoopVote = false;
   if (AtftLoopVote && !pureApproxOutput) {
     IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
     if (lvSig) {
-      sigA = EB.CreateAlloca(I64Ty, nullptr, "atft.sigA");
-      sigB = EB.CreateAlloca(I64Ty, nullptr, "atft.sigB");
-      EB.CreateStore(ConstantInt::get(I64Ty, 0), sigA);
-      EB.CreateStore(ConstantInt::get(I64Ty, 0), sigB);
+      sigVec = EB.CreateAlloca(V2I64Ty, nullptr, "atft.sigVec");
+      EB.CreateStore(ConstantAggregateZero::get(V2I64Ty), sigVec);
     } else {
       okFlag = EB.CreateAlloca(I1Ty, nullptr, "atft.ok.flag");
       EB.CreateStore(ConstantInt::getTrue(Ctx), okFlag);
@@ -2913,21 +2913,20 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
                           ? a1_f32
                           : IRB.CreateFPExt(a1_f32, F64Ty, "a1.f64");
 
-      // 循环级检错：不建分支/冷块，store 仍写精确 val
-      if (AtftLoopVote && (okFlag || sigA)) {
+      // 循环级检错：不建分支/冷块
+      if (AtftLoopVote && (okFlag || sigVec)) {
         auto mk = [&](Value *V) -> Value * {
           if (auto *I = dyn_cast<Instruction>(V))
             I->setMetadata("atft.voter.internal", MDNode::get(Ctx, {}));
           return V;
         };
-        if (lvSig && sigA) {
-          // 精确路径：val 与 lane0 逐位相同，各累一个 XOR 签名(每 store 仅 2 条 XOR)
-          Value *a1_bits = mk(IRB.CreateBitCast(a1_f64, I64Ty, "lv.a1.bits"));
-          Value *v_bits = mk(IRB.CreateBitCast(val, I64Ty, "lv.v.bits"));
-          Value *ca = mk(IRB.CreateLoad(I64Ty, sigA, "lv.sigA.cur"));
-          mk(IRB.CreateStore(mk(IRB.CreateXor(ca, v_bits, "lv.sigA.next")), sigA));
-          Value *cb = mk(IRB.CreateLoad(I64Ty, sigB, "lv.sigB.cur"));
-          mk(IRB.CreateStore(mk(IRB.CreateXor(cb, a1_bits, "lv.sigB.next")), sigB));
+        if (lvSig && sigVec) {
+          // Elzar 式：两条冗余即 <2 x f64> 向量的两 lane，对向量整体 XOR 累 <2 x i64> 签名
+          // (每 store 1 条向量 XOR，零 extract)；store 改写 lane0，标量 val 链死代码消除。
+          Value *vecBits = mk(IRB.CreateBitCast(vApprox, V2I64Ty, "lv.vec.bits"));
+          Value *cur = mk(IRB.CreateLoad(V2I64Ty, sigVec, "lv.sigVec.cur"));
+          mk(IRB.CreateStore(mk(IRB.CreateXor(cur, vecBits, "lv.sigVec.next")), sigVec));
+          SI->setOperand(0, a1_f64);
         } else {
           // 非精确回落：逐元素容差比累 i1
           Value *a2 = mk(IRB.CreateExtractElement(vApprox, ConstantInt::get(I32Ty, 1), "lv.a2"));
@@ -3074,15 +3073,16 @@ void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
   }
 
   // 循环级检错：在每个返回点一次性提交(zext：1=一致，0=不一致→置检测标志)
-  if (AtftLoopVote && emittedLoopVote && (okFlag || sigA)) {
+  if (AtftLoopVote && emittedLoopVote && (okFlag || sigVec)) {
     for (BasicBlock &BB : F) {
       if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
         IRBuilder<> RB(RI);
         Value *ok;
-        if (lvSig && sigA) {
-          Value *la = RB.CreateLoad(I64Ty, sigA, "lv.sigA.final");
-          Value *lb = RB.CreateLoad(I64Ty, sigB, "lv.sigB.final");
-          ok = RB.CreateICmpEQ(la, lb, "lv.sig.ok");
+        if (lvSig && sigVec) {
+          Value *lv = RB.CreateLoad(V2I64Ty, sigVec, "lv.sigVec.final");
+          Value *l0 = RB.CreateExtractElement(lv, ConstantInt::get(I32Ty, 0), "lv.sig.l0");
+          Value *l1 = RB.CreateExtractElement(lv, ConstantInt::get(I32Ty, 1), "lv.sig.l1");
+          ok = RB.CreateICmpEQ(l0, l1, "lv.sig.ok");
         } else {
           ok = RB.CreateLoad(I1Ty, okFlag, "lv.ok.final");
         }
