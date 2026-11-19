@@ -305,6 +305,14 @@ static cl::opt<bool> AtftDMRGeneric(
              "shadow dataflow + signature on whatever got vectorized (or scalar)"),
     cl::init(false));
 
+// 公平基线：走与 -atft-dmr-generic 完全相同的 ISA+内部 O3 管线，但不注入冗余。
+// 用它当分母，隔离出纯冗余开销(排除双重 O3 对基准码的影响)。
+static cl::opt<bool> AtftDMRNoInject(
+    "atft-dmr-no-inject",
+    cl::desc("With -atft-dmr-generic: run ISA+O3 pipeline but skip redundancy "
+             "injection (fair baseline denominator)"),
+    cl::init(false));
+
 
 enum CritLevel {
   CRIT_NON_CRITICAL = 0,
@@ -2992,8 +3000,10 @@ static int transformFunctionDMRGeneric(Function &F) {
 
   DenseMap<Value *, Value *> shadow;
   Type *PtrTy = fpLoads.empty() ? nullptr : fpLoads[0]->getPointerOperand()->getType();
+  // hasSideEffects=true：否则纯 inline-asm 恒等会被 GVN 当可 CSE 的表达式合并两条 launder，
+  // 两条影子 load 又退回同指针→被合并→影子折叠(假冗余)。真副作用标记才挡得住。
   InlineAsm *pbar = PtrTy ? InlineAsm::get(FunctionType::get(PtrTy, {PtrTy}, false),
-                                           "", "=r,0", /*hasSideEffects=*/false)
+                                           "", "=r,0", /*hasSideEffects=*/true)
                           : nullptr;
   // 1) 影子 load：经指针 launder 的二次 load(SSA 不同→GVN 不合并→不透明)
   for (LoadInst *LD : fpLoads) {
@@ -4214,31 +4224,6 @@ public:
       }
     }
 
-    // 通用 DMR：ISA 提到 AVX-512 → 模块内 default<O3>(LLVM 通用向量化) → 逐函数注入影子+签名。
-    // 不认循环形状；O3 可能改动函数，故按名字在 O3 后重新解析目标集。
-    if (AtftDMRGeneric) {
-      for (Function *F : targetFuncs) {
-        F->addFnAttr("target-cpu", "x86-64-v4");
-        F->addFnAttr("target-features",
-                     "+avx,+avx2,+avx512f,+avx512vl,+avx512bw,+avx512dq,+fma,"
-                     "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+cx8,+fxsr,+mmx,+x87");
-        F->addFnAttr("min-legal-vector-width", "512");
-        F->addFnAttr("prefer-vector-width", "512");
-      }
-      std::set<std::string> names;
-      for (Function *F : targetFuncs) names.insert(F->getName().str());
-      atftRunO3(M);
-      int total = 0;
-      for (Function &F : M) {
-        if (F.isDeclaration() || !names.count(F.getName().str())) continue;
-        int n = transformFunctionDMRGeneric(F);
-        if (n) { errs() << "ATFT_DMR_GENERIC," << F.getName().str() << "," << n << "\n"; total += n; }
-      }
-      errs() << "ATFT_DMR_GENERIC_TOTAL," << total << "\n";
-      writeAtftSelectionFile(AtftSelectionFile);
-      return PreservedAnalyses::none();
-    }
-
     // 通用 DMR：ISA 提到 AVX-512 → 模块内跑 O3(复用 LLVM 向量化器) → 对每个目标函数通用注入
     // 冗余影子+签名。不认循环形状，换没见过的内核也自动生效。处理完直接返回。
     if (AtftDMRGeneric) {
@@ -4256,6 +4241,7 @@ public:
       for (const std::string &n : targetNames) {
         Function *F = M.getFunction(n);
         if (!F || F->isDeclaration()) continue;
+        if (AtftDMRNoInject) continue;             // 公平基线：同管线但不注入
         int inj = transformFunctionDMRGeneric(*F);
         if (inj) errs() << "ATFT_DMR_GENERIC," << n << "," << inj << "\n";
       }
