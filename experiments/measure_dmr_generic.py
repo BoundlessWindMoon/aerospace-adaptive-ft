@@ -14,9 +14,10 @@ BASE = ["-atft-delta-runtime", "-atft-replica-exact", "-atft-no-cse-barrier", "-
 ISA = ["-atft-isa-avx512"]
 TRIALS = 150
 CFGS = [
-    ("native512",  "native",      ISA,                                         True),
-    ("gen_base",   "approx-simd", ["-atft-dmr-generic", "-atft-dmr-no-inject"], False),
-    ("dmr_generic","approx-simd", ["-atft-dmr-generic"],                        False),
+    ("native512",  "native",      ISA,                                          True),
+    ("gen_base",   "approx-simd", ["-atft-dmr-generic", "-atft-dmr-no-inject"],  False),
+    ("dmr_generic","approx-simd", ["-atft-dmr-generic"],                         False),
+    ("tmr_generic","approx-simd", ["-atft-dmr-generic", "-atft-tmr-generic"],    False),
 ]
 
 SSA = H.build_infrastructure()
@@ -52,28 +53,23 @@ def sdc(tag, bench):  # bench 名在 FI 里
 
 def geo(xs): return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else float("nan")
 rows = []
-print(f"{'kernel':20}{'base_us':>10}{'gen/base':>9}{'natSDC':>8}{'genSDC':>8}{'genDet':>8}  prot?")
+print(f"{'kernel':18}{'base_us':>9}{'dmr/b':>7}{'tmr/b':>7}{'natSDC':>8}{'dmrSDC':>8}{'tmrSDC':>8}")
 for n in names:
-    base = med("gen_base", n); gen = med("dmr_generic", n)
-    if not base or not gen: continue
-    ns, _ = sdc("native512", n); gs, gd = sdc("dmr_generic", n)
-    tax = gen / base
-    prot = (ns is not None and gs is not None and (ns - gs > 1.0 or (gd or 0) > 1.0))
-    rows.append((n, tax, prot))
-    ns_s = f"{ns:.1f}" if ns is not None else "-"
-    gs_s = f"{gs:.1f}" if gs is not None else "-"
-    gd_s = f"{gd:.1f}" if gd is not None else "-"
-    print(f"{n:20}{base:>10.2f}{tax:>9.2f}{ns_s:>8}{gs_s:>8}{gd_s:>8}  {'yes' if prot else '-'}")
+    base = med("gen_base", n); dmr = med("dmr_generic", n); tmr = med("tmr_generic", n)
+    if not base or not dmr or not tmr: continue
+    ns, _ = sdc("native512", n); ds, _ = sdc("dmr_generic", n); ts, _ = sdc("tmr_generic", n)
+    rows.append((n, dmr / base, tmr / base, ns, ds, ts))
+    f = lambda x: f"{x:.1f}" if x is not None else "-"
+    print(f"{n:18}{base:>9.1f}{dmr/base:>7.2f}{tmr/base:>7.2f}{f(ns):>8}{f(ds):>8}{f(ts):>8}")
 
-prot_rows = [r for r in rows if r[2]]
-print(f"\n受保护内核(SDC降/有检出): {len(prot_rows)}/{len(rows)}")
-if prot_rows:
-    print(f"受保护内核 gen/base 几何均税 = {geo([r[1] for r in prot_rows]):.2f}")
-print(f"全部内核 gen/base 几何均 = {geo([r[1] for r in rows if r[1]>0]):.2f}")
+fp = [r for r in rows if r[3] and r[3] > 1.0]   # 有 fp64 故障的核
+print(f"\nFP 核({len(fp)}个) 几何均:  dmr/base={geo([r[1] for r in fp]):.2f}  tmr/base={geo([r[2] for r in fp]):.2f}")
+print(f"全部核 几何均:  dmr/base={geo([r[1] for r in rows if r[1]>0]):.2f}  tmr/base={geo([r[2] for r in rows if r[2]>0]):.2f}")
+print(f"tmr<3× 的核: {sum(1 for r in rows if r[2]<3.0)}/{len(rows)}")
 
 def agg(tag, key):
     v = [FI[tag][b][key] for b in FI[tag]]
     return sum(v)/len(v) if v else float("nan")
-print(f"\n聚合 SDC/det(fp64): native {agg('native512','sdc_pct'):.1f}/{agg('native512','det_recovered_pct'):.1f}"
-      f"  gen {agg('dmr_generic','sdc_pct'):.1f}/{agg('dmr_generic','det_recovered_pct'):.1f}")
-print(f"max rel_l2(gen vs native golden) = {max(RL['dmr_generic'].values(), default=0):.2e}")
+print(f"\n聚合 fp64 SDC: native {agg('native512','sdc_pct'):.1f}  dmr {agg('dmr_generic','sdc_pct'):.1f}"
+      f"  tmr {agg('tmr_generic','sdc_pct'):.1f}  (tmr 纠错应最低)")
+print(f"max rel_l2: dmr {max(RL['dmr_generic'].values(),default=0):.1e}  tmr {max(RL['tmr_generic'].values(),default=0):.1e}")

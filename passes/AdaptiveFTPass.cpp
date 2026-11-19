@@ -313,6 +313,14 @@ static cl::opt<bool> AtftDMRNoInject(
              "injection (fair baseline denominator)"),
     cl::init(false));
 
+// 通用 TMR：与 -atft-dmr-generic 同架构，但注入 2 条影子并在每 FP 存储/返回写 median-of-3
+// (纠错，而非 DMR 的只检错)。用于验证"骑 SIMD 空闲车道"能否把三模纠错干到 <3×。
+static cl::opt<bool> AtftTMRGeneric(
+    "atft-tmr-generic",
+    cl::desc("With -atft-dmr-generic: 3-way TMR (2 shadows + median-of-3 vote "
+             "writeback = correction) instead of 2-way detect-only DMR"),
+    cl::init(false));
+
 
 enum CritLevel {
   CRIT_NON_CRITICAL = 0,
@@ -2975,9 +2983,10 @@ static void atftRunO3(Module &M) {
   MPM.run(M, MAM);
 }
 
-// 通用 DMR 注入：对 F 里全部 FP 算术/加载/phi 造影子链(不认循环形状)，返回点按 i64 签名提交。
+// 通用冗余注入：对 F 全部 FP 算术/加载/phi 造 (ways-1) 条独立影子链(不认循环形状)。
+// ways=2 → DMR(检错，XOR 签名返回点提交)；ways=3 → TMR(纠错，每 FP 存储/返回写 median-of-3)。
 // 前提：F 已向量化(调用方先跑 O3)。返回注入的影子算术条数。
-static int transformFunctionDMRGeneric(Function &F) {
+static int transformFunctionDMRGeneric(Function &F, int ways) {
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
   Type *I64Ty = Type::getInt64Ty(Ctx);
@@ -2998,48 +3007,74 @@ static int transformFunctionDMRGeneric(Function &F) {
     }
   if (fpArith.empty()) return 0;
 
-  DenseMap<Value *, Value *> shadow;
   Type *PtrTy = fpLoads.empty() ? nullptr : fpLoads[0]->getPointerOperand()->getType();
-  // hasSideEffects=true：否则纯 inline-asm 恒等会被 GVN 当可 CSE 的表达式合并两条 launder，
-  // 两条影子 load 又退回同指针→被合并→影子折叠(假冗余)。真副作用标记才挡得住。
+  // hasSideEffects=true：否则纯 inline-asm 恒等会被 GVN 当可 CSE 合并两条 launder→影子折叠(假冗余)。
   InlineAsm *pbar = PtrTy ? InlineAsm::get(FunctionType::get(PtrTy, {PtrTy}, false),
                                            "", "=r,0", /*hasSideEffects=*/true)
                           : nullptr;
-  // 1) 影子 load：经指针 launder 的二次 load(SSA 不同→GVN 不合并→不透明)
-  for (LoadInst *LD : fpLoads) {
-    IRBuilder<> B(LD->getNextNode());
-    Value *ps = B.CreateCall(pbar, {LD->getPointerOperand()});
-    LoadInst *ls = B.CreateAlignedLoad(LD->getType(), ps, LD->getAlign(), "atft.dmr.ld");
-    shadow[LD] = ls;
+  int nShadow = ways - 1;
+  std::vector<DenseMap<Value *, Value *>> sh(nShadow);
+  for (int c = 0; c < nShadow; ++c) {
+    DenseMap<Value *, Value *> &S = sh[c];
+    for (LoadInst *LD : fpLoads) {                 // 每条影子各自独立 launder 二次 load
+      IRBuilder<> B(LD->getNextNode());
+      Value *ps = B.CreateCall(pbar, {LD->getPointerOperand()});
+      S[LD] = B.CreateAlignedLoad(LD->getType(), ps, LD->getAlign(), "atft.dmr.ld");
+    }
+    for (PHINode *PN : fpPhis) {
+      IRBuilder<> B(&*PN->getParent()->getFirstInsertionPt());
+      S[PN] = B.CreatePHI(PN->getType(), PN->getNumIncomingValues(), "atft.dmr.phi");
+    }
+    auto so = [&](Value *v) -> Value * {
+      auto it = S.find(v);
+      return it != S.end() ? it->second : v;
+    };
+    for (Instruction *A : fpArith) {
+      IRBuilder<> B(A->getNextNode());
+      Value *s = (A->getOpcode() == Instruction::FNeg)
+                     ? B.CreateFNeg(so(A->getOperand(0)))
+                     : B.CreateBinOp((Instruction::BinaryOps)A->getOpcode(),
+                                     so(A->getOperand(0)), so(A->getOperand(1)));
+      S[A] = s;
+    }
+    for (PHINode *PN : fpPhis) {
+      auto *ps = cast<PHINode>(S[PN]);
+      for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+        ps->addIncoming(so(PN->getIncomingValue(i)), PN->getIncomingBlock(i));
+    }
   }
-  // 2) 影子 phi 占位
-  for (PHINode *PN : fpPhis) {
-    IRBuilder<> B(&*PN->getParent()->getFirstInsertionPt());
-    PHINode *ps = B.CreatePHI(PN->getType(), PN->getNumIncomingValues(), "atft.dmr.phi");
-    shadow[PN] = ps;
-  }
-  auto shadowOf = [&](Value *v) -> Value * {
-    auto it = shadow.find(v);
-    return it != shadow.end() ? it->second : v;   // 不变量/常量/未覆盖 → 共用
+  int injected = (int)fpArith.size() * nShadow;
+
+  // median-of-3（标量或向量 FP）：无故障三者相等→原值；单故障→取多数(中位=一致那对)
+  auto med3 = [&](IRBuilder<> &B, Value *a, Value *b, Value *cc) -> Value * {
+    Value *mnab = B.CreateBinaryIntrinsic(Intrinsic::minnum, a, b);
+    Value *mxab = B.CreateBinaryIntrinsic(Intrinsic::maxnum, a, b);
+    Value *inner = B.CreateBinaryIntrinsic(Intrinsic::minnum, mxab, cc);
+    return B.CreateBinaryIntrinsic(Intrinsic::maxnum, mnab, inner);
   };
-  // 3) 影子算术：按程序顺序克隆(操作数走 shadowOf)
-  for (Instruction *A : fpArith) {
-    IRBuilder<> B(A->getNextNode());
-    Value *s;
-    if (A->getOpcode() == Instruction::FNeg)
-      s = B.CreateFNeg(shadowOf(A->getOperand(0)));
-    else
-      s = B.CreateBinOp((Instruction::BinaryOps)A->getOpcode(),
-                        shadowOf(A->getOperand(0)), shadowOf(A->getOperand(1)));
-    shadow[A] = s;
+
+  if (ways == 3) {                                 // TMR：投票写回(纠错)
+    for (StoreInst *SI : fpStores) {
+      Value *v = SI->getValueOperand();
+      if (sh[0].count(v) && sh[1].count(v)) {
+        IRBuilder<> B(SI);
+        SI->setOperand(0, med3(B, v, sh[0][v], sh[1][v]));
+      }
+    }
+    for (BasicBlock &BB : F) {
+      auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+      if (!RI || RI->getNumOperands() != 1) continue;
+      Value *v = RI->getOperand(0);
+      if (atftIsFP(v) && sh[0].count(v) && sh[1].count(v)) {
+        IRBuilder<> B(RI);
+        RI->setOperand(0, med3(B, v, sh[0][v], sh[1][v]));
+      }
+    }
+    return injected;
   }
-  // 4) 填影子 phi 入边
-  for (PHINode *PN : fpPhis) {
-    auto *ps = cast<PHINode>(shadow[PN]);
-    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
-      ps->addIncoming(shadowOf(PN->getIncomingValue(i)), PN->getIncomingBlock(i));
-  }
-  // 5) 签名累加器(i64 alloca，交后续 mem2reg 升 SSA)
+
+  // ways==2：DMR 检错，XOR 签名
+  DenseMap<Value *, Value *> &shadow = sh[0];
   IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
   AllocaInst *sig = EB.CreateAlloca(I64Ty, nullptr, "atft.dmr.sig");
   EB.CreateStore(ConstantInt::get(I64Ty, 0), sig);
@@ -3065,7 +3100,6 @@ static int transformFunctionDMRGeneric(Function &F) {
     Value *v = SI->getValueOperand();
     if (shadow.count(v)) { IRBuilder<> B(SI); foldDiff(B, v, shadow[v]); }
   }
-  int injected = (int)fpArith.size();
   for (BasicBlock &BB : F) {
     auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
     if (!RI) continue;
@@ -4242,7 +4276,7 @@ public:
         Function *F = M.getFunction(n);
         if (!F || F->isDeclaration()) continue;
         if (AtftDMRNoInject) continue;             // 公平基线：同管线但不注入
-        int inj = transformFunctionDMRGeneric(*F);
+        int inj = transformFunctionDMRGeneric(*F, AtftTMRGeneric ? 3 : 2);
         if (inj) errs() << "ATFT_DMR_GENERIC," << n << "," << inj << "\n";
       }
       // 清理：mem2reg 把签名 alloca 升 SSA(reduction phi)，省掉每迭代访存
