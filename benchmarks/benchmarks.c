@@ -779,3 +779,345 @@ __attribute__((noinline))
 void bench_coast_quicksort(int32_t *arr, int n) {
     quick_sort((int *)arr, n);
 }
+
+// ---- Suite G: MobileNet-class CNN 推理算子（conv2d 3x3 same-pad + ReLU）----
+// 当代星载 AI 推理的主导算子;FP64 乘加链可向量化,落在 RVV/NEON 车道上,
+// 正好被 ②SIMD 结构保护覆盖。零填充 same padding,输出 cout*h*w。
+__attribute__((noinline))
+void bench_cnn_conv(int cin, int cout, int h, int w,
+                    const double *in, const double *weights, double *out) {
+    for (int oc = 0; oc < cout; oc++) {
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                double acc = 0.0;
+                for (int ic = 0; ic < cin; ic++) {
+                    const double *ichan = in + (ic * h + 0) * w;
+                    const double *wk = weights + ((oc * cin + ic) * 3) * 3;
+                    for (int ky = 0; ky < 3; ky++) {
+                        int iy = y + ky - 1;
+                        if (iy < 0 || iy >= h) continue;
+                        for (int kx = 0; kx < 3; kx++) {
+                            int ix = x + kx - 1;
+                            if (ix < 0 || ix >= w) continue;
+                            acc += ichan[iy * w + ix] * wk[ky * 3 + kx];
+                        }
+                    }
+                }
+                acc = acc > 0.0 ? acc : 0.0;   // ReLU
+                out[(oc * h + y) * w + x] = acc;
+            }
+        }
+    }
+}
+
+// ---- Suite G': conv2d 的 ABFT/Freivalds 结构化保护版 ----
+// conv 的线性部分等价于 matmul O = W_mat · Patch。先算线性 conv,用 Freivalds 精确校验
+// (O·r) == W_mat·(Patch·r);污染则重算线性部分;最后统一 ReLU(逐元素,另行保护)。
+// 校验代价 O(Cout·HW + Cin·9·HW + Cout·Cin·9) ≪ conv O(Cout·Cin·9·HW)。按结构选机制,非复制。
+static void cnn_conv_linear(int cin, int cout, int h, int w,
+                            const double *in, const double *weights, double *out) {
+    for (int oc = 0; oc < cout; oc++)
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                double acc = 0.0;
+                for (int ic = 0; ic < cin; ic++) {
+                    const double *ichan = in + ic * h * w;
+                    const double *wk = weights + (oc * cin + ic) * 9;
+                    for (int ky = 0; ky < 3; ky++) {
+                        int iy = y + ky - 1; if (iy < 0 || iy >= h) continue;
+                        for (int kx = 0; kx < 3; kx++) {
+                            int ix = x + kx - 1; if (ix < 0 || ix >= w) continue;
+                            acc += ichan[iy * w + ix] * wk[ky * 3 + kx];
+                        }
+                    }
+                }
+                out[(oc * h + y) * w + x] = acc;      // 线性,不 ReLU
+            }
+}
+
+__attribute__((noinline))
+void bench_cnn_conv_abft(int cin, int cout, int h, int w,
+                         const double *in, const double *weights, double *out,
+                         const double *rvec) {
+    cnn_conv_linear(cin, cout, h, w, in, weights, out);
+    double patchr[8 * 9];                              // cin<=8;通用场景应堆分配
+    for (int i = 0; i < cin * 9; i++) patchr[i] = 0.0;
+    for (int ic = 0; ic < cin; ic++) {
+        const double *ichan = in + ic * h * w;
+        for (int ky = 0; ky < 3; ky++)
+            for (int kx = 0; kx < 3; kx++) {
+                double s = 0.0;
+                for (int y = 0; y < h; y++) {
+                    int iy = y + ky - 1; if (iy < 0 || iy >= h) continue;
+                    for (int x = 0; x < w; x++) {
+                        int ix = x + kx - 1; if (ix < 0 || ix >= w) continue;
+                        s += rvec[y * w + x] * ichan[iy * w + ix];
+                    }
+                }
+                patchr[ic * 9 + ky * 3 + kx] = s;
+            }
+    }
+    int mismatch = 0;
+    for (int oc = 0; oc < cout && !mismatch; oc++) {
+        double lhs = 0.0;
+        const double *orow = out + oc * h * w;
+        for (int p = 0; p < h * w; p++) lhs += orow[p] * rvec[p];   // (O·r)
+        double rhs = 0.0;
+        const double *wrow = weights + oc * cin * 9;
+        for (int i = 0; i < cin * 9; i++) rhs += wrow[i] * patchr[i]; // W_mat·(Patch·r)
+        double diff = lhs - rhs; if (diff < 0) diff = -diff;
+        double mag = (rhs > 0 ? rhs : -rhs);
+        if (diff > 1e-6 * (1.0 + mag)) mismatch = 1;
+    }
+    if (mismatch) cnn_conv_linear(cin, cout, h, w, in, weights, out);  // 重算恢复
+    for (int i = 0; i < cout * h * w; i++)             // 统一 ReLU
+        if (out[i] < 0.0) out[i] = 0.0;
+}
+
+// ---- Suite G'': conv 的 GEMM 下沉形式(im2col + 规范矩阵乘 + ReLU) ----
+// 对标 FT-CNN / CUTLASS implicit-GEMM:把 conv 降成规范 C=A·B,好让"通用 GEMM ABFT
+// 自动检测器"直接命中——不手写 checksum,由编译器自动插桩。patch 为 (cin*9)x(h*w) 暂存。
+__attribute__((noinline))
+void bench_cnn_conv_gemm(int cin, int cout, int h, int w,
+                         const double *in, const double *weights, double *out,
+                         double *patch) {
+    int K = cin * 9, N = h * w;
+    // im2col:patch[r][p] = in[ic, y+ky-1, x+kx-1],  r=ic*9+ky*3+kx, p=y*w+x
+    for (int ic = 0; ic < cin; ic++) {
+        const double *ichan = in + ic * h * w;
+        for (int ky = 0; ky < 3; ky++)
+            for (int kx = 0; kx < 3; kx++) {
+                int r = ic * 9 + ky * 3 + kx;
+                double *prow = patch + r * N;
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++) {
+                        int iy = y + ky - 1, ix = x + kx - 1;
+                        prow[y * w + x] = (iy < 0 || iy >= h || ix < 0 || ix >= w)
+                                          ? 0.0 : ichan[iy * w + ix];
+                    }
+            }
+    }
+    // 规范 GEMM(原地累加入 out,匹配检测器的 C[i][j]=load(C)+term 归约形态):
+    for (int oc = 0; oc < cout; oc++)
+        for (int p = 0; p < N; p++) out[oc * N + p] = 0.0;
+    for (int oc = 0; oc < cout; oc++)
+        for (int p = 0; p < N; p++)
+            for (int r = 0; r < K; r++)
+                out[oc * N + p] += weights[oc * K + r] * patch[r * N + p];
+    for (int i = 0; i < cout * N; i++) if (out[i] < 0.0) out[i] = 0.0;  // ReLU
+}
+
+// ============================================================================
+// 通用受保护 GEMM 原语(方案 b):C[M*N]=A[M*K]·B[K*N],内置 Freivalds 校验+重算恢复。
+// 任何能降为 GEMM 的算子(matmul/fc/conv-im2col/attention)路由到它即获结构化保护,
+// 不必一核一手写 checksum。校验代价 O(MN+KN+MK) ≪ GEMM 的 O(MNK)。tol 可由 FI 校准。
+// r 为长度 N 的随机投影向量。
+// ============================================================================
+__attribute__((noinline))
+void atft_abft_gemm(int M, int N, int K,
+                    const double *A, const double *B, double *C,
+                    const double *r, double tol) {
+    for (int i = 0; i < M; i++)
+        for (int j = 0; j < N; j++) C[i * N + j] = 0.0;
+    for (int i = 0; i < M; i++)
+        for (int j = 0; j < N; j++)
+            for (int k = 0; k < K; k++)
+                C[i * N + j] += A[i * K + k] * B[k * N + j];
+    // Freivalds: 验 (C·r) == A·(B·r)
+    double Br[512];                         // K 上界(conv/fc 足够);通用场景堆分配
+    int kk = K < 512 ? K : 512;
+    for (int k = 0; k < kk; k++) {
+        double s = 0.0;
+        for (int j = 0; j < N; j++) s += B[k * N + j] * r[j];
+        Br[k] = s;
+    }
+    int bad = 0;
+    for (int i = 0; i < M && !bad; i++) {
+        double lhs = 0.0, rhs = 0.0;
+        for (int j = 0; j < N; j++) lhs += C[i * N + j] * r[j];
+        for (int k = 0; k < kk; k++) rhs += A[i * K + k] * Br[k];
+        double d = lhs - rhs; if (d < 0) d = -d;
+        double mag = rhs > 0 ? rhs : -rhs;
+        if (d > tol * (1.0 + mag)) bad = 1;
+    }
+    if (bad)                                 // 检测到污染 → 重算恢复
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++) {
+                double acc = 0.0;
+                for (int k = 0; k < K; k++) acc += A[i * K + k] * B[k * N + j];
+                C[i * N + j] = acc;
+            }
+}
+
+// conv 路由到通用受保护 GEMM 原语:im2col → atft_abft_gemm → ReLU。
+// 证明"一个受保护原语覆盖 conv"——不是 conv 专用 checksum。
+__attribute__((noinline))
+void bench_cnn_conv_primitive(int cin, int cout, int h, int w,
+                              const double *in, const double *weights, double *out,
+                              double *patch, const double *r) {
+    int K = cin * 9, N = h * w;
+    for (int ic = 0; ic < cin; ic++) {
+        const double *ichan = in + ic * h * w;
+        for (int ky = 0; ky < 3; ky++)
+            for (int kx = 0; kx < 3; kx++) {
+                int rr = ic * 9 + ky * 3 + kx;
+                double *prow = patch + rr * N;
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++) {
+                        int iy = y + ky - 1, ix = x + kx - 1;
+                        prow[y * w + x] = (iy < 0 || iy >= h || ix < 0 || ix >= w)
+                                          ? 0.0 : ichan[iy * w + ix];
+                    }
+            }
+    }
+    atft_abft_gemm(cout, N, K, weights, patch, out, r, 1e-6);   // 结构化保护
+    for (int i = 0; i < cout * N; i++) if (out[i] < 0.0) out[i] = 0.0;
+}
+
+// ============================================================================
+// 端到端 CNN 分类器:conv(3x3 same-pad)+ReLU → maxpool 2x2 → flatten → fc → logits。
+// 用来量"数值 SDC(logits 偏差) vs 决策翻转(argmax 类别变化)"的差距。
+// 维度小、确定性,便于 FI。cin=1, cout=8, h=w=16, pool→8x8, flat=8*8*8=512, ncls=10。
+// ============================================================================
+__attribute__((noinline))
+void bench_cnn_classifier(int cin, int cout, int h, int w, int ncls,
+                          const double *in, const double *cw, const double *fw,
+                          double *conv_tmp, double *pool_tmp, double *logits) {
+    // conv + ReLU → conv_tmp[cout][h][w]
+    for (int oc = 0; oc < cout; oc++)
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                double acc = 0.0;
+                for (int ic = 0; ic < cin; ic++) {
+                    const double *ich = in + ic * h * w;
+                    const double *wk = cw + (oc * cin + ic) * 9;
+                    for (int ky = 0; ky < 3; ky++) {
+                        int iy = y + ky - 1; if (iy < 0 || iy >= h) continue;
+                        for (int kx = 0; kx < 3; kx++) {
+                            int ix = x + kx - 1; if (ix < 0 || ix >= w) continue;
+                            acc += ich[iy * w + ix] * wk[ky * 3 + kx];
+                        }
+                    }
+                }
+                conv_tmp[(oc * h + y) * w + x] = acc > 0.0 ? acc : 0.0;
+            }
+    // maxpool 2x2 → pool_tmp[cout][h/2][w/2]
+    int ph = h / 2, pw = w / 2;
+    for (int oc = 0; oc < cout; oc++)
+        for (int py = 0; py < ph; py++)
+            for (int px = 0; px < pw; px++) {
+                double m = -1e300;
+                for (int dy = 0; dy < 2; dy++)
+                    for (int dx = 0; dx < 2; dx++) {
+                        double v = conv_tmp[(oc * h + (2 * py + dy)) * w + (2 * px + dx)];
+                        if (v > m) m = v;
+                    }
+                pool_tmp[(oc * ph + py) * pw + px] = m;
+            }
+    // fc: logits[o] = sum_f fw[o*FLAT + f] * pool_tmp[f]
+    int FLAT = cout * ph * pw;
+    for (int o = 0; o < ncls; o++) {
+        double acc = 0.0;
+        for (int f = 0; f < FLAT; f++) acc += fw[o * FLAT + f] * pool_tmp[f];
+        logits[o] = acc;
+    }
+}
+
+// decision 版:跑分类器 + argmax,输出类别索引(作为 double)。harness 的 SDC = 类别翻转。
+__attribute__((noinline))
+void bench_cnn_classifier_decision(int cin, int cout, int h, int w, int ncls,
+                                   const double *in, const double *cw, const double *fw,
+                                   double *conv_tmp, double *pool_tmp, double *logits,
+                                   double *cls_out) {
+    bench_cnn_classifier(cin, cout, h, w, ncls, in, cw, fw, conv_tmp, pool_tmp, logits);
+    int best = 0; double bv = logits[0];
+    for (int o = 1; o < ncls; o++) if (logits[o] > bv) { bv = logits[o]; best = o; }
+    cls_out[0] = (double)best;
+}
+
+// ============================================================================
+// 真实空天负载:线性 Kalman 滤波状态估计(GNC 姿态/轨道估计的核心)。
+// 决策敏感端:误差累积进持久状态 x/P,跨时间步传播——与 CV 容错端对立。
+// n=4 态(位置+速度 2D), m=2 观测, T 步。内部自初始化,输出最终状态 x[n]。
+// 全是矩阵/矩阵-向量运算(GNC "Matrix Computation" 类),峰值 burst 下持久状态被打坏最致命。
+// ============================================================================
+__attribute__((noinline))
+void bench_gnc_kalman(int n, int m, int T,
+                      const double *F, const double *H, const double *Q, const double *R,
+                      const double *zseq, double *x, double *P) {
+    // 自初始化:x=0, P=单位阵*10(大初始不确定度)
+    for (int i = 0; i < n; i++) x[i] = 0.0;
+    for (int i = 0; i < n*n; i++) P[i] = 0.0;
+    for (int i = 0; i < n; i++) P[i*n+i] = 10.0;
+
+    double xp[8], Pp[64], tmp[64], y[8], S[64], Sinv[64], K[64], HPp[64];
+    for (int t = 0; t < T; t++) {
+        // 预测 xp = F x
+        for (int i = 0; i < n; i++) { double s=0; for (int j=0;j<n;j++) s+=F[i*n+j]*x[j]; xp[i]=s; }
+        // Pp = F P F^T + Q
+        for (int i=0;i<n;i++) for (int j=0;j<n;j++){ double s=0; for(int k=0;k<n;k++) s+=F[i*n+k]*P[k*n+j]; tmp[i*n+j]=s; } // tmp=F P
+        for (int i=0;i<n;i++) for (int j=0;j<n;j++){ double s=0; for(int k=0;k<n;k++) s+=tmp[i*n+k]*F[j*n+k]; Pp[i*n+j]=s+Q[i*n+j]; }
+        // 创新 y = z_t - H xp
+        for (int i=0;i<m;i++){ double s=0; for(int j=0;j<n;j++) s+=H[i*n+j]*xp[j]; y[i]=zseq[t*m+i]-s; }
+        // HPp = H Pp (m x n), S = H Pp H^T + R (m x m)
+        for (int i=0;i<m;i++) for(int j=0;j<n;j++){ double s=0; for(int k=0;k<n;k++) s+=H[i*n+k]*Pp[k*n+j]; HPp[i*n+j]=s; }
+        for (int i=0;i<m;i++) for(int j=0;j<m;j++){ double s=0; for(int k=0;k<n;k++) s+=HPp[i*n+k]*H[j*n+k]; S[i*m+j]=s+R[i*m+j]; }
+        // 2x2 S 求逆(m==2)
+        double det = S[0]*S[3]-S[1]*S[2]; if (det==0.0) det=1e-12;
+        Sinv[0]= S[3]/det; Sinv[1]=-S[1]/det; Sinv[2]=-S[2]/det; Sinv[3]=S[0]/det;
+        // K = Pp H^T Sinv (n x m)
+        double PpHt[64];
+        for (int i=0;i<n;i++) for(int j=0;j<m;j++){ double s=0; for(int k=0;k<n;k++) s+=Pp[i*n+k]*H[j*n+k]; PpHt[i*m+j]=s; }
+        for (int i=0;i<n;i++) for(int j=0;j<m;j++){ double s=0; for(int k=0;k<m;k++) s+=PpHt[i*m+k]*Sinv[k*m+j]; K[i*m+j]=s; }
+        // x = xp + K y
+        for (int i=0;i<n;i++){ double s=xp[i]; for(int j=0;j<m;j++) s+=K[i*m+j]*y[j]; x[i]=s; }
+        // P = (I - K H) Pp
+        for (int i=0;i<n;i++) for(int j=0;j<n;j++){ double s=(i==j)?1.0:0.0; for(int k=0;k<m;k++) s-=K[i*m+k]*H[k*n+j]; tmp[i*n+j]=s; } // tmp = I-KH
+        for (int i=0;i<n;i++) for(int j=0;j<n;j++){ double s=0; for(int k=0;k<n;k++) s+=tmp[i*n+k]*Pp[k*n+j]; P[i*n+j]=s; }
+    }
+}
+
+// 二体轨道外推:开环 RK4 积分 d/dt[r,v]=[v, -mu r/|r|^3]。无反馈,单步误差被
+// 后续积分放大 → 典型敏感负载,与 Kalman 的闭环自纠形成对照。
+static void orbit_deriv(double mu, const double *s, double *ds) {
+    double r2 = s[0]*s[0]+s[1]*s[1]+s[2]*s[2];
+    double r = sqrt(r2); if (r < 1e-9) r = 1e-9;
+    double a = -mu / (r2*r);           // -mu/|r|^3
+    ds[0]=s[3]; ds[1]=s[4]; ds[2]=s[5];
+    ds[3]=a*s[0]; ds[4]=a*s[1]; ds[5]=a*s[2];
+}
+void bench_orbit_rk4(int T, double dt, double mu, double *state) {
+    // 自初始化:归一化圆轨道 r=(1,0,0), v=(0,1,0)(保证多次调用确定性,同 Kalman)
+    state[0]=1.0; state[1]=0.0; state[2]=0.0;
+    state[3]=0.0; state[4]=1.0; state[5]=0.0;
+    double k1[6],k2[6],k3[6],k4[6],tmp[6];
+    for (int t=0;t<T;t++) {
+        orbit_deriv(mu, state, k1);
+        for (int i=0;i<6;i++) tmp[i]=state[i]+0.5*dt*k1[i];
+        orbit_deriv(mu, tmp, k2);
+        for (int i=0;i<6;i++) tmp[i]=state[i]+0.5*dt*k2[i];
+        orbit_deriv(mu, tmp, k3);
+        for (int i=0;i<6;i++) tmp[i]=state[i]+dt*k3[i];
+        orbit_deriv(mu, tmp, k4);
+        for (int i=0;i<6;i++)
+            state[i]+=dt/6.0*(k1[i]+2.0*k2[i]+2.0*k3[i]+k4[i]);
+    }
+}
+
+// 单轴姿态 PID 控制回路+作动器饱和:闭环系统,控制器把误差拉回参考,
+// 瞬态故障被反馈吸收 → 与 Kalman 同属鲁棒端(验证"反馈→内在鲁棒"的普遍性)。
+void bench_aocs_pid(int T, double dt, double ref, double Kp, double Ki, double Kd,
+                    double umax, double inertia, double *state) {
+    // 自初始化:静止偏离参考(theta=0, omega=0),阶跃到 ref
+    double theta=0.0, omega=0.0, integ=0.0;
+    for (int t=0;t<T;t++) {
+        double e = ref - theta;
+        integ += e*dt;
+        double u = Kp*e + Ki*integ - Kd*omega;   // D 项作用在速度上(抑制超调)
+        if (u >  umax) u =  umax;                 // 作动器力矩饱和
+        if (u < -umax) u = -umax;
+        omega += (u/inertia)*dt;                  // 一阶惯量模型
+        theta += omega*dt;
+    }
+    state[0]=theta; state[1]=omega;
+}

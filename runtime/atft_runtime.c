@@ -15,8 +15,8 @@
 #endif
 
 // 时间驱动降档（ATFT_SPRT_TIME_DRIVEN）：无事件流逝的时间也作为 H0 的证据。
-// 默认关闭，关闭时判决规则与冻结基线逐位一致。
-static int g_atft_sprt_time_driven = 0;
+// 默认开启(见 atft_init_sprt);设 ATFT_SPRT_TIME_DRIVEN=0 退回事件驱动以逐位复现旧基线。
+static int g_atft_sprt_time_driven = 1;
 
 
 atft_runtime_state_t g_atft_state = {
@@ -122,7 +122,11 @@ void atft_init_sprt(double calm_interval, double rate_ratio, double alpha, doubl
     g_atft_state.sprt_bound_a = log((1.0 - beta) / alpha);
     g_atft_state.sprt_bound_b = log(beta / (1.0 - alpha));
     g_atft_state.sprt_llr = 0.0;
-    g_atft_sprt_time_driven = getenv("ATFT_SPRT_TIME_DRIVEN") ? 1 : 0;
+    // 时间驱动是默认行为:平静段"无事件流逝的时间"连续贡献降档证据,
+    // 否则降档要等下一个事件(间隔~1/lambda0,轨道周期量级),回落滞后结构性过长。
+    // 仅当显式设 ATFT_SPRT_TIME_DRIVEN=0 时退回旧的事件驱动规则(用于复现对照)。
+    const char *td = getenv("ATFT_SPRT_TIME_DRIVEN");
+    g_atft_sprt_time_driven = (td && td[0] == '0') ? 0 : 1;
 }
 
 void atft_reset_stats(void) {    g_atft_state.total_votes = 0;

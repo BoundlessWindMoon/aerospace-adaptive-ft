@@ -35,6 +35,83 @@ SSO_SAA_FRAC = 0.2107
 LAM_GEO_QUIET = LAM_LEO_QUIET * 1e-2     # GEO 静默背景（GCR 主导，低通量）
 GEO_FLARE_FACTOR = 1.0e4                  # 耀斑相对静默的增强倍数
 
+# ============================================================================
+# 参考飞控平台 profile：RAD750（BAE Systems PowerPC 750）。
+# 所有"非辐射"约束(算力/功耗/代码尺寸/deadline)的锚点，一律引公开 datasheet，
+# 避免自设阈值导致 toy。辐射侧(λ) 已由上面 SAMPEX/Alsat-1 实测锚定。
+# 来源：BAE RAD750 datasheet；Wikipedia RAD750；Aumictech 3U cPCI SBC spec；
+#      ECSS-E-HB-20-40A（容错）；AIAA G002868（GNC 回路率）。
+# 评估口径统一写：针对 RAD750-class 平台，参数取自上述公开 spec。
+# ============================================================================
+RAD750 = {
+    "name": "RAD750 (BAE Systems, PowerPC 750)",
+    "clock_mhz": 133.0,            # 110–200 MHz；取 133MHz（对应 CPU 5W 点）
+    "dmips": 300.0,                # 266–435 DMIPS；标称 ~300
+    "cpu_power_w": 5.0,            # CPU 功耗 @133MHz
+    "sbc_power_w": 10.0,           # 整板 SBC 10–12.2W @198MHz
+    "code_rom_kb": 256.0,          # 启动 SUROM 256KB（代码尺寸标尺）
+    "sram_mb": 36.0,               # rad-hard SRAM
+    "sdram_mb": 1024.0,            # EDAC SDRAM 1GB
+    "tid_krad": (200.0, 1000.0),   # 0.25µm 200krad / 0.15µm 1Mrad
+    "seu_err_bit_day": 1.6e-10,    # <1.6e-10 err/bit-day @90% worst-case GEO
+    "temp_c": (-55.0, 125.0),
+}
+
+# 实时 deadline 锚点：ADCS/GNC 控制回路 1–10 Hz（AIAA G002868 综述；CubeSat GNC）。
+# 取 10 Hz → 100 ms 作标称硬截止；星敏 4Hz；挠性控制 10–100Hz 为上界参考。
+GNC_LOOP_HZ = 10.0
+GNC_DEADLINE_S = 1.0 / GNC_LOOP_HZ        # 100 ms 硬截止
+
+def rad750_time_s(base_time_s, overhead_x):
+    """保护倍率 overhead_x 下的墙钟（相对无保护 base_time_s）。"""
+    return base_time_s * overhead_x
+
+def rad750_energy_j(time_s, power_w=None):
+    """动态能耗 ≈ 时间 × 功率（同频同电压下，开销倍率≈能耗倍率）。"""
+    return time_s * (power_w if power_w is not None else RAD750["cpu_power_w"])
+
+def meets_deadline(time_s, deadline_s=None):
+    return time_s <= (deadline_s if deadline_s is not None else GNC_DEADLINE_S)
+
+# ============================================================================
+# 现代平台(2024-2026 NASA/顶会实际在用,不再用 1990s-2010 老件)。两类都有向量单元:
+#  - HPSC(NASA 下一代旗舰,RISC-V):SiFive X280×8,RVV1.0 512-bit 向量(可拼 4096-bit),
+#    FP16/32/64,28,130 DMIPS@1GHz,256 GFLOPs 向量;rad-hard-by-design;
+#    支持 DCLS 双核锁步(安全,吞吐减半) / Split 全吞吐(快,无锁步)两种模式。
+#    来源:NASA cFS Symposium 2025、NASA HPSC 白皮书、SiFive X280 datasheet。
+#  - Jetson Orin Nano(COTS 边缘,AMOS 2026/JPL 实测):6×ARM A78AE(NEON 128-bit)+
+#    Ampere GPU(1024 CUDA/32 tensor),40 TOPS INT8;功率靠 nvpmodel 调频/关核(7W/15W)。
+# 功率预算 = 调频/关核实现(DMIPS 随频率线性缩),这是真实的 degrade 执行器。
+# ============================================================================
+PLATFORMS = {
+    "HPSC": {
+        "cls": "space-modern", "isa": "RISC-V", "cores": 8, "mhz": 1000,
+        "dmips": 28130, "vector_bits": 512, "gflops_vec": 256, "fp64": True,
+        "power_w": None,  # datasheet 未公开干净 W(强调 100× perf/W);正式用查 PIC64-HPSC
+        "modes": ["DCLS_lockstep(吞吐减半)", "split(全吞吐无锁步)"],
+    },
+    "JetsonOrinNano8G": {
+        "cls": "cots-edge", "isa": "ARMv8.2-A78AE + Ampere GPU", "cores": 6,
+        "mhz": 1500, "vector_bits": 128, "tops_int8": 40, "fp64": True,
+        # nvpmodel 电源模式:功率→关核+限频(实测自 L4T r39.2 power 表)
+        "power_modes": {"7W": {"cores": 4, "cpu_mhz": 960},
+                        "15W": {"cores": 6, "cpu_mhz": 1500}},
+    },
+}
+
+def platform_dmips(platform="HPSC", power_mode=None):
+    """返回平台 DMIPS;给 Jetson 的 power_mode 则按关核+限频线性缩放。"""
+    p = PLATFORMS[platform]
+    if power_mode and "power_modes" in p:
+        m = p["power_modes"][power_mode]
+        full = p["dmips"] if "dmips" in p else p["cores"] * p["mhz"] * 8  # A78≈8 DMIPS/MHz
+        return (m["cores"] * m["cpu_mhz"] * 8)  # 关核+限频后的标量 DMIPS
+    return p.get("dmips", p["cores"] * p["mhz"] * 8)
+
+def platform_time_s(hw_insts, platform="HPSC", power_mode=None):
+    """实测动态指令数 → 该平台等效执行时间(s)。限频模式按 power_mode 缩放。"""
+    return hw_insts / (platform_dmips(platform, power_mode) * 1e6)
+
 
 def load_csv(name):
     with open(os.path.join(OPT, name)) as f:

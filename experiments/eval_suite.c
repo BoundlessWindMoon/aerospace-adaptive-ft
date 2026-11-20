@@ -209,9 +209,52 @@ static const bench_meta_t BENCHES[] = {
     { "pb_heat3d",          "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
     { "pb_jacobi1d",        "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
     { "pb_seidel2d",        "PolyBench/C 4.2.1",       BK_FP,   BTAG_NONE },
+    { "cnn_conv",           "MobileNet-class conv2d",  BK_FP,   BTAG_REPR | BTAG_AEROSPACE },
+    { "cnn_conv_abft",      "conv2d + ABFT(Freivalds)",BK_FP,   BTAG_REPR | BTAG_AEROSPACE },
+    { "cnn_conv_gemm",      "conv2d GEMM 下沉(自动ABFT)",BK_FP,  BTAG_REPR | BTAG_AEROSPACE },
+    { "cnn_conv_prim",      "conv2d → 通用受保护GEMM原语",BK_FP, BTAG_REPR | BTAG_AEROSPACE },
+    { "cnn_cls_logit",      "端到端分类器(logits/数值SDC)",BK_FP, BTAG_REPR | BTAG_AEROSPACE },
+    { "cnn_cls_decision",   "端到端分类器(argmax/决策翻转)",BK_FP,BTAG_REPR | BTAG_AEROSPACE },
+    { "gnc_kalman",         "GNC Kalman 状态估计(敏感端)",BK_FP, BTAG_AEROSPACE },
+    { "orbit_rk4",          "二体轨道外推(开环RK4,敏感)",BK_FP, BTAG_AEROSPACE },
+    { "aocs_pid",           "单轴姿态PID控制(闭环,鲁棒)",BK_FP, BTAG_AEROSPACE },
 };
 
 #define NUM_BENCHES ((int)(sizeof(BENCHES) / sizeof(BENCHES[0])))
+
+/* MobileNet-class CNN 推理算子维度（小尺寸,保证 FI 快;算子类型代表当代星载 AI 负载） */
+#define CNN_CIN  8
+#define CNN_COUT 16
+#define CNN_H    16
+#define CNN_W    16
+
+/* 端到端分类器维度:1x16x16 → conv 8ch → pool 8x8 → flatten 512 → fc 10 类 */
+#define CLS_CIN  1
+#define CLS_COUT 8
+#define CLS_H    16
+#define CLS_W    16
+#define CLS_NCLS 10
+#define CLS_FLAT (CLS_COUT*(CLS_H/2)*(CLS_W/2))
+
+/* GNC Kalman 滤波:4 态(2D 位置+速度), 2 观测, 20 步 */
+#define GNC_N 4
+#define GNC_M 2
+#define GNC_T 20
+
+/* 二体轨道外推:LEO 圆轨道归一化单位(mu=1, r0=1, v0=1), RK4 积分 */
+#define ORB_T    200
+#define ORB_DT   0.05
+#define ORB_MU   1.0
+
+/* 单轴姿态 PID:阶跃 1.0 rad 机动, 惯量 1.0, 力矩饱和 0.5, 400 步 */
+#define PID_T       400
+#define PID_DT      0.02
+#define PID_REF     1.0
+#define PID_KP      4.0
+#define PID_KI      0.5
+#define PID_KD      3.0
+#define PID_UMAX    0.5
+#define PID_INERTIA 1.0
 
 static const char *bench_name(int b) {
     return (b >= 0 && b < NUM_BENCHES) ? BENCHES[b].name : "<invalid>";
@@ -396,6 +439,10 @@ typedef struct {
     double *h3_A, *h3_A0, *h3_B, *h3_B0;
     double *j1_A, *j1_A0, *j1_B, *j1_B0;
     double *sd_A, *sd_A0;
+    double *cnn_in, *cnn_w, *cnn_out, *cnn_r, *cnn_patch;   // Suite G: CNN conv2d 输入/权重/输出/Freivalds r/im2col patch
+    double *cls_in, *cls_cw, *cls_fw, *cls_conv, *cls_pool, *cls_logits, *cls_cls;  // 端到端分类器
+    double *gnc_F, *gnc_H, *gnc_Q, *gnc_R, *gnc_z, *gnc_x, *gnc_P;  // GNC Kalman
+    double *orb_state, *pid_state;  // 轨道外推 / 姿态 PID
 
     double *out_ptrs[NUM_BENCHES];
     int     out_sizes[NUM_BENCHES];
@@ -718,6 +765,27 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     ws->j1_B0=calloc(PBM_JAC1D_N,sizeof(double));
     ws->sd_A=calloc(PBM_SEIDEL_N*PBM_SEIDEL_N,sizeof(double));
     ws->sd_A0=calloc(PBM_SEIDEL_N*PBM_SEIDEL_N,sizeof(double));
+    ws->cnn_in=calloc(CNN_CIN*CNN_H*CNN_W,sizeof(double));
+    ws->cnn_w=calloc(CNN_COUT*CNN_CIN*9,sizeof(double));
+    ws->cnn_out=calloc(CNN_COUT*CNN_H*CNN_W,sizeof(double));
+    ws->cnn_r=calloc(CNN_H*CNN_W,sizeof(double));
+    ws->cnn_patch=calloc(CNN_CIN*9*CNN_H*CNN_W,sizeof(double));
+    ws->cls_in=calloc(CLS_CIN*CLS_H*CLS_W,sizeof(double));
+    ws->cls_cw=calloc(CLS_COUT*CLS_CIN*9,sizeof(double));
+    ws->cls_fw=calloc(CLS_NCLS*CLS_FLAT,sizeof(double));
+    ws->cls_conv=calloc(CLS_COUT*CLS_H*CLS_W,sizeof(double));
+    ws->cls_pool=calloc(CLS_FLAT,sizeof(double));
+    ws->cls_logits=calloc(CLS_NCLS,sizeof(double));
+    ws->cls_cls=calloc(1,sizeof(double));
+    ws->gnc_F=calloc(GNC_N*GNC_N,sizeof(double));
+    ws->gnc_H=calloc(GNC_M*GNC_N,sizeof(double));
+    ws->gnc_Q=calloc(GNC_N*GNC_N,sizeof(double));
+    ws->gnc_R=calloc(GNC_M*GNC_M,sizeof(double));
+    ws->gnc_z=calloc(GNC_M*GNC_T,sizeof(double));
+    ws->gnc_x=calloc(GNC_N,sizeof(double));
+    ws->gnc_P=calloc(GNC_N*GNC_N,sizeof(double));
+    ws->orb_state=calloc(6,sizeof(double));
+    ws->pid_state=calloc(2,sizeof(double));
 
 // ---- 按上游 init_array 公式逐一复刻初始化（静态 init_array 无法跨 TU 调用）----
     { int i,j,k;
@@ -843,6 +911,29 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
       // seidel-2d
       for (i=0;i<PBM_SEIDEL_N;i++) for (j=0;j<PBM_SEIDEL_N;j++)
         ws->sd_A0[i*PBM_SEIDEL_N+j]=((double)i*(j+2)+2)/PBM_SEIDEL_N;
+      // cnn conv2d: 确定性填充输入特征图与卷积核(读-only,不需 reset)
+      for (i=0;i<CNN_CIN*CNN_H*CNN_W;i++) ws->cnn_in[i]=(double)((i*7)%13-6)/4.0;
+      for (i=0;i<CNN_COUT*CNN_CIN*9;i++)  ws->cnn_w[i]=(double)((i*5)%11-5)/8.0;
+      for (i=0;i<CNN_H*CNN_W;i++)         ws->cnn_r[i]=(double)((i*3)%7-3)/2.0;  // Freivalds r
+      // 端到端分类器:确定性填充输入/卷积核/fc 权重
+      for (i=0;i<CLS_CIN*CLS_H*CLS_W;i++) ws->cls_in[i]=(double)((i*11)%17-8)/4.0;
+      for (i=0;i<CLS_COUT*CLS_CIN*9;i++)  ws->cls_cw[i]=(double)((i*5)%11-5)/8.0;
+      for (i=0;i<CLS_NCLS*CLS_FLAT;i++)   ws->cls_fw[i]=(double)((i*7)%13-6)/16.0;
+      // GNC Kalman:恒速 2D 模型 F、位置观测 H、过程/观测噪声 Q/R、合成量测 z
+      {
+        double Fm[16]={1,0,1,0, 0,1,0,1, 0,0,1,0, 0,0,0,1};
+        double Hm[8] ={1,0,0,0, 0,1,0,0};
+        for (i=0;i<16;i++) ws->gnc_F[i]=Fm[i];
+        for (i=0;i<8;i++)  ws->gnc_H[i]=Hm[i];
+        for (i=0;i<16;i++) ws->gnc_Q[i]=(i%5==0)?0.01:0.0;     // 0.01*I
+        for (i=0;i<4;i++)  ws->gnc_R[i]=(i%3==0)?0.1:0.0;      // 0.1*I (2x2)
+        for (i=0;i<GNC_T;i++){ ws->gnc_z[i*2]=1.0*i+0.3; ws->gnc_z[i*2+1]=0.5*i-0.2; }  // 匀速目标轨迹
+      }
+      // 轨道外推:归一化圆轨道初值 r=(1,0,0), v=(0,1,0)(|v|=sqrt(mu/r))
+      ws->orb_state[0]=1.0; ws->orb_state[1]=0.0; ws->orb_state[2]=0.0;
+      ws->orb_state[3]=0.0; ws->orb_state[4]=1.0; ws->orb_state[5]=0.0;
+      // 姿态 PID:初始静止偏离参考(theta=0, omega=0, 阶跃到 1.0 rad)
+      ws->pid_state[0]=0.0; ws->pid_state[1]=0.0;
 
     }
 // 补齐内核的 live-out / QoR 配置（输出直接是 double 缓冲，无需 export 转换）
@@ -866,6 +957,15 @@ static void alloc_and_init_workspace(suite_workspace_t *ws, int scale_small) {
     ws->out_ptrs[34]=ws->h3_A;      ws->out_sizes[34]=PBM_HEAT_N*PBM_HEAT_N*PBM_HEAT_N; ws->peak_vals[34]=50.0; ws->perf_iters[34]=150;
     ws->out_ptrs[35]=ws->j1_A;      ws->out_sizes[35]=PBM_JAC1D_N;           ws->peak_vals[35]=2.0;    ws->perf_iters[35]=800;
     ws->out_ptrs[36]=ws->sd_A;      ws->out_sizes[36]=PBM_SEIDEL_N*PBM_SEIDEL_N; ws->peak_vals[36]=50.0; ws->perf_iters[36]=100;
+    ws->out_ptrs[37]=ws->cnn_out;   ws->out_sizes[37]=CNN_COUT*CNN_H*CNN_W;  ws->peak_vals[37]=10.0;   ws->perf_iters[37]=400;
+    ws->out_ptrs[38]=ws->cnn_out;   ws->out_sizes[38]=CNN_COUT*CNN_H*CNN_W;  ws->peak_vals[38]=10.0;   ws->perf_iters[38]=400;
+    ws->out_ptrs[39]=ws->cnn_out;   ws->out_sizes[39]=CNN_COUT*CNN_H*CNN_W;  ws->peak_vals[39]=10.0;   ws->perf_iters[39]=400;
+    ws->out_ptrs[40]=ws->cnn_out;   ws->out_sizes[40]=CNN_COUT*CNN_H*CNN_W;  ws->peak_vals[40]=10.0;   ws->perf_iters[40]=400;
+    ws->out_ptrs[41]=ws->cls_logits;ws->out_sizes[41]=CLS_NCLS;              ws->peak_vals[41]=50.0;   ws->perf_iters[41]=400;
+    ws->out_ptrs[42]=ws->cls_cls;   ws->out_sizes[42]=1;                     ws->peak_vals[42]=10.0;   ws->perf_iters[42]=400;
+    ws->out_ptrs[43]=ws->gnc_x;     ws->out_sizes[43]=GNC_N;                 ws->peak_vals[43]=20.0;   ws->perf_iters[43]=400;
+    ws->out_ptrs[44]=ws->orb_state; ws->out_sizes[44]=6;                     ws->peak_vals[44]=2.0;    ws->perf_iters[44]=400;
+    ws->out_ptrs[45]=ws->pid_state; ws->out_sizes[45]=2;                     ws->peak_vals[45]=1.5;    ws->perf_iters[45]=400;
     
     workspace_selfcheck(ws);
 }
@@ -1079,6 +1179,27 @@ if (g_abft_harness) {
         case 34: bench_pb_heat3d(PBM_HEAT_TSTEPS, PBM_HEAT_N, ws->h3_A, ws->h3_B); break;
         case 35: bench_pb_jacobi1d(PBM_JAC1D_TSTEPS, PBM_JAC1D_N, ws->j1_A, ws->j1_B); break;
         case 36: bench_pb_seidel2d(PBM_SEIDEL_TSTEPS, PBM_SEIDEL_N, ws->sd_A); break;
+        case 37: bench_cnn_conv(CNN_CIN, CNN_COUT, CNN_H, CNN_W,
+                                ws->cnn_in, ws->cnn_w, ws->cnn_out); break;
+        case 38: bench_cnn_conv_abft(CNN_CIN, CNN_COUT, CNN_H, CNN_W,
+                                     ws->cnn_in, ws->cnn_w, ws->cnn_out, ws->cnn_r); break;
+        case 39: bench_cnn_conv_gemm(CNN_CIN, CNN_COUT, CNN_H, CNN_W,
+                                     ws->cnn_in, ws->cnn_w, ws->cnn_out, ws->cnn_patch); break;
+        case 40: bench_cnn_conv_primitive(CNN_CIN, CNN_COUT, CNN_H, CNN_W,
+                                          ws->cnn_in, ws->cnn_w, ws->cnn_out,
+                                          ws->cnn_patch, ws->cnn_r); break;
+        case 41: bench_cnn_classifier(CLS_CIN, CLS_COUT, CLS_H, CLS_W, CLS_NCLS,
+                                      ws->cls_in, ws->cls_cw, ws->cls_fw,
+                                      ws->cls_conv, ws->cls_pool, ws->cls_logits); break;
+        case 42: bench_cnn_classifier_decision(CLS_CIN, CLS_COUT, CLS_H, CLS_W, CLS_NCLS,
+                                      ws->cls_in, ws->cls_cw, ws->cls_fw,
+                                      ws->cls_conv, ws->cls_pool, ws->cls_logits,
+                                      ws->cls_cls); break;
+        case 43: bench_gnc_kalman(GNC_N, GNC_M, GNC_T, ws->gnc_F, ws->gnc_H,
+                                  ws->gnc_Q, ws->gnc_R, ws->gnc_z, ws->gnc_x, ws->gnc_P); break;
+        case 44: bench_orbit_rk4(ORB_T, ORB_DT, ORB_MU, ws->orb_state); break;
+        case 45: bench_aocs_pid(PID_T, PID_DT, PID_REF, PID_KP, PID_KI, PID_KD,
+                                PID_UMAX, PID_INERTIA, ws->pid_state); break;
         default:
             // 注册表里新增了负载但忘了加 case：立刻失败，不要静默跑错程序
             fprintf(stderr, "[eval_suite] invoke_benchmark: benchmark %d (%s) 未实现\n",
@@ -1157,6 +1278,12 @@ static void free_workspace(suite_workspace_t *ws) {
     free(ws->h3_A); free(ws->h3_A0); free(ws->h3_B); free(ws->h3_B0);
     free(ws->j1_A); free(ws->j1_A0); free(ws->j1_B); free(ws->j1_B0);
     free(ws->sd_A); free(ws->sd_A0);
+    free(ws->cnn_in); free(ws->cnn_w); free(ws->cnn_out); free(ws->cnn_r); free(ws->cnn_patch);
+    free(ws->cls_in); free(ws->cls_cw); free(ws->cls_fw); free(ws->cls_conv);
+    free(ws->cls_pool); free(ws->cls_logits); free(ws->cls_cls);
+    free(ws->gnc_F); free(ws->gnc_H); free(ws->gnc_Q); free(ws->gnc_R);
+    free(ws->gnc_z); free(ws->gnc_x); free(ws->gnc_P);
+    free(ws->orb_state); free(ws->pid_state);
 }
 
 // ============================================================================
@@ -1256,6 +1383,10 @@ static int rangecheck_invoke(suite_workspace_t *ws, int b) {
 // 由 ATFT_COARSE_FORK=1 打开（配合 ATFT_COARSE>=2）。
 // ============================================================================
 static int g_coarse_fork = 0;
+// 检出即重执行(detect+retry):任一表决器/校验器检出不一致 → 从干净输入重跑该核一次。
+// 单发瞬态在重跑里已消失 → 结果正确 → 既不 SDC 也不 DUE。只建模单发(k=1)的首阶恢复;
+// 代价(重执行开销)由 λW 账本单独算,此处只测 SDC/DUE 分类。由 ATFT_RETRY_ON_DETECT 开启。
+static int g_retry_on_detect = 0;
 static double *g_fork_out = NULL;   // 共享：3 * cap 个 double
 static int *g_fork_done = NULL;     // 共享：3 个完成标志
 static size_t g_fork_cap = 0;
@@ -1529,16 +1660,64 @@ static void fi_run_campaign(suite_workspace_t *ws, int b, const char *policy_nam
             harness_qor_metrics_t q;
             harness_compute_qor(ws->out_sizes[b], golden_buf, ws->out_ptrs[b],
                                 ws->peak_vals[b], &q);
+            int detected = (g_atft_state.detected_faults > base_alarms);
+            // 检出即重执行:表决器/校验器检出 → 从干净输入重跑一次(关闭注入)。
+            // k=1 单发瞬态在重跑里不复存在 → 用重跑结果作最终输出。
+            if (g_retry_on_detect && detected) {
+                uint64_t zero_step = 0; uint32_t zero_bit = 0;
+                harness_fi_arm_mbu_or_burst(&zero_step, &zero_bit, 0, 1); // 解除注入
+                harness_fi_set_step_budget(st->total_dyn_insts * (uint64_t)g_cfg.budget_factor);
+                memset(ws->out_ptrs[b], 0, (size_t)ws->out_sizes[b] * sizeof(double));
+                invoke_benchmark(ws, b);
+                export_outputs(ws, b);
+                harness_compute_qor(ws->out_sizes[b], golden_buf, ws->out_ptrs[b],
+                                    ws->peak_vals[b], &q); // 以重跑结果重判
+            }
             shm->rel_l2_err     = q.rel_l2_err;
             shm->has_nan_or_inf = q.has_nan_or_inf;
-            shm->fault_detected = (g_atft_state.detected_faults > base_alarms);
-            shm->unrecoverable  = (g_atft_state.unrecoverable_faults > 0);
+            shm->fault_detected = detected;
+            shm->unrecoverable  = (g_atft_state.unrecoverable_faults > 0)
+                                   && !(g_retry_on_detect && detected);
             _exit(0);
         }
 
         int status = 0;
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
         int child_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+
+        // 父级 detect+retry：子进程崩溃/挂死(watchdog)本身就是 fail-stop 检出。
+        // 在 retry 模式下,对"崩溃"这类检出做一次干净重执行(单发瞬态已消失)。
+        // 这覆盖了 in-child retry 够不到的"中途崩溃"DUE —— cmp_branch/int_arith 的主因。
+        if (g_retry_on_detect && !child_ok) {
+            memset(shm, 0, sizeof(*shm));
+            pid_t pid2 = fork();
+            if (pid2 == 0) {
+                struct itimerval cw; memset(&cw, 0, sizeof(cw));
+                cw.it_value.tv_usec = g_cfg.watchdog_us;
+                signal(SIGALRM, SIG_DFL); setitimer(ITIMER_REAL, &cw, NULL);
+                atft_init(10000.0, 4.0, 3, 4, 3);
+                apply_delta_for_bench(bench_name(b));
+                if (strstr(policy_name, "adaptive") != NULL) g_atft_state.current_mode = ATFT_MODE_HIGH;
+                uint64_t zero_step = 0; uint32_t zero_bit = 0;
+                harness_fi_reset_profile();
+                harness_fi_arm_mbu_or_burst(&zero_step, &zero_bit, 0, 1); // 干净重跑,无注入
+                harness_fi_set_step_budget(st->total_dyn_insts * (uint64_t)g_cfg.budget_factor);
+                memset(ws->out_ptrs[b], 0, (size_t)ws->out_sizes[b] * sizeof(double));
+                invoke_benchmark(ws, b);
+                export_outputs(ws, b);
+                harness_qor_metrics_t q2;
+                harness_compute_qor(ws->out_sizes[b], golden_buf, ws->out_ptrs[b],
+                                    ws->peak_vals[b], &q2);
+                shm->rel_l2_err     = q2.rel_l2_err;
+                shm->has_nan_or_inf = q2.has_nan_or_inf;
+                shm->fault_detected = 1;   // 崩溃即检出 → 重执行成功计为 det_rec
+                shm->unrecoverable  = 0;
+                _exit(0);
+            }
+            int st2 = 0;
+            while (waitpid(pid2, &st2, 0) < 0 && errno == EINTR) { }
+            child_ok = WIFEXITED(st2) && WEXITSTATUS(st2) == 0;  // 重跑仍崩 → 真 DUE
+        }
         fi_stats_accumulate(st, b, child_ok, shm);
     }
 
@@ -1572,6 +1751,7 @@ static int run_standard_one_fault_fi(const char *policy_name, const char *golden
     { const char *cs = getenv("ATFT_COARSE"); g_coarse_n = cs ? atoi(cs) : 0; }
     { const char *rk = getenv("ATFT_RANGECHECK"); g_rangecheck_k = rk ? atof(rk) : 0.0; }
     { const char *ck = getenv("ATFT_COARSE_FORK"); g_coarse_fork = ck ? atoi(ck) : 0; }
+    { const char *rt = getenv("ATFT_RETRY_ON_DETECT"); g_retry_on_detect = rt ? atoi(rt) : 0; }
     install_crash_handlers();
 
     for (int b = 0; b < NUM_BENCHES; b++) {
@@ -1723,41 +1903,31 @@ static int run_bitfield_sensitivity(const char *policy_name) {
         fi_stats_t agg;
         memset(&agg, 0, sizeof(agg));
         bitfield_ctx_t ctx = { f };
-
         for (int bi = 0; bi < n_targets; bi++) {
             int b = targets[bi];
             fi_stats_t st;
             uint64_t seed = 0x55aa55aa12345678ULL ^ ((uint64_t)(f * 17 + b) << 24);
             fi_run_campaign(&ws, b, policy_name, trials_per_bench, seed,
                             pick_bitfield, &ctx, &st);
-            agg.trials += st.trials;
-            agg.masked += st.masked;
-            agg.det_rec += st.det_rec;
-            agg.benign += st.benign;
-            agg.sdc += st.sdc;
-            agg.due += st.due;
+            agg.trials += st.trials; agg.masked += st.masked; agg.det_rec += st.det_rec;
+            agg.benign += st.benign; agg.sdc += st.sdc; agg.due += st.due;
         }
-
         int denom = agg.trials > 0 ? agg.trials : 1;
         printf("BITFIELD_CSV,%s,%s,%d,%.2f,%.2f,%.2f,%.2f,%.2f\n",
                policy_name, field_names[f], agg.trials,
-               100.0 * agg.masked / denom,
-               100.0 * agg.det_rec / denom,
-               100.0 * agg.benign / denom,
-               100.0 * agg.sdc / denom,
+               100.0 * agg.masked / denom, 100.0 * agg.det_rec / denom,
+               100.0 * agg.benign / denom, 100.0 * agg.sdc / denom,
                100.0 * agg.due / denom);
     }
-
     free_workspace(&ws);
     return 0;
 }
-
 // ============================================================================
 // 模式 5 (RQ6): 空间多比特翻转 (Spatial MBU: 1/2/4-bit) 与时间窗口连续故障冲击
 // ============================================================================
 typedef struct {
-    uint32_t mbu_width;   // 空间多比特宽度：1=SEU, 2=DBU, 4=QBU
-    int      k_events;    // 时间维连发故障数
+    uint32_t mbu_width;
+    int      k_events;
 } stress_ctx_t;
 
 static void pick_stress(uint64_t *rng, uint64_t total_dyn,
@@ -1769,7 +1939,6 @@ static void pick_stress(uint64_t *rng, uint64_t total_dyn,
     out->mbu_width = c->mbu_width > 0 ? c->mbu_width : 1;
     for (int e = 0; e < k; e++) {
         out->steps[e] = 1 + (splitmix64(rng) % total_dyn);
-        // MBU 模式下基位要留出相邻宽度的空间，故限制在 [0,60)
         out->bits[e]  = (uint32_t)(splitmix64(rng) % (out->mbu_width > 1 ? 60 : 64));
     }
 }
@@ -1793,9 +1962,20 @@ static int run_mbu_and_burst_stress(const char *policy_name) {
     { const char *cs = getenv("ATFT_COARSE"); g_coarse_n = cs ? atoi(cs) : 0; }
     { const char *rk = getenv("ATFT_RANGECHECK"); g_rangecheck_k = rk ? atof(rk) : 0.0; }
     { const char *ck = getenv("ATFT_COARSE_FORK"); g_coarse_fork = ck ? atoi(ck) : 0; }
+    { const char *rt = getenv("ATFT_RETRY_ON_DETECT"); g_retry_on_detect = rt ? atoi(rt) : 0; }
 
     int targets[NUM_BENCHES];
     int n_targets = bench_select_tagged(BTAG_REPR, targets, NUM_BENCHES);
+    {   // 若设 ATFT_BENCH_SUBSET,直接按子集从全部负载选(不限 BTAG_REPR),
+        // 这样可受控地 stress 任意单核(如 gnc_kalman),且不污染默认聚合口径。
+        init_bench_subset();
+        if (g_subset_active) {
+            int m = 0;
+            for (int b = 0; b < NUM_BENCHES; b++)
+                if (bench_in_subset(b)) targets[m++] = b;
+            if (m > 0) n_targets = m;
+        }
+    }
 
     // 每个负载的试验数与 k 的取值都可配：P(F|n) 的置信区间宽度直接取决于
     // 试验数，而 n 的采样点决定 Ostler 求和的插值精度。

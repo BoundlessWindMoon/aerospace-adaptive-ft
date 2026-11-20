@@ -147,6 +147,52 @@ uint16_t bench_coast_crc16(const unsigned char *data, unsigned char length);
 
 void bench_coast_quicksort(int32_t *arr, int n);
 
+// ---- Suite G: MobileNet-class CNN 推理(conv2d 3x3 same-pad + ReLU, FP64 可向量化) ----
+//   代表当代星载 AI 推理负载;对齐 SiFive X280 官方基准(MobileNet VLEN=512)的算子类型。
+void bench_cnn_conv(int cin, int cout, int h, int w,
+                    const double *in, const double *weights, double *out);
+
+// 同一算子的 ABFT/Freivalds 结构化保护版:conv=matmul,随机投影校验 O(n²) 远低于复制;
+// 不一致则重算一次(检测+恢复)。rvec 长度 h*w。
+void bench_cnn_conv_abft(int cin, int cout, int h, int w,
+                         const double *in, const double *weights, double *out,
+                         const double *rvec);
+
+// conv 的 GEMM 下沉形式(im2col + 规范 C=A·B + ReLU),让通用 GEMM ABFT 自动检测器命中。
+void bench_cnn_conv_gemm(int cin, int cout, int h, int w,
+                         const double *in, const double *weights, double *out,
+                         double *patch);
+
+// 通用受保护 GEMM 原语 + conv 经 im2col 路由到它(方案 b)。
+void atft_abft_gemm(int M, int N, int K, const double *A, const double *B,
+                    double *C, const double *r, double tol);
+void bench_cnn_conv_primitive(int cin, int cout, int h, int w,
+                              const double *in, const double *weights, double *out,
+                              double *patch, const double *r);
+
+// 端到端 CNN 分类器(conv+ReLU+maxpool+fc)+ decision(argmax)版。
+void bench_cnn_classifier(int cin, int cout, int h, int w, int ncls,
+                          const double *in, const double *cw, const double *fw,
+                          double *conv_tmp, double *pool_tmp, double *logits);
+void bench_cnn_classifier_decision(int cin, int cout, int h, int w, int ncls,
+                                   const double *in, const double *cw, const double *fw,
+                                   double *conv_tmp, double *pool_tmp, double *logits,
+                                   double *cls_out);
+
+// 真实空天 GNC:线性 Kalman 滤波状态估计(敏感端,持久状态)。
+void bench_gnc_kalman(int n, int m, int T,
+                      const double *F, const double *H, const double *Q, const double *R,
+                      const double *zseq, double *x, double *P);
+
+// 真实空天 GNC:二体轨道外推(开环 RK4 积分,无反馈 → 误差累积,极敏感)。
+// state[6]={x,y,z,vx,vy,vz};mu 引力常数;dt 步长;T 步。输出最终 6 维状态。
+void bench_orbit_rk4(int T, double dt, double mu, double *state);
+
+// 真实空天 AOCS:单轴姿态 PID 控制回路+作动器饱和(闭环 → 自纠,鲁棒)。
+// state[2]={theta,omega};ref 目标角;T 步。输出最终 [theta,omega]。
+void bench_aocs_pid(int T, double dt, double ref, double Kp, double Ki, double Kd,
+                    double umax, double inertia, double *state);
+
 #ifdef __cplusplus
 }
 #endif

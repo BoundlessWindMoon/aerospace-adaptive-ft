@@ -171,10 +171,19 @@ static bool isAddrSite(Instruction *I) {
   return idx->getType()->isIntegerTy(32) || idx->getType()->isIntegerTy(64);
 }
 
+// 盲注入模式:忽略 atft.voter.internal 豁免,让故障也能打到 pass 插入的保护代码
+// (voter / 代数校验 / cmp-DMR),对齐 SASSIFI/LLFI 的"全程序均匀注入"口径,
+// 测得出保护机制自身被打中时的真实残余。默认关闭(保持冻结实验口径)。
+static cl::opt<bool> FiBlind(
+    "fi-blind",
+    cl::desc("Blind injection: do NOT exempt protection code (atft.voter.internal); "
+             "inject uniformly across the whole program incl. FT mechanisms (SASSIFI/LLFI style)"),
+    cl::init(false));
+
 // 唯一的分类入口：按指令种类定优先级，保证互斥
 FiCategory classifyFaultSite(Instruction *I) {
   if (!I || isa<PHINode>(I)) return FIC_NONE;
-  if (I->getMetadata("atft.voter.internal") != nullptr) return FIC_NONE;
+  if (!FiBlind && I->getMetadata("atft.voter.internal") != nullptr) return FIC_NONE;
 
   if (isAddrSite(I))                              return FIC_ADDR;
   if (isa<LoadInst>(I))
@@ -182,7 +191,9 @@ FiCategory classifyFaultSite(Instruction *I) {
   if (isCastOp(I))
     return isHookableTy(I->getType()) ? FIC_CAST : FIC_NONE;
   if (isa<ICmpInst>(I) || isa<FCmpInst>(I))
-    return cmpDrivesControlFlow(I) ? FIC_CMP_BRANCH : FIC_NONE;
+    // 仅标量 i1 分支条件算控制流注入点；向量谓词(<N x i1>，向量化 select 的掩码)
+    // 不是控制流、且标量翻转注入器处理不了向量 → 排除，避免生成坏 IR。
+    return (!I->getType()->isVectorTy() && cmpDrivesControlFlow(I)) ? FIC_CMP_BRANCH : FIC_NONE;
 
   if (I->isBinaryOp() || I->isUnaryOp()) {
     Type *ty = I->getType();

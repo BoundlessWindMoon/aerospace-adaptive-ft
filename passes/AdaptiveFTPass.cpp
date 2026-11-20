@@ -76,6 +76,11 @@ static cl::opt<double> AtftBudget(
     cl::desc("Selective protection budget ratio in [0.0, 1.0]"),
     cl::init(1.0));
 
+static cl::opt<std::string> AtftVulnCache(
+    "atft-vuln-cache",
+    cl::desc("CSV (site_key,sdc) of FI-measured vulnerability; enables -atft-rank=fi-cache"),
+    cl::init(""));
+
 static cl::opt<std::string> AtftBudgetMode(
     "atft-budget-mode",
     cl::desc("Budget selector: count | dynamic-cost | risk-cost"),
@@ -171,6 +176,88 @@ static cl::opt<bool> AtftCmpTMR(
     "atft-cmp-tmr",
     cl::desc("Triplicate control-flow-driving compares and majority-vote them"),
     cl::init(false));
+
+// 控制平面双模检错：比较只复制一份、不一致置检测标志(交系统级回滚),不就地多数决。
+// 对"分支判决翻转"故障模型,检错+回滚即够(空天口径),比三模省一份比较+整个 select 网络。
+// CFCSS 式签名法对本故障模型无效(它抓非法 CFG 边,抓不住走错的合法分支),故走复制检错。
+static cl::opt<bool> AtftCmpDMR(
+    "atft-cmp-dmr",
+    cl::desc("Control plane: duplicate control-flow compares and detect (commit flag for "
+             "rollback) instead of triplicate+majority. Cheaper, detect-only."),
+    cl::init(false));
+
+// 地址平面结构型保护(PRESAGE/FailAmp 思路):不复制整条整数通路,只复制**喂给 GEP 的
+// 下标的后向切片**,在 GEP 处比对、检错交回滚。利用"地址来自仿射/结构化下标"这一结构,
+// 比全整数三模便宜(只碰地址切片、双份而非三份、无多数决网络)。检错口径,配合回滚。
+static cl::opt<bool> AtftAddrDMR(
+    "atft-addr-dmr",
+    cl::desc("Address plane: duplicate only the GEP-index backward-slice and detect at the "
+             "GEP (structure-aware, cheaper than full integer TMR)"),
+    cl::init(false));
+
+// correct-before-use:对喂给 GEP 下标的整数做 TMR 取中值,在访存发生前用中值替换下标,
+// 把"坏下标→越界→崩溃(DUE)"在源头掐掉(而非 detect-only 事后记录)。
+static cl::opt<bool> AtftAddrCorrect(
+    "atft-addr-correct",
+    cl::desc("Address plane: TMR-median the GEP index and substitute before use "
+             "(prevents out-of-bounds crashes / DUE, not just detect)"),
+    cl::init(false));
+
+// 整数数据平面:复制流向整数 store/return 的值的后向切片,store 处检错。补 addr-DMR 漏的整数数据。
+static cl::opt<bool> AtftIntDataDMR(
+    "atft-int-data-dmr",
+    cl::desc("Integer data plane: duplicate backward-slice of values feeding integer "
+             "stores/returns and detect at the store"),
+    cl::init(false));
+
+// 整数数据平面的选择性预算(Shoestring 思路):只保护 SDC 关键度最高的那部分整数 store,
+// 其余靠症状(越界崩溃=DUE→回滚)自现。<1 则按关键度排序取 top 比例。实测整数故障本就
+// ~半数直接崩溃(DUE 50.9%),故静默 SDC 只集中在少数不经症状直达输出的值上。
+static cl::opt<double> AtftIntDataBudget(
+    "atft-int-data-budget",
+    cl::desc("Fraction of integer stores to protect, ranked by SDC criticality (<1 = selective)"),
+    cl::init(1.0));
+
+// 层③·整数编码:沿环运算(+,−,×)携带残差码 r=v mod M,store 处比 (v mod M)==r。
+// 检测的是环运算链上的计算故障(非复制,是编码检查);非环运算(位运算/比较/load)处
+// 残差链断开、重编码,那些点不被码保护。AN/残差码是整数软错误的领域首选(TRUMP 用其替代多数决)。
+static cl::opt<bool> AtftIntResidue(
+    "atft-int-residue",
+    cl::desc("Integer data: carry a residue (mod M) arithmetic code through ring ops "
+             "(+,-,*) and check at stores (layer-3 encoding, not duplication)"),
+    cl::init(false));
+
+// 层②·load(内存层级冗余):对整数数据 load 做独立 launder 二次读 + 比对(nZDC 式)。
+// 利用"值在内存/cache 有冗余副本"这一结构抓 load 结果/LSU 瞬态;内存阵列翻转假设由 ECC 兜底。
+static cl::opt<bool> AtftLoadReload(
+    "atft-load-reload",
+    cl::desc("Load (memory-hierarchy redundancy): independent laundered reload + compare for "
+             "integer data loads (nZDC-style; memory-array flips assumed ECC-covered)"),
+    cl::init(false));
+
+// 复用 TRIDENT(Li et al., DSN'18)的方法:输出锚定的误差传播,免 FI 估每条指令的 SDC
+// 到达概率(带屏蔽模型:比较/截断/逻辑会屏蔽故障)。纯分析,输出 CSV,不改代码。
+static cl::opt<std::string> AtftTridentRank(
+    "atft-trident-rank",
+    cl::desc("TRIDENT-style analytical SDC reachability ranking (output-anchored, masking-aware); "
+             "writes per-instruction weight CSV to this path. Analysis only."),
+    cl::init(""));
+
+
+// 层①·分支(循环控制):仿射循环结束后归纳变量必等于上界(与路径无关的结构不变量)。
+// 判决翻转→早退/多跑→i≠N→检出。保守只处理 slt/ult + 步长+1 的规范循环,避免假阳。
+// 依据:Goloubeva CFA(2003)、ASU 低成本检测器(10% 开销换 90% SDC)。
+static cl::opt<bool> AtftLoopAssert(
+    "atft-loop-assert",
+    cl::desc("Branch (loop control): assert the affine loop's induction variable equals its "
+             "bound at exit (path-independent structural invariant)"),
+    cl::init(false));
+
+
+
+
+
+
 
 // D3 表决阈值改为运行期逐负载值：表决器读全局 g_atft_delta_abs（由剖析结果填），
 // 而不是把 -atft-delta 的编译期常数烧进去
@@ -389,6 +476,51 @@ bool isTargetMathCall(Instruction *I) {
 // ============================================================================
 // 模块 1: 关键性排序算法实现 (含 HotPath, Shoestring [ASPLOS'10], SDCTune [CASES'14], Semantic)
 // ============================================================================
+
+// fi-cache 排名:site_key -> FI 实测 SDC(%)。由 -atft-vuln-cache 指向的合并 CSV 填充,
+// 第一次运行由 vuln_cache.py 定点注入测量得到,之后直接复用,无需再注错。
+static std::map<std::string, double> g_atftVulnCache;
+static bool g_atftVulnCacheLoaded = false;
+
+static void loadAtftVulnCache(const std::string &path) {
+  g_atftVulnCache.clear();
+  g_atftVulnCacheLoaded = true;
+  std::ifstream in(path);
+  if (!in.is_open()) {
+    errs() << "ATFT_VULN_CACHE_ERROR," << path << "\n";
+    return;
+  }
+  std::string line;
+  bool header = true;
+  size_t n = 0;
+  while (std::getline(in, line)) {
+    if (header) { header = false; continue; }  // 跳过 site_key,sdc 表头
+    size_t comma = line.rfind(',');
+    if (comma == std::string::npos) continue;
+    std::string key = line.substr(0, comma);
+    if (key.empty()) continue;                 // 空 key(O3 后合成的控制/地址整数op)不在保护域
+    double sdc = atof(line.substr(comma + 1).c_str());
+    // 同一 key 取最大 SDC(保守:按最坏脆弱性排)
+    auto it = g_atftVulnCache.find(key);
+    if (it == g_atftVulnCache.end() || sdc > it->second) g_atftVulnCache[key] = sdc;
+    ++n;
+  }
+  errs() << "ATFT_VULN_CACHE," << path << ",keys=" << g_atftVulnCache.size()
+         << ",rows=" << n << "\n";
+}
+
+static double atftVulnCacheScore(const Instruction *I) {
+  if (MDNode *N = I->getMetadata("atft.site.key")) {
+    if (N->getNumOperands() > 0) {
+      if (auto *S = dyn_cast<MDString>(N->getOperand(0))) {
+        auto it = g_atftVulnCache.find(S->getString().str());
+        if (it != g_atftVulnCache.end()) return it->second;
+      }
+    }
+  }
+  return -1.0;  // 未命中:cache 里没这条(含空 key 的 O3 合成 op)
+}
+
 std::map<const Instruction *, double>
 computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &rankMethod) {
   std::queue<const Instruction *> bfsQueue;
@@ -490,7 +622,12 @@ computeInstructionCriticalityMap(Function &F, LoopInfo &LI, const std::string &r
       else if (I.getOpcode() == Instruction::FMul) opAmp = 1.8;
 
       double s = 0.0;
-      if (rankMethod == "hotpath" || rankMethod == "loop-only") {
+      if (rankMethod == "fi-cache") {
+        // 本课题 B 机制:直接用 FI 实测脆弱性缓存排名。命中的站点按实测 SDC 排,
+        // 未命中(含 O3 合成的控制/地址整数op)压到负分区,用 closeness 稳定次序。
+        double v = atftVulnCacheScore(&I);
+        s = (v >= 0.0) ? (1000.0 + v) : (0.001 * closeness);
+      } else if (rankMethod == "hotpath" || rankMethod == "loop-only") {
         // HotPath (Lu et al.): 纯按动态执行频率 (10^depth) 与程序早期出现顺序排序
         s = std::pow(10.0, (double)depth) - 0.05 * (double)idx;
       } else if (rankMethod == "shoestring") {
@@ -1752,11 +1889,39 @@ void transformFunctionCmpTMR(Function &F, unsigned *outProtected,
   std::set<Instruction *> selectedControls =
       selectInstructionsByBudget(controlCandidates, controlScores, controlBudget);
 
+  // DMR 检错模式:入口建签名 alloca,每条被选比较把"与影子不一致"累进去,返回前提交。
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  AllocaInst *cmpSig = nullptr;
+  FunctionCallee CmpCommitFn;
+  if (AtftCmpDMR) {
+    IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+    cmpSig = EB.CreateAlloca(I64Ty, nullptr, "atft.cmp.sig");
+    EB.CreateStore(ConstantInt::get(I64Ty, 0), cmpSig);
+    CmpCommitFn = M->getOrInsertFunction("atft_loop_vote_commit",
+                                         Type::getVoidTy(Ctx), I32Ty);
+  }
+
   for (CmpInst *CI : targets) {
     if (!selectedControls.count(CI)) continue;
     Instruction *insertPt = CI->getNextNode();
     if (!insertPt) continue;
     IRBuilder<> IRB(insertPt);
+
+    if (AtftCmpDMR) {
+      // 单份影子比较 + 不一致累进签名(检错,不改分支用的原比较 → 走回滚)
+      int isoIdx = isa<Constant>(CI->getOperand(0)) ? 1 : 0;
+      Value *a = (isoIdx == 0) ? insertZeroCostCSEBarrier(IRB, CI->getOperand(0))
+                               : CI->getOperand(0);
+      Value *b = (isoIdx == 1) ? insertZeroCostCSEBarrier(IRB, CI->getOperand(1))
+                               : CI->getOperand(1);
+      Value *rep = IRB.CreateCmp(CI->getPredicate(), a, b, CI->getName() + ".dmr");
+      markReplica(rep);
+      Value *diff = IRB.CreateZExt(IRB.CreateICmpNE(CI, rep), I64Ty, "cmp.diff");
+      IRB.CreateStore(IRB.CreateOr(IRB.CreateLoad(I64Ty, cmpSig), diff), cmpSig);
+      if (outProtected) (*outProtected)++;
+      continue;
+    }
 
     std::set<Value *> created;
     auto isolate = [&](Value *v) -> Value * {
@@ -1805,7 +1970,464 @@ void transformFunctionCmpTMR(Function &F, unsigned *outProtected,
     });
     if (outProtected) (*outProtected)++;
   }
+
+  // DMR 模式:返回前提交签名(ok=1 一致 / 0 检出不一致 → 系统级回滚)
+  if (AtftCmpDMR && cmpSig) {
+    for (BasicBlock &BB : F) {
+      auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+      if (!RI) continue;
+      IRBuilder<> B(RI);
+      Value *ok = B.CreateICmpEQ(B.CreateLoad(I64Ty, cmpSig), ConstantInt::get(I64Ty, 0));
+      B.CreateCall(CmpCommitFn, {B.CreateZExt(ok, I32Ty)});
+    }
+  }
 }
+
+// 整数后向切片影子构造器:沿整数 load/phi/binop/cast/select 往回复制一份独立影子,
+// 叶子(常量/参数/非整数/call)共用。load 走指针 launder 防 CSE 折叠。addr/data 两种 DMR 共用。
+static bool atftIsIntTy(Type *T) {
+  return T->isIntegerTy(8) || T->isIntegerTy(16) ||
+         T->isIntegerTy(32) || T->isIntegerTy(64);
+}
+static Value *atftBuildIntShadow(Value *v, DenseMap<Value *, Value *> &shadow) {
+  auto it = shadow.find(v);
+  if (it != shadow.end()) return it->second;
+  auto *I = dyn_cast<Instruction>(v);
+  if (!I || !atftIsIntTy(v->getType())) { shadow[v] = v; return v; }  // 叶子:共用
+  if (auto *PN = dyn_cast<PHINode>(I)) {                              // 先插空 phi 断环
+    IRBuilder<> B(PN);
+    PHINode *sp = B.CreatePHI(PN->getType(), PN->getNumIncomingValues(), "atft.int.phi");
+    shadow[v] = sp;
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+      sp->addIncoming(atftBuildIntShadow(PN->getIncomingValue(i), shadow),
+                      PN->getIncomingBlock(i));
+    return sp;
+  }
+  if (auto *LD = dyn_cast<LoadInst>(I)) {                             // 独立 launder 二次 load
+    IRBuilder<> B(LD->getNextNode());
+    Value *ptr = LD->getPointerOperand();
+    InlineAsm *pbar = InlineAsm::get(
+        FunctionType::get(ptr->getType(), {ptr->getType()}, false), "", "=r,0", true);
+    Value *p = B.CreateCall(pbar, {ptr});
+    Value *s = B.CreateAlignedLoad(LD->getType(), p, LD->getAlign(), "atft.int.ld");
+    shadow[v] = s;
+    return s;
+  }
+  if (I->isBinaryOp() || isa<CastInst>(I) || isa<SelectInst>(I)) {    // 克隆并重映射整数操作数
+    Instruction *cl = I->clone();
+    for (unsigned k = 0; k < cl->getNumOperands(); ++k)
+      if (atftIsIntTy(I->getOperand(k)->getType()))
+        cl->setOperand(k, atftBuildIntShadow(I->getOperand(k), shadow));
+    cl->insertAfter(I);
+    cl->setName("atft.int.sh");
+    shadow[v] = cl;
+    return cl;
+  }
+  shadow[v] = v;  // 其它(call 等)不复制,当叶子
+  return v;
+}
+
+// 整数三数取中值 median(a,b,c) = max(min(a,b), min(max(a,b), c))。
+// 任一单份被翻则被另两份多数盖掉(TMR 纠正)。
+static Value *atftIntMedian3(IRBuilder<> &B, Value *a, Value *b, Value *c) {
+  Value *abLt = B.CreateICmpSLT(a, b);
+  Value *mn = B.CreateSelect(abLt, a, b);
+  Value *mx = B.CreateSelect(abLt, b, a);
+  Value *mxc = B.CreateSelect(B.CreateICmpSLT(mx, c), mx, c);     // min(max(a,b), c)
+  return B.CreateSelect(B.CreateICmpSGT(mn, mxc), mn, mxc);       // max(min(a,b), that)
+}
+
+// 地址平面结构型保护:只复制喂给 GEP 的下标后向切片,GEP 处比对检错。
+void transformFunctionAddrDMR(Function &F) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  FunctionCallee CommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+
+  std::vector<std::pair<GetElementPtrInst *, Value *>> idxSites;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *G = dyn_cast<GetElementPtrInst>(&I))
+        for (Use &op : G->indices())
+          if (!isa<Constant>(op.get()) && atftIsIntTy(op.get()->getType()))
+            idxSites.push_back({G, op.get()});
+  if (idxSites.empty()) return;
+
+  IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *sig = EB.CreateAlloca(I64Ty, nullptr, "atft.addr.sig");
+  EB.CreateStore(ConstantInt::get(I64Ty, 0), sig);
+
+  DenseMap<Value *, Value *> shadow;
+  DenseMap<Value *, Value *> shadow2;   // 第二份独立影子(correct 模式下用于 TMR 取中)
+  unsigned nSites = 0, nCorrected = 0;
+  for (auto &pr : idxSites) {
+    GetElementPtrInst *G = pr.first;
+    Value *idx = pr.second;
+    Value *s = atftBuildIntShadow(idx, shadow);
+    if (s == idx) continue;
+    IRBuilder<> B(G);
+    Value *diff = B.CreateZExt(B.CreateICmpNE(idx, s), I64Ty, "addr.diff");
+    B.CreateStore(B.CreateXor(B.CreateLoad(I64Ty, sig), diff), sig);
+    ++nSites;
+    // correct-before-use:第二份独立影子 + 三数取中,用中值替换本 GEP 的下标操作数,
+    // 让坏下标在越界访问发生前就被多数盖掉 → 防 DUE。
+    if (AtftAddrCorrect) {
+      Value *s2 = atftBuildIntShadow(idx, shadow2);
+      if (s2 != idx) {
+        Value *med = atftIntMedian3(B, idx, s, s2);
+        for (unsigned k = 1; k < G->getNumOperands(); ++k)   // 跳过指针操作数 0
+          if (G->getOperand(k) == idx) G->setOperand(k, med);
+        ++nCorrected;
+      }
+    }
+  }
+  if (!nSites) return;
+  for (BasicBlock &BB : F) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI) continue;
+    IRBuilder<> B(RI);
+    Value *ok = B.CreateICmpEQ(B.CreateLoad(I64Ty, sig), ConstantInt::get(I64Ty, 0));
+    B.CreateCall(CommitFn, {B.CreateZExt(ok, I32Ty)});
+  }
+  errs() << "ATFT_ADDR_DMR," << F.getName().str() << "," << nSites
+         << (AtftAddrCorrect ? (",corrected=" + std::to_string(nCorrected)) : "") << "\n";
+}
+
+// 整数数据平面:复制流向整数 store/return 的值的后向切片,在 store 处比对检错。
+// 跟随的是"值"而非地址(不穿过 GEP/指针),补 addr-DMR 漏掉的整数数据 load/arith。
+// budget<1 时按 SDC 关键度选 top 比例的 store,其余靠症状(崩溃)自现(Shoestring 思路)。
+void transformFunctionIntDataDMR(Function &F, const std::string &rankMethod, double budget) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  FunctionCallee CommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+
+  std::vector<StoreInst *> intStores;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        if (atftIsIntTy(SI->getValueOperand()->getType()) &&
+            !isa<Constant>(SI->getValueOperand()))
+          intStores.push_back(SI);
+  if (intStores.empty()) return;
+
+  // 选择性:按 store 值的关键度排序,取 top budget 比例
+  std::set<StoreInst *> selected;
+  if (budget >= 0.999) {
+    selected.insert(intStores.begin(), intStores.end());
+  } else {
+    DominatorTree DT(F);
+    LoopInfo LI(DT);
+    auto scores = computeInstructionCriticalityMap(F, LI, rankMethod);
+    std::vector<Instruction *> cand;
+    std::map<Instruction *, StoreInst *> back;
+    for (StoreInst *SI : intStores)
+      if (auto *vi = dyn_cast<Instruction>(SI->getValueOperand())) {
+        cand.push_back(vi);
+        back[vi] = SI;
+      }
+    auto sel = selectInstructionsByBudget(cand, scores, budget);
+    for (Instruction *vi : sel)
+      if (back.count(vi)) selected.insert(back[vi]);
+  }
+  if (selected.empty()) return;
+
+  IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *sig = EB.CreateAlloca(I64Ty, nullptr, "atft.intd.sig");
+  EB.CreateStore(ConstantInt::get(I64Ty, 0), sig);
+
+  DenseMap<Value *, Value *> shadow;
+  unsigned nSites = 0;
+  for (StoreInst *SI : intStores) {
+    if (!selected.count(SI)) continue;
+    Value *val = SI->getValueOperand();
+    Value *s = atftBuildIntShadow(val, shadow);
+    if (s == val) continue;
+    IRBuilder<> B(SI);
+    Value *diff = B.CreateZExt(B.CreateICmpNE(val, s), I64Ty, "intd.diff");
+    B.CreateStore(B.CreateXor(B.CreateLoad(I64Ty, sig), diff), sig);
+    ++nSites;
+  }
+  if (!nSites) return;
+  for (BasicBlock &BB : F) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI) continue;
+    IRBuilder<> B(RI);
+    Value *ok = B.CreateICmpEQ(B.CreateLoad(I64Ty, sig), ConstantInt::get(I64Ty, 0));
+    B.CreateCall(CommitFn, {B.CreateZExt(ok, I32Ty)});
+  }
+  errs() << "ATFT_INTDATA_DMR," << F.getName().str() << "," << nSites << "\n";
+}
+
+// 层③·整数残差码:沿 +,−,× 携带 r=v mod M,store 处比 (v mod M)==r。检测环运算链上的计算故障。
+void transformFunctionIntResidue(Function &F) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  FunctionCallee CommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+  const int64_t MOD = 65521;  // 最大的 < 2^16 素数,乘积在 i64 内不溢出
+  Constant *MODC = ConstantInt::get(I64Ty, MOD);
+
+  auto afterPt = [](Instruction *I) -> Instruction * {
+    return isa<PHINode>(I) ? &*I->getParent()->getFirstInsertionPt() : I->getNextNode();
+  };
+  auto norm = [&](IRBuilder<> &B, Value *x) {            // 归一到 [0,M):((x%M)+M)%M
+    Value *m = B.CreateSRem(x, MODC);
+    return B.CreateSRem(B.CreateAdd(m, MODC), MODC);
+  };
+
+  DenseMap<Value *, Value *> resid;
+  std::function<Value *(Value *)> res = [&](Value *v) -> Value * {
+    auto it = resid.find(v);
+    if (it != resid.end()) return it->second;
+    auto *I = dyn_cast<Instruction>(v);
+    auto encode = [&](Value *val) -> Value * {           // 叶子/断链:r = val mod M(重编码)
+      Instruction *ip = I ? afterPt(I) : &*F.getEntryBlock().getFirstInsertionPt();
+      IRBuilder<> B(ip);
+      return norm(B, B.CreateSExtOrTrunc(val, I64Ty));
+    };
+    if (!I || !atftIsIntTy(v->getType())) { Value *r = encode(v); resid[v] = r; return r; }
+    unsigned op = I->getOpcode();
+    if (op == Instruction::Add || op == Instruction::Sub || op == Instruction::Mul) {
+      Value *ra = res(I->getOperand(0)), *rb = res(I->getOperand(1));
+      IRBuilder<> B(afterPt(I));
+      Value *raw = (op == Instruction::Mul) ? B.CreateMul(ra, rb)
+                 : (op == Instruction::Add) ? B.CreateAdd(ra, rb)
+                                            : B.CreateSub(ra, rb);
+      Value *r = norm(B, raw);
+      resid[v] = r; return r;
+    }
+    Value *r = encode(v); resid[v] = r; return r;         // 非环运算:链断开,重编码(此点不受码保护)
+  };
+
+  std::vector<StoreInst *> intStores;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        if (atftIsIntTy(SI->getValueOperand()->getType()) && !isa<Constant>(SI->getValueOperand()))
+          intStores.push_back(SI);
+  if (intStores.empty()) return;
+
+  IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *sig = EB.CreateAlloca(I64Ty, nullptr, "atft.res.sig");
+  EB.CreateStore(ConstantInt::get(I64Ty, 0), sig);
+  unsigned n = 0;
+  for (StoreInst *SI : intStores) {
+    Value *val = SI->getValueOperand();
+    Value *rv = res(val);
+    IRBuilder<> B(SI);
+    Value *vm = norm(B, B.CreateSExtOrTrunc(val, I64Ty));
+    Value *diff = B.CreateZExt(B.CreateICmpNE(vm, rv), I64Ty, "res.diff");
+    B.CreateStore(B.CreateXor(B.CreateLoad(I64Ty, sig), diff), sig);
+    ++n;
+  }
+  if (!n) return;
+  for (BasicBlock &BB : F) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI) continue;
+    IRBuilder<> B(RI);
+    Value *ok = B.CreateICmpEQ(B.CreateLoad(I64Ty, sig), ConstantInt::get(I64Ty, 0));
+    B.CreateCall(CommitFn, {B.CreateZExt(ok, I32Ty)});
+  }
+  errs() << "ATFT_INT_RESIDUE," << F.getName().str() << "," << n << "\n";
+}
+
+// 层①·分支:仿射循环退出时 IV==bound 的结构不变量断言。
+void transformFunctionLoopIndexAssert(Function &F) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  FunctionCallee CommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+
+  std::vector<Loop *> loops(LI.begin(), LI.end());
+  for (size_t i = 0; i < loops.size(); ++i)
+    for (Loop *sub : *loops[i]) loops.push_back(sub);
+
+  // 规范归纳:header 里的 PHI,latch 入边 = add(phi, 1)
+  auto inductionStep1 = [](PHINode *PN, Loop *L) -> bool {
+    BasicBlock *latch = L->getLoopLatch();
+    if (!latch) return false;
+    auto *lv = dyn_cast<BinaryOperator>(PN->getIncomingValueForBlock(latch));
+    if (!lv || lv->getOpcode() != Instruction::Add) return false;
+    Value *other = (lv->getOperand(0) == PN) ? lv->getOperand(1)
+                 : (lv->getOperand(1) == PN) ? lv->getOperand(0) : nullptr;
+    auto *c = dyn_cast<ConstantInt>(other);
+    return c && c->equalsInt(1);
+  };
+
+  IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *sig = EB.CreateAlloca(I64Ty, nullptr, "atft.lpa.sig");
+  EB.CreateStore(ConstantInt::get(I64Ty, 0), sig);
+
+  unsigned n = 0;
+  for (Loop *L : loops) {
+    BasicBlock *exiting = L->getExitingBlock();
+    BasicBlock *exit = L->getExitBlock();
+    if (!exiting || !exit) continue;                 // 只处理单出口
+    auto *br = dyn_cast<BranchInst>(exiting->getTerminator());
+    if (!br || !br->isConditional()) continue;
+    auto *cmp = dyn_cast<ICmpInst>(br->getCondition());
+    if (!cmp) continue;
+    auto p = cmp->getPredicate();
+    if (p != ICmpInst::ICMP_SLT && p != ICmpInst::ICMP_ULT) continue;  // 保守:i<N
+    Value *iv = nullptr, *bound = nullptr;
+    for (int k = 0; k < 2; ++k) {
+      Value *a = cmp->getOperand(k), *b = cmp->getOperand(1 - k);
+      auto *PN = dyn_cast<PHINode>(a);
+      if (PN && PN->getParent() == L->getHeader() && inductionStep1(PN, L) &&
+          L->isLoopInvariant(b)) { iv = a; bound = b; break; }
+    }
+    if (!iv || !bound) continue;
+    Instruction *ip = &*exit->getFirstInsertionPt();
+    if (!DT.dominates(cast<Instruction>(iv), ip)) continue;  // iv 须支配出口
+    if (iv->getType() != bound->getType()) continue;
+    IRBuilder<> B(ip);
+    Value *ne = B.CreateICmpNE(iv, bound, "lpa.ne");
+    Value *d = B.CreateZExt(ne, I64Ty);
+    B.CreateStore(B.CreateXor(B.CreateLoad(I64Ty, sig), d), sig);
+    ++n;
+  }
+  if (!n) return;
+  for (BasicBlock &BB : F) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI) continue;
+    IRBuilder<> B(RI);
+    Value *ok = B.CreateICmpEQ(B.CreateLoad(I64Ty, sig), ConstantInt::get(I64Ty, 0));
+    B.CreateCall(CommitFn, {B.CreateZExt(ok, I32Ty)});
+  }
+  errs() << "ATFT_LOOP_ASSERT," << F.getName().str() << "," << n << "\n";
+}
+
+// 层②·load:整数数据 load 的独立 launder 二次读 + 比对(nZDC 式内存层级冗余)。
+void transformFunctionLoadReload(Function &F) {
+  Module *M = F.getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  FunctionCallee CommitFn = M->getOrInsertFunction(
+      "atft_loop_vote_commit", Type::getVoidTy(Ctx), I32Ty);
+
+  std::vector<LoadInst *> loads;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *LD = dyn_cast<LoadInst>(&I))
+        if (atftIsIntTy(LD->getType()) && !LD->use_empty())
+          loads.push_back(LD);
+  if (loads.empty()) return;
+
+  IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *sig = EB.CreateAlloca(I64Ty, nullptr, "atft.ldr.sig");
+  EB.CreateStore(ConstantInt::get(I64Ty, 0), sig);
+
+  unsigned n = 0;
+  for (LoadInst *LD : loads) {
+    IRBuilder<> B(LD->getNextNode());
+    Value *ptr = LD->getPointerOperand();
+    InlineAsm *pbar = InlineAsm::get(
+        FunctionType::get(ptr->getType(), {ptr->getType()}, false), "", "=r,0", true);
+    Value *p2 = B.CreateCall(pbar, {ptr});
+    Value *reload = B.CreateAlignedLoad(LD->getType(), p2, LD->getAlign(), "atft.ldr.ld");
+    Value *d = B.CreateZExt(B.CreateICmpNE(LD, reload), I64Ty, "ldr.diff");
+    B.CreateStore(B.CreateXor(B.CreateLoad(I64Ty, sig), d), sig);
+    ++n;
+  }
+  for (BasicBlock &BB : F) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI) continue;
+    IRBuilder<> B(RI);
+    Value *ok = B.CreateICmpEQ(B.CreateLoad(I64Ty, sig), ConstantInt::get(I64Ty, 0));
+    B.CreateCall(CommitFn, {B.CreateZExt(ok, I32Ty)});
+  }
+  errs() << "ATFT_LOAD_RELOAD," << F.getName().str() << "," << n << "\n";
+}
+
+// ============================================================================
+// TRIDENT 方法复现(Li et al., DSN'18, "Modeling Soft-Error Propagation in Programs")
+// 核心:以程序输出(写回 arg/global 的 store)为锚,免 FI 地估每条指令"故障传到输出"的
+// 概率。关键是**屏蔽模型**:并非所有故障都传播——比较会屏蔽(1 bit 结果,宽操作数翻转
+// 多不改布尔)、截断丢高位、逻辑运算部分屏蔽。反向定点传播(max 式,单调收敛),再按
+// 循环深度近似动态频次加权。纯分析,产出每指令 SDC 权重,不做任何代码变换。
+// ============================================================================
+static bool atftIsOutputStore(StoreInst *SI) {
+  const Value *obj = getUnderlyingObject(SI->getPointerOperand());
+  return isa<Argument>(obj) || isa<GlobalValue>(obj);  // 写回参数数组/全局 = 程序输出
+}
+
+void transformFunctionTridentRank(Function &F, LoopInfo &LI,
+                                   std::vector<std::string> &out) {
+  // 每条用户边的屏蔽因子(故障从 I 传到 user u 的通过概率),参考 TRIDENT 的屏蔽处理
+  auto factor = [](Instruction *I, Instruction *u) -> double {
+    if (auto *SI = dyn_cast<StoreInst>(u)) {
+      if (SI->getValueOperand() == I) return atftIsOutputStore(SI) ? 1.0 : 0.7; // 经内存 ~0.7
+      if (SI->getPointerOperand() == I) return 1.0;                             // 地址损坏→SDC
+      return 0.0;
+    }
+    if (isa<ICmpInst>(u) || isa<FCmpInst>(u)) return 0.10;      // 比较屏蔽(TRIDENT)
+    if (isa<TruncInst>(u)) return 0.5;                          // 截断丢高位
+    if (isa<ZExtInst>(u) || isa<SExtInst>(u)) return 1.0;
+    if (u->isBitwiseLogicOp()) return 0.5;                      // and/or/xor 部分屏蔽
+    if (isa<BranchInst>(u) || isa<SelectInst>(u) || isa<SwitchInst>(u)) return 1.0;
+    return 1.0;                                                 // 算术等:全传播
+  };
+
+  std::vector<Instruction *> insts;
+  DenseMap<Instruction *, double> reach;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) { insts.push_back(&I); reach[&I] = 0.0; }
+
+  auto drivesBranch = [](Instruction *I) {
+    for (User *u : I->users())
+      if (isa<BranchInst>(u) || isa<SelectInst>(u) || isa<SwitchInst>(u)) return true;
+    return false;
+  };
+
+  // 反向定点:reach[I] = 故障传到输出的概率(max 式,单调增,收敛)
+  for (int iter = 0; iter < 8; ++iter) {
+    bool changed = false;
+    for (auto it = insts.rbegin(); it != insts.rend(); ++it) {
+      Instruction *I = *it;
+      double r = reach[I];
+      if (auto *SI = dyn_cast<StoreInst>(I)) { if (atftIsOutputStore(SI)) r = std::max(r, 1.0); }
+      if ((isa<ICmpInst>(I) || isa<FCmpInst>(I)) && drivesBranch(I)) r = std::max(r, 1.0);
+      for (User *u : I->users())
+        if (auto *ui = dyn_cast<Instruction>(u))
+          r = std::max(r, factor(I, ui) * reach[ui]);
+      if (r > reach[I] + 1e-9) { reach[I] = r; changed = true; }
+    }
+    if (!changed) break;
+  }
+
+  // 分类 + 循环深度加权(动态频次近似)
+  auto cat = [](Instruction *I) -> const char * {
+    if (isa<GetElementPtrInst>(I)) return "addr";
+    if (isa<LoadInst>(I)) return "load";
+    if (isa<TruncInst>(I) || isa<ZExtInst>(I) || isa<SExtInst>(I) ||
+        isa<SIToFPInst>(I) || isa<FPToSIInst>(I)) return "cast";
+    if ((isa<ICmpInst>(I) || isa<FCmpInst>(I))) return "cmp_branch";
+    if (I->getType()->isDoubleTy() || I->getType()->isFloatTy()) return "fp";
+    if (I->getType()->isIntegerTy() && (I->isBinaryOp())) return "int_arith";
+    return "other";
+  };
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      double w = reach[&I] * std::pow(2.0, std::min<unsigned>(LI.getLoopDepth(&BB), 12));
+      if (w <= 0) continue;
+      out.push_back(std::string(F.getName()) + "," + cat(&I) + "," +
+                    std::to_string(reach[&I]) + "," + std::to_string(w));
+    }
+}
+
+
 
 // ============================================================================
 // 模块 2A: 复现 EDDI (Oh et al., IEEE TR'02) 与 SWIFT (Reis et al., CGO'05)
@@ -4265,6 +4887,23 @@ public:
       for (Function *F : targetFuncs) expandFMulAddIntrinsics(*F);
     }
     assignAtftSiteIds(targetFuncs);
+    // fi-cache 排名:在 O3 改写 IR 之前把实测脆弱性缓存读进来(key=site_key,
+    // 跟随 atft.site.key metadata 一起被 O3 保留在存活指令上)。
+    if (!AtftVulnCache.empty() && !g_atftVulnCacheLoaded)
+      loadAtftVulnCache(AtftVulnCache);
+    // TRIDENT 方法复现:免 FI 的输出锚定 SDC 可达性排名(纯分析,写 CSV 后返回)。
+    if (!AtftTridentRank.empty()) {
+      std::vector<std::string> rows;
+      for (Function *F : targetFuncs) {
+        auto &LI = FAM.getResult<LoopAnalysis>(*F);
+        transformFunctionTridentRank(*F, LI, rows);
+      }
+      std::ofstream tr(AtftTridentRank);
+      tr << "function,category,reach,weight\n";
+      for (const std::string &r : rows) tr << r << "\n";
+      errs() << "ATFT_TRIDENT_RANK," << AtftTridentRank << ",rows=" << rows.size() << "\n";
+      return PreservedAnalyses::all();
+    }
     if (!AtftFrontierManifestFile.empty())
       writeAtftFrontierManifest(targetFuncs, FAM, AtftFrontierManifestFile);
     if (AtftBudgetMode != "count" && AtftBudgetMode != "dynamic-cost" &&
@@ -4305,6 +4944,68 @@ public:
         if (AtftDMRNoInject) continue;             // 公平基线：同管线但不注入
         int inj = transformFunctionDMRGeneric(*F, AtftTMRGeneric ? 3 : 2);
         if (inj) errs() << "ATFT_DMR_GENERIC," << n << "," << inj << "\n";
+      }
+      // 实验(P3 收口):把整数通路三模接入向量化路径,实测它能否覆盖 O3 向量化
+      // 产生的向量 cast。本地构 LoopInfo,避开外层 FAM 在 O3 后的陈旧结果。
+      if (AtftIntTMRWire) {
+        for (const std::string &n : targetNames) {
+          Function *F = M.getFunction(n);
+          if (!F || F->isDeclaration()) continue;
+          DominatorTree DT(*F);
+          LoopInfo LI(DT);
+          transformFunctionExactIntTMR(*F, LI, AtftRankMethod, AtftBudget);
+        }
+      }
+      // 地址平面结构型保护:只复制 GEP 下标切片并检错(替代全整数三模的便宜法)。
+      if (AtftAddrDMR) {
+        for (const std::string &n : targetNames) {
+          Function *F = M.getFunction(n);
+          if (!F || F->isDeclaration()) continue;
+          transformFunctionAddrDMR(*F);
+        }
+      }
+      // 整数数据平面:复制流向整数 store 的值切片并检错(补整数数据 load/arith 的洞)。
+      if (AtftIntDataDMR) {
+        for (const std::string &n : targetNames) {
+          Function *F = M.getFunction(n);
+          if (!F || F->isDeclaration()) continue;
+          transformFunctionIntDataDMR(*F, AtftRankMethod, AtftIntDataBudget);
+        }
+      }
+      // 层③·整数残差码:环运算链携带 mod-M 残差,store 处检查(编码检查,非复制)。
+      if (AtftIntResidue) {
+        for (const std::string &n : targetNames) {
+          Function *F = M.getFunction(n);
+          if (!F || F->isDeclaration()) continue;
+          transformFunctionIntResidue(*F);
+        }
+      }
+      // 层①·分支:仿射循环 IV==bound 结构不变量断言。
+      if (AtftLoopAssert) {
+        for (const std::string &n : targetNames) {
+          Function *F = M.getFunction(n);
+          if (!F || F->isDeclaration()) continue;
+          transformFunctionLoopIndexAssert(*F);
+        }
+      }
+      // 层②·load:整数数据 load 的 nZDC 式 reload-compare。
+      if (AtftLoadReload) {
+        for (const std::string &n : targetNames) {
+          Function *F = M.getFunction(n);
+          if (!F || F->isDeclaration()) continue;
+          transformFunctionLoadReload(*F);
+        }
+      }
+      // 控制穿越口接入向量化路径:复制驱动标量分支的比较并多数决(TMR)或检错(DMR)。
+      if (AtftCmpTMR || AtftCmpDMR) {
+        unsigned nProtected = 0;
+        double controlBudget = AtftControlBudget >= 0.0 ? AtftControlBudget : AtftBudget;
+        for (const std::string &n : targetNames) {
+          Function *F = M.getFunction(n);
+          if (!F || F->isDeclaration()) continue;
+          transformFunctionCmpTMR(*F, &nProtected, controlBudget, AtftRankMethod);
+        }
+        errs() << "ATFT_CMP_TMR_SITES," << nProtected << "\n";
       }
       // 清理：mem2reg 把签名 alloca 升 SSA(reduction phi)，省掉每迭代访存
       {
