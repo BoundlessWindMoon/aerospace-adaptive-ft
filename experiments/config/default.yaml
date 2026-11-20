@@ -28,7 +28,8 @@ thresholds:
 # smoke 模式（默认模式）
 smoke:
   trials: 60
-  policies: [native, exact_tmr, approx_simd]
+  # approx_simd 已退役（f32+δ 近似，历史遗留；精确 SIMD 见部署栈 -atft-simd-f64）。
+  policies: [native, exact_tmr]
   # smoke 只跑三个代表性类别（浮点 / 整数 / 控制流各一个），保证秒级反馈；
   # 正式结论必须用 --full 跑全部 fault_categories
   categories: [fp64, int_arith, cmp_branch]
@@ -41,15 +42,15 @@ smoke:
 #   budget / delta : 可选，覆盖该策略的保护预算与表决阈值
 policies:
   - {tag: native,        mode: native,        golden: true,  fi: true}
-  - {tag: pure_approx,   mode: pure-approx,   fi: false}
   - {tag: eddi,          mode: eddi,          fi: true}
   - {tag: swift,         mode: swift,         fi: true}
   - {tag: lltfi_sid,     mode: lltfi-sid,     fi: true}
   - {tag: exact_tmr,     mode: exact-tmr,     fi: true}
-  - {tag: approx_scalar, mode: approx-scalar, fi: true}
-  - {tag: approx_simd,   mode: approx-simd,   fi: true}
   - {tag: adaptive_low,  mode: adaptive,      fi: false}
   - {tag: adaptive_high, mode: adaptive,      fi: true}
+# 已退役（f32+δ 近似计算容错，历史遗留）：approx_simd / approx_scalar / pure_approx。
+# 不再作为默认对比基线。精确冗余用 exact_tmr；精确 SIMD 打包用 -atft-simd-f64。
+# transform 代码保留（与 -atft-simd-f64 及 adaptive 模式共用），仅需显式 opt-in 才走近似分支。
 
 # 各实验的参数网格
 grids:
@@ -71,11 +72,11 @@ grids:
     # 能报的只有 Wilson 上界给出的 MTTF 下界，所以这个数直接决定结论强度：
     # 400/负载 -> 上界 0.23%；4000/负载 -> 上界约 0.023%
     trials_per_benchmark: 4000
-    policies: [native, swift, exact_tmr, approx_simd]
+    policies: [native, swift, exact_tmr]
   rq8:                       # 指令类别注错与 RISC-V 交叉验证
     # 不设 categories：沿用顶层 fault_categories（七类）。内置默认值里也不再
     # 保留一份旧清单，否则 deep_merge 会让它永远覆盖顶层
-    policies: [native, swift, lltfi_sid, exact_tmr, approx_simd]
+    policies: [native, swift, lltfi_sid, exact_tmr]
     trials: 120
 
 # ===========================================================================

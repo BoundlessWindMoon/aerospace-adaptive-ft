@@ -126,18 +126,19 @@ BUILTIN_CONFIG = {
         "trial_watchdog_ms": 100,
         "step_budget_factor": 50,
     },
-    "smoke": {"trials": 60, "policies": ["native", "exact_tmr", "approx_simd"],
+    "smoke": {"trials": 60, "policies": ["native", "exact_tmr"],
               "categories": ["fp64", "int_arith", "cmp_branch"]},
+    # approx_simd/approx_scalar/pure_approx 已退役(f32+δ 近似,历史遗留),不再作默认基线。
+    # 精确冗余用 exact_tmr;精确 SIMD 打包用 -atft-simd-f64。
     "policies": [
         {"tag": "native", "mode": "native", "golden": True, "fi": True},
         {"tag": "exact_tmr", "mode": "exact-tmr", "fi": True},
-        {"tag": "approx_simd", "mode": "approx-simd", "fi": True},
     ],
     "grids": {
         "rq2": {"budgets": [0.25, 0.50, 0.75, 1.00],
                 "rank_methods": ["semantic", "sdctune", "shoestring", "hotpath", "random"]},
         "rq3": {"deltas": [1e-7, 1e-5, 5e-5, 1e-3, 5e-2, 5e-1]},
-        "rq8": {"policies": ["native", "swift", "lltfi_sid", "exact_tmr", "approx_simd"]},
+        "rq8": {"policies": ["native", "swift", "lltfi_sid", "exact_tmr"]},
     },
     "defaults": {"budget": 1.0, "delta": 5.0e-5, "weights": {"w1": 2.5, "w2": 1.8, "w3": 0.8}},
 }

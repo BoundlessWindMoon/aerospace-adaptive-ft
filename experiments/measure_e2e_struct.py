@@ -12,7 +12,8 @@ BAR = ["-atft-no-cse-barrier"]
 CFGS = [
     ("native",      "native",      ["-atft-isa-avx512"]),
     ("old_intTMR",  "approx-simd", ["-atft-dmr-generic","-atft-int-tmr-wire","-atft-int-tmr-i64","-atft-cmp-dmr"]+BAR),
-    ("struct_full", "approx-simd", ["-atft-dmr-generic","-atft-addr-dmr","-atft-int-residue","-atft-cmp-dmr"]+BAR),
+    # 部署栈:FP-DMR 用**精确** SIMD(2xf64)而非 approx(f32+δ,已退役)。实测 SDC 与 approx 持平、口径更干净。
+    ("struct_full", "approx-simd", ["-atft-dmr-generic","-atft-addr-dmr","-atft-int-residue","-atft-cmp-dmr","-atft-simd-f64","-atft-replica-exact"]+BAR),
 ]
 SSA = H.build_infrastructure()
 def pct(k, n): return 100.0 * k / n if n else 0.0

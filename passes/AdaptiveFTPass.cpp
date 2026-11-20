@@ -63,7 +63,11 @@ namespace {
 
 static cl::opt<std::string> AtftMode(
     "atft-mode",
-    cl::desc("Protection policy: analyze | native | eddi | swift | lltfi-sid | exact-tmr | approx-scalar | approx-simd | adaptive | pure-approx"),
+    cl::desc("Protection policy: analyze | native | eddi | swift | lltfi-sid | exact-tmr | "
+             "adaptive | [DEPRECATED: approx-scalar | approx-simd | pure-approx]. "
+             "The approx-* modes (f32 replicas + delta tolerance) are legacy "
+             "approximate-computing FT, retired as defaults; for exact SIMD-packed "
+             "redundancy use exact-tmr or -atft-simd-f64 instead."),
     cl::init("adaptive"));
 
 static cl::opt<std::string> AtftRankMethod(
@@ -3774,6 +3778,11 @@ static int transformFunctionDMRGeneric(Function &F, int ways) {
   return injected;
 }
 
+// 注意：本函数是 approx-simd / exact-SIMD / adaptive 三者共用的实现。
+// 默认(AtftSimdF64=false)走 f32+δ 近似副本 —— 这是历史遗留的"近似计算容错"分支，
+// 已退役为默认基线（见 config/default.yaml 与 -atft-mode 的 DEPRECATED 说明）。
+// 精确冗余请走 AtftSimdF64=true（-atft-simd-f64，2×f64 精确 SIMD 打包）。
+// 代码不删：exact-SIMD 与 adaptive 模式都复用这条路径，仅按 flag 切精确/近似。
 void transformFunctionApproxTMR(Function &F, LoopInfo &LI, CritLevel critLevel,
                                 double delta, bool useSIMD,
                                 const std::string &rankMethod, double budget,
