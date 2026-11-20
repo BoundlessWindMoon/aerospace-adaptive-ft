@@ -263,6 +263,7 @@ public:
     FunctionCallee HookF32 = M.getOrInsertFunction("__harness_fi_hook_f32", F32Ty, F32Ty, I32Ty);
     FunctionCallee HookI16 = M.getOrInsertFunction("__harness_fi_hook_i16", I16Ty, I16Ty, I32Ty);
     FunctionCallee HookI32 = M.getOrInsertFunction("__harness_fi_hook_i32", I32Ty, I32Ty, I32Ty);
+    FunctionCallee HookAddrI32 = M.getOrInsertFunction("__harness_fi_hook_addr_i32", I32Ty, I32Ty, I32Ty);
     FunctionCallee HookI64 = M.getOrInsertFunction("__harness_fi_hook_i64", I64Ty, I64Ty, I32Ty);
 
     bool enabled[FIC_COUNT];
@@ -331,7 +332,9 @@ public:
       Instruction *inst = entry.first;
       FiCategory cat = entry.second;
 
-      // ---- 地址类：扰动 GEP 的可变下标，幅度限制在 ±3 个元素 ----
+      // ---- 地址类：扰动 GEP 的可变下标，±3 元素有界位移故障模型 ----
+      // P0-4 修复：改用专用 addr hook，每次触发都是非零位移，不再有 bit>=2 被 &0x3
+      // 清零的空注入。hook 内部已做 ±3 元素有界，这里直接用返回值。
       if (cat == FIC_ADDR) {
         unsigned lastIdx = inst->getNumOperands() - 1;
         Value *idxVal = inst->getOperand(lastIdx);
@@ -339,11 +342,8 @@ public:
         bool is64 = idxVal->getType()->isIntegerTy(64);
         Value *idx32 = is64 ? IRB.CreateTrunc(idxVal, I32Ty, "gep.idx32") : idxVal;
         Value *hooked32 = IRB.CreateCall(
-            HookI32, {idx32, allocateSiteId(inst, cat)}, "fi.addr");
-        Value *diff = IRB.CreateXor(idx32, hooked32);
-        Value *boundedDiff = IRB.CreateAnd(diff, ConstantInt::get(I32Ty, 0x3));
-        Value *safeIdx32 = IRB.CreateXor(idx32, boundedDiff);
-        Value *finalIdx = is64 ? IRB.CreateSExt(safeIdx32, idxVal->getType()) : safeIdx32;
+            HookAddrI32, {idx32, allocateSiteId(inst, cat)}, "fi.addr");
+        Value *finalIdx = is64 ? IRB.CreateSExt(hooked32, idxVal->getType()) : hooked32;
         inst->setOperand(lastIdx, finalIdx);
         continue;
       }

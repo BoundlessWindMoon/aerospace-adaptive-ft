@@ -1,0 +1,12 @@
+metric,category,old_sampling,new_sampling,ratio,note
+# P0-4 注入器采样缺陷修复前后对比 (2026-11-20)
+# 口径: native(无保护), 空天核子集 pb_gemm/gnc_kalman/orbit_rk4/aocs_pid/cnn_cls_decision
+#       --fi-one, 300 trials/核, 均值; FI5_CSV 第9列=SDC% 第10列=DUE%
+# 旧采样: addr 位翻转后 &0x3 (bit>=2 空注入), i16 make_mbu_mask32 &0xFFFF (bit16-31 空注入)
+# 新采样: addr 专用 ±3 元素有界位移 hook (每次触发非零); i16 专用 make_mbu_mask16 (shift 0-15)
+sdc_pct,addr,0.67,9.13,13.6,"地址脆弱性旧口径被空注入稀释13.6x;'地址不脆弱'是测量假象"
+due_pct,addr,0.00,0.00,1.0,"±3元素位移多落在相邻合法元素->静默错值而非越界崩溃"
+sdc_pct,cast,1.80,1.73,0.96,"基本不变;本子集cast几乎不走i16路径"
+due_pct,cast,58.13,58.07,1.0,"不变"
+sdc_pct,int_arith,19.87,19.80,1.0,"不变;int_arith走i32/i64 hook,不受addr/i16修复影响"
+due_pct,int_arith,26.33,26.33,1.0,"不变"

@@ -154,6 +154,14 @@ static inline uint32_t make_mbu_mask32(uint32_t base_bit, uint32_t width) {
     return m << shift;
 }
 
+// i16 专用：把 shift 限制在 0..15，避免采到 16-31 位时 &0xFFFF 归零的空注入
+// （P0-4 修复：旧代码用 make_mbu_mask32(...)&0xFFFF，约半数 trial 是零扰动却进分母）
+static inline uint16_t make_mbu_mask16(uint32_t base_bit, uint32_t width) {
+    uint16_t m = (uint16_t)((1U << width) - 1U);
+    uint32_t shift = base_bit % (17 - width);
+    return (uint16_t)(m << shift);
+}
+
 double __harness_fi_hook_f64(double val, int32_t static_site_id) {
     (void)static_site_id;
     g_fi_dyn_step++;
@@ -238,12 +246,31 @@ int16_t __harness_fi_hook_i16(int16_t val, int32_t static_site_id) {
     fi_check_budget();
     for (int i = 0; i < g_fi_num_events; i++) {
         if (fi_should_apply(static_site_id, i)) {
-            uint16_t u = (uint16_t)val ^ (uint16_t)(make_mbu_mask32(g_fi_bits[i], g_fi_mbu_width) & 0xFFFFU);
+            uint16_t u = (uint16_t)val ^ make_mbu_mask16(g_fi_bits[i], g_fi_mbu_width);
             g_fi_injected++;
             val = (int16_t)u;
         }
     }
     return val;
+}
+
+// 地址类专用 hook（P0-4 修复）：旧实现对 GEP 下标做位翻转后再 &0x3，均匀采 32 位时
+// 约 94% 的触发落在 bit>=2 被清零成空注入却照样进分母，系统性压低地址脆弱性。
+// 改为"±3 元素有界位移"故障模型：每次触发都产生非零位移(1/2/3 元素，符号由另一位定)，
+// 无空注入。位移幅度与 ±3 上界与原注释(FaultInjectorPass.cpp:334)一致。
+int32_t __harness_fi_hook_addr_i32(int32_t idx, int32_t static_site_id) {
+    g_fi_dyn_step++;
+    fi_check_budget();
+    for (int i = 0; i < g_fi_num_events; i++) {
+        if (fi_should_apply(static_site_id, i)) {
+            uint32_t b = g_fi_bits[i];
+            int32_t mag  = (int32_t)(b % 3) + 1;       // 1 / 2 / 3 个元素
+            int32_t disp = (b & 0x4u) ? -mag : mag;    // 另一位定符号
+            g_fi_injected++;
+            idx += disp;
+        }
+    }
+    return idx;
 }
 
 // ============================================================================
