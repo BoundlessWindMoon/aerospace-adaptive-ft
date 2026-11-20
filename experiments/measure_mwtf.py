@@ -18,7 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atft_core as C
 
 ROOT = Path(__file__).resolve().parent.parent
-E2E = ROOT / "results" / "e2e_struct.csv"
+E2E = ROOT / "results" / "e2e_struct_aero.csv"   # 稳定命名(航天核;避免被 OBPMark 跑覆盖)
+
+# load/store 数据属 ECC 域(SWIFT SoR 之外),软件 FT 不声明保护 → 从保护聚合口径剔除。
+# addr 保留:它是地址**计算**错(访问到错位置),ECC 管不了,是软件层的活。
+ECC_DELEGATED = {"load"}
 
 F_SAA = C.LEO_SAA_FRAC
 F_CALM = 1.0 - F_SAA
@@ -28,10 +32,12 @@ LOCKSTEP_OV = 2.0
 
 
 def load_e2e():
-    """返回 {config: (mean_sdc_frac, overhead)}，SDC 按 6 类别等权。"""
+    """返回 {config: (mean_sdc_frac, overhead)}，SDC 按类别等权（剔除 ECC 域的 load/store）。"""
     agg = {}
     with open(E2E) as f:
         for r in csv.DictReader(f):
+            if r["category"] in ECC_DELEGATED:
+                continue
             cfg = r["config"]
             agg.setdefault(cfg, {"sdc": [], "ov": float(r["overhead"])})
             agg[cfg]["sdc"].append(float(r["sdc_pct"]) / 100.0)
