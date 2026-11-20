@@ -1,0 +1,6 @@
+policy,agg_sdc_pct,throughput_rel,failure_rate_rel,mwtf_rel,note
+native,9.655,1.0,1.0,1.0,裸奔基线
+generic_tmr,0.192,0.838,0.0199,42.22,"通用TMR,全程付"
+struct_static,0.25,0.91,0.0259,35.14,结构栈全程开
+adaptive,0.25,0.983,0.0468,21.01,平静关/SAA开
+hw_lockstep,0.0,0.5,0.0,inf,"DCLS,静默0但半吞吐"
