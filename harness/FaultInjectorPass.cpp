@@ -332,19 +332,34 @@ public:
       Instruction *inst = entry.first;
       FiCategory cat = entry.second;
 
-      // ---- 地址类：扰动 GEP 的可变下标，±3 元素有界位移故障模型 ----
-      // P0-4 修复：改用专用 addr hook，每次触发都是非零位移，不再有 bit>=2 被 &0x3
-      // 清零的空注入。hook 内部已做 ±3 元素有界，这里直接用返回值。
+      // ---- 地址类：扰动下标的**定义值**（不是 GEP 操作数），±3 元素有界位移 ----
+      // 修正方法学问题：旧实现对 GEP 的 index 操作数做 setOperand，注入点落在下标保护
+      // (addr-dmr 比较 / addr-correct 的 median)的**下游**，使任何下标冗余结构上都看不到故障。
+      // 改为在下标**定义处**注入并替换其全部使用：GEP、DMR 比较、median 都看到被扰动值，
+      // 而由上游操作数重算的影子保持干净 → 下标冗余可检/可纠。hook 紧跟 def 之后插入，
+      // 故所有其他使用都在 hook 之后，replaceUsesWithIf 的 dominance 安全。
       if (cat == FIC_ADDR) {
         unsigned lastIdx = inst->getNumOperands() - 1;
         Value *idxVal = inst->getOperand(lastIdx);
-        IRBuilder<> IRB(inst);
+        auto *idxDef = dyn_cast<Instruction>(idxVal);
+        if (!idxDef) continue;   // 常量/参数下标：无定义指令可注（与原 isa<Constant> 排除一致）
+        Instruction *ip = isa<PHINode>(idxDef)
+                              ? &*idxDef->getParent()->getFirstInsertionPt()
+                              : idxDef->getNextNode();
+        if (!ip) continue;
+        IRBuilder<> IRB(ip);
         bool is64 = idxVal->getType()->isIntegerTy(64);
         Value *idx32 = is64 ? IRB.CreateTrunc(idxVal, I32Ty, "gep.idx32") : idxVal;
         Value *hooked32 = IRB.CreateCall(
             HookAddrI32, {idx32, allocateSiteId(inst, cat)}, "fi.addr");
         Value *finalIdx = is64 ? IRB.CreateSExt(hooked32, idxVal->getType()) : hooked32;
-        inst->setOperand(lastIdx, finalIdx);
+        auto *truncI = is64 ? dyn_cast<Instruction>(idx32) : nullptr;
+        auto *hookI = cast<Instruction>(hooked32);
+        idxDef->replaceUsesWithIf(finalIdx, [&](Use &U) {
+          Instruction *u = dyn_cast<Instruction>(U.getUser());
+          if (!u) return true;
+          return u != truncI && u != hookI;   // 不改 hook 链自身对 idxVal 的使用
+        });
         continue;
       }
 
