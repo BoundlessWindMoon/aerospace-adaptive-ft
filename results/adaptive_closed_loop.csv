@@ -1,0 +1,4 @@
+strategy,mean_sdc_events,sdc_seeds,cum_time_rel,per_cycle_s,deadline_violated
+always_low,104960.7,105468/104658/104756,1.0,3.00e-05,0
+always_high,2773.0,2753/2869/2697,1.099,3.30e-05,0
+adaptive,4294.0,4289/4365/4228,1.025,3.30e-05,0
