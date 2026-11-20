@@ -1,0 +1,5 @@
+config,text,rodata,data,bss,stack_max,code_bytes,sram_bytes,code_ratio_vs_native,status
+native,61590,32,20,33561592,64,61622,33561612,1.0,ok
+exact_tmr,146802,32,20,33561592,64,146834,33561612,2.383,ok
+dmr_generic,120332,1024,16,33561584,64,121356,33561600,1.969,ok
+struct_full,146167,1024,16,33561584,64,147191,33561600,2.389,ok
