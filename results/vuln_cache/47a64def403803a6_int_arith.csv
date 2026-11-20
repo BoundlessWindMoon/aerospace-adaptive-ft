@@ -1,0 +1,7 @@
+site_key,sdc
+f_mask_replace|bb5|5|7|add|integer,0.0
+f_mask_replace|bb7|7|0|add|integer,0.0
+f_mask_replace|bb4|4|4|mul|integer,0.0
+f_mask_replace|bb5|5|6|mul|integer,0.0
+f_mask_replace|bb9|9|0|add|integer,0.0
+f_mask_replace|bb4|4|5|add|integer,0.0

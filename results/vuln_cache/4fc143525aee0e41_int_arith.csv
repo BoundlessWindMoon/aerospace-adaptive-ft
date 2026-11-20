@@ -1,0 +1,4 @@
+site_key,sdc
+bench_pb_bicg|bb2|2|3|add|integer,0.0
+bench_pb_bicg|bb7|7|32|add|integer,0.0
+bench_pb_bicg|bb8|8|0|add|integer,0.0

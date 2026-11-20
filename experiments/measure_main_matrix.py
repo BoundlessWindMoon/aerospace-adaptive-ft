@@ -47,11 +47,11 @@ for tag, mode, flags, env in CFGS:
             pass_flags=flags, env_extra=env)
         ks = sum(round(r["sdc_pct"] / 100 * r["trials"]) for r in f)
         n = sum(r["trials"] for r in f)
-        lo, hi, half = H.wilson_ci95(ks, n) if n else (0, 0, 0)
+        lo, hi, half = H.wilson_ci95(ks, n) if n else (0, 0, 0)  # 已是百分比形式
         rows.append({"config": tag, "category": cat, "ecc_domain": int(cat in ECC),
                      "sdc_pct": round(pct(ks, n), 2), "n": n,
-                     "sdc_ci95_lo": round(lo * 100, 2), "sdc_ci95_hi": round(hi * 100, 2),
-                     "sdc_ci95_half": round(half * 100, 2)})
+                     "sdc_ci95_lo": round(lo, 2), "sdc_ci95_hi": round(hi, 2),
+                     "sdc_ci95_half": round(half, 2)})
 
 OUT = H.RES_DIR / "main_matrix.csv"
 with open(OUT, "w", newline="") as fp:

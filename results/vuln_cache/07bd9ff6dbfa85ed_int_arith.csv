@@ -1,0 +1,11 @@
+site_key,sdc
+crc16|bb2|2|8|ashr|integer,0.0
+crc16|bb2|2|20|shl|integer,0.0
+crc16|bb2|2|26|xor|integer,0.0
+crc16|bb2|2|13|shl|integer,0.0
+crc16|bb2|2|18|xor|integer,0.0
+crc16|bb2|2|10|xor|integer,0.0
+crc16|bb2|2|23|xor|integer,0.0
+crc16|bb2|2|1|ashr|integer,0.0
+crc16|bb2|2|15|shl|integer,0.0
+crc16|bb2|2|5|xor|integer,0.0

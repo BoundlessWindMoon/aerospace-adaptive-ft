@@ -1,0 +1,8 @@
+site_key,sdc
+bench_pb_covariance|bb20|20|0|add|integer,100.0
+bench_pb_covariance|bb11|11|0|add|integer,100.0
+bench_pb_covariance|bb10|10|11|add|integer,90.0
+bench_pb_covariance|bb18|18|20|add|integer,0.0
+bench_pb_covariance|bb19|19|21|add|integer,0.0
+bench_pb_covariance|bb5|5|5|add|integer,0.0
+bench_pb_covariance|bb4|4|11|add|integer,0.0

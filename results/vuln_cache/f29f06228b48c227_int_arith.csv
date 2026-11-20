@@ -1,0 +1,9 @@
+site_key,sdc
+bench_axc_sobel|bb16|16|6|add|integer,0.0
+bench_axc_sobel|bb6|6|1|add|integer,0.0
+bench_axc_sobel|bb9|9|0|add|integer,0.0
+bench_axc_sobel|bb6|6|0|mul|integer,0.0
+bench_axc_sobel|bb16|16|5|mul|integer,0.0
+bench_axc_sobel|bb7|7|0|add|integer,0.0
+bench_axc_sobel|bb19|19|0|add|integer,0.0
+bench_axc_sobel|bb17|17|0|add|integer,0.0

@@ -1,0 +1,11 @@
+site_key,sdc
+f_gain|bb5|5|0|add|integer,100.0
+f_gain|bb7|7|0|add|integer,100.0
+f_gain|bb4|4|20|mul|integer,60.0
+f_gain|bb4|4|27|mul|integer,45.0
+f_gain|bb4|4|28|add|integer,45.0
+f_gain|bb4|4|21|lshr|integer,40.0
+f_gain|bb4|4|14|mul|integer,5.0
+f_gain|bb4|4|15|add|integer,5.0
+f_gain|bb4|4|4|mul|integer,0.0
+f_gain|bb4|4|5|add|integer,0.0

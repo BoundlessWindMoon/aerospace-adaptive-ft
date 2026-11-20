@@ -1,0 +1,10 @@
+config,category,sdc_pct,due_pct,det_rec_pct,n,overhead
+native,fp64,8.94,0.06,0.0,1800,1.0
+native,int_arith,9.79,50.96,0.0,2400,1.0
+native,load,11.67,1.58,0.0,2400,1.0
+int_dmr,fp64,0.19,0.12,71.38,1600,2.761
+int_dmr,int_arith,3.58,27.04,51.83,2400,2.761
+int_dmr,load,8.92,0.17,72.08,2400,2.761
+int_res,fp64,0.19,0.06,71.38,1600,2.056
+int_res,int_arith,1.58,14.5,76.33,2400,2.056
+int_res,load,10.38,0.12,61.75,2400,2.056

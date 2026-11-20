@@ -1,0 +1,7 @@
+config,category,sdc_pct,sdc_ci95_half,due_pct,n,n_vector_cast,n_all_cast
+scalar_native,cast,3.62,0.75,69.38,2400,0,2992
+scalar_native,addr,0.46,0.28,0.04,2400,0,2992
+vector_noinject,cast,12.08,1.3,73.54,2400,137,607
+vector_noinject,addr,0.25,0.21,0.0,2400,137,607
+vector_dmr,cast,9.42,1.17,55.04,2400,137,641
+vector_dmr,addr,0.25,0.21,0.0,2400,137,641

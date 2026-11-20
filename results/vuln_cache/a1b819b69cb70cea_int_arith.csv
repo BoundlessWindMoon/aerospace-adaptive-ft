@@ -1,0 +1,10 @@
+site_key,sdc
+bench_pb_3mm|bb26|26|0|add|integer,90.0
+bench_pb_3mm|bb6|6|20|add|integer,0.0
+bench_pb_3mm|bb24|24|20|add|integer,0.0
+bench_pb_3mm|bb7|7|0|add|integer,0.0
+bench_pb_3mm|bb25|25|0|add|integer,0.0
+bench_pb_3mm|bb17|17|0|add|integer,0.0
+bench_pb_3mm|bb15|15|20|add|integer,0.0
+bench_pb_3mm|bb8|8|0|add|integer,0.0
+bench_pb_3mm|bb16|16|0|add|integer,0.0

@@ -1,0 +1,4 @@
+config,load_sdc_pct,sdc_ci95_half,load_due_pct,n
+vec_dmr,10.38,1.22,0.0,2400
+vec_dmr_inttmr,0.75,0.35,0.0,2400
+eddi_ref,5.67,0.93,53.12,2400

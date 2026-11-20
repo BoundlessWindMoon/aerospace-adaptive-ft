@@ -1,0 +1,12 @@
+
+=== fi-cache vs semantic(int_arith, 200 trials/bench) ===
+不保护(native)          int SDC% =   9.8
+全保护(budget=1.0)       int SDC% =   0.0  (覆盖上界)
+
+  budget   semantic SDC%   fi-cache SDC%   semantic 覆盖   fi-cache 覆盖
+     0.5             0.3             0.4         97.0%         95.7%
+    0.25             0.6             0.9         94.0%         90.6%
+     0.1             2.7             3.8         72.8%         61.3%
+
+读法:同 budget 下 fi-cache 的 SDC 更低/覆盖更高 → 实测排名吃到了启发式看不见的 skew。
+in-sample 说明:cache 与评测用同输入,结论是排名是否可用,非跨输入泛化保证。

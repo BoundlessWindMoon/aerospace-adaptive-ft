@@ -1,0 +1,5 @@
+config,category,sdc_pct,sdc_ci95_half,n
+vec_dmr,cast,9.42,1.17,2400
+vec_dmr,int_arith,4.88,0.86,2400
+vec_dmr_inttmr,cast,0.04,0.11,2400
+vec_dmr_inttmr,int_arith,0.0,0.08,2400

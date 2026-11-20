@@ -1,0 +1,8 @@
+site_key,sdc
+f_coadd|bb4|4|18|add|integer,100.0
+f_coadd|bb4|4|4|mul|integer,0.0
+f_coadd|bb5|5|0|add|integer,0.0
+f_coadd|bb4|4|13|mul|integer,0.0
+f_coadd|bb4|4|14|add|integer,0.0
+f_coadd|bb4|4|5|add|integer,0.0
+f_coadd|bb7|7|0|add|integer,0.0

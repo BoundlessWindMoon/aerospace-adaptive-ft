@@ -1,0 +1,9 @@
+
+=== correct-before-use 防 DUE (300 trials/bench) ===
+类别          native DUE%   corr DUE%  native SDC%   corr SDC%
+cast               69.5         0.3          3.6         0.6
+int_arith          52.2        10.6          9.7         1.2
+addr                0.1         0.0          0.5         0.2
+
+读法:corr 列 DUE 明显低于 native → 坏下标被 TMR 中值盖掉,越界崩溃被源头掐掉。
+     SDC 也应降(下标纠正顺带救了部分数据正确性);addr 本就低,看是否保持。

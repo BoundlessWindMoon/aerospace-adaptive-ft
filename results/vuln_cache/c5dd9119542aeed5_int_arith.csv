@@ -1,0 +1,6 @@
+site_key,sdc
+bench_pb_floyd_warshall|bb8|8|12|add|integer,100.0
+bench_pb_floyd_warshall|bb11|11|0|add|integer,75.0
+bench_pb_floyd_warshall|bb10|10|0|add|integer,0.0
+bench_pb_floyd_warshall|bb9|9|7|add|integer,0.0
+bench_pb_floyd_warshall|bb6|6|18|add|integer,0.0

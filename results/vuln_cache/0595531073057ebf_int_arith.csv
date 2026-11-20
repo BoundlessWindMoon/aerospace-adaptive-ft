@@ -1,0 +1,12 @@
+site_key,sdc
+bench_pb_ludcmp|bb12|12|14|add|integer,0.0
+bench_pb_ludcmp|bb7|7|13|add|integer,0.0
+bench_pb_ludcmp|bb19|19|11|add|integer,0.0
+bench_pb_ludcmp|bb14|14|0|add|integer,0.0
+bench_pb_ludcmp|bb13|13|6|add|integer,0.0
+bench_pb_ludcmp|bb23|23|3|add|integer,0.0
+bench_pb_ludcmp|bb25|25|11|add|integer,0.0
+bench_pb_ludcmp|bb6|6|14|add|integer,0.0
+bench_pb_ludcmp|bb20|20|3|add|integer,0.0
+bench_pb_ludcmp|bb21|21|0|sub|integer,0.0
+bench_pb_ludcmp|bb26|26|10|add|integer,0.0

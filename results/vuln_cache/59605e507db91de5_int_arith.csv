@@ -1,0 +1,15 @@
+site_key,sdc
+bench_pb_deriche|bb26|26|0|sub|integer,0.0
+bench_pb_deriche|bb34|34|20|add|integer,0.0
+bench_pb_deriche|bb22|22|28|add|integer,0.0
+bench_pb_deriche|bb5|5|0|add|integer,0.0
+bench_pb_deriche|bb28|28|22|add|integer,0.0
+bench_pb_deriche|bb11|11|0|add|integer,0.0
+bench_pb_deriche|bb29|29|0|add|integer,0.0
+bench_pb_deriche|bb16|16|20|add|integer,0.0
+bench_pb_deriche|bb17|17|0|add|integer,0.0
+bench_pb_deriche|bb4|4|28|add|integer,0.0
+bench_pb_deriche|bb23|23|0|add|integer,0.0
+bench_pb_deriche|bb8|8|0|sub|integer,0.0
+bench_pb_deriche|bb35|35|0|add|integer,0.0
+bench_pb_deriche|bb10|10|22|add|integer,0.0

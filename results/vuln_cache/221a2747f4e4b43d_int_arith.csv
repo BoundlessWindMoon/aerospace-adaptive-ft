@@ -1,0 +1,9 @@
+site_key,sdc
+bench_pb_durbin|bb7|7|4|sub|integer,0.0
+bench_pb_durbin|bb7|7|12|add|integer,0.0
+bench_pb_durbin|bb7|7|3|sub|integer,0.0
+bench_pb_durbin|bb4|4|9|add|integer,0.0
+bench_pb_durbin|bb4|4|0|sub|integer,0.0
+bench_pb_durbin|bb4|4|1|sub|integer,0.0
+bench_pb_durbin|bb11|11|3|add|integer,0.0
+bench_pb_durbin|bb10|10|6|add|integer,0.0

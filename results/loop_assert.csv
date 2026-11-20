@@ -1,0 +1,4 @@
+config,sdc_pct,due_pct,det_rec_pct,n,overhead,false_alarms
+native,29.25,0.0,0.0,2400,1.0,0
+cmp_dmr,0.0,5.21,94.79,2400,1.802,0
+loop_assert,26.79,5.21,0.0,2400,1.8,0
